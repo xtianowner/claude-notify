@@ -1,0 +1,1182 @@
+// 业务主入口。分层：api.js → 网络；format.js → 展示工具；app.js → 状态 + 渲染。
+import { api, connectWS } from "./api.js";
+import {
+  relTime, absTimeShanghai, fullTimeShanghai,
+  statusBadgeClass, statusLabel, eventBadgeClass,
+  colorDot, colorDotValue, displayName, truncate,
+} from "./format.js";
+
+// ───────────── 状态 ─────────────
+const state = {
+  sessions: [],
+  config: null,
+  drawerSessionId: null,
+  drawerEvents: [],
+  drawerHiddenTypes: new Set(["Heartbeat", "SessionStart"]),
+  filter: {
+    text: "",
+    statuses: new Set(["running", "waiting", "suspect", "idle"]),
+  },
+};
+
+// status 排序权重：值越小越靠前
+const STATUS_WEIGHT = {
+  waiting: 0,
+  suspect: 1,
+  running: 2,
+  idle: 3,
+  ended: 4,
+  dead: 5,
+};
+function statusWeight(s) {
+  const w = STATUS_WEIGHT[s];
+  return w === undefined ? 99 : w;
+}
+
+// notify_policy 静默秒数默认值
+const SILENCE_DEFAULTS = {
+  Notification: 5,
+  Stop: 12,
+  SubagentStop: 6,
+  TimeoutSuspect: 5,
+  SessionDead: 5,
+  SessionEnd: 5,
+};
+const NP_KEYS = ["Notification","Stop","SubagentStop","TimeoutSuspect","SessionDead","SessionEnd"];
+
+// ───────────── DOM ─────────────
+const $ = (id) => document.getElementById(id);
+const $sessions       = $("sessions");
+const $webhookBadge   = $("webhook-badge");
+const $wsBadge        = $("ws-badge");
+const $btnTest        = $("btn-test");
+const $btnConfig      = $("btn-config");
+const $search         = $("search");
+const $statusFilter   = $("status-filter");
+const $summaryPill    = $("summary-pill");
+const $summaryText    = $("summary-text");
+const $btnMore        = $("btn-more");
+const $moreMenu       = $("more-menu");
+
+const $drawer         = $("drawer");
+const $drawerDot      = $("drawer-dot");
+const $drawerTitle    = $("drawer-title");
+const $drawerStatus   = $("drawer-status");
+const $drawerSub      = $("drawer-sub");
+const $drawerMeta     = $("drawer-meta");
+const $drawerMetaToggle = $("drawer-meta-toggle");
+const $drawerMetaBody = $("drawer-meta-body");
+const $drawerBody     = $("drawer-body");
+const $drawerClose    = $("drawer-close");
+const $drawerFocus    = $("drawer-focus");
+
+const $modal          = $("modal-config");
+const $configForm     = $("config-form");
+const $configCancel   = $("config-cancel");
+const $configMsg      = $("config-msg");
+const $npFieldset     = $("np-fieldset");
+
+const $modalAlias     = $("modal-alias");
+const $aliasForm      = $("alias-form");
+const $aliasCancel    = $("alias-cancel");
+
+const $btnSnooze      = $("btn-snooze");
+const $snoozeMenu     = $("snooze-menu");
+
+const $toast          = $("toast");
+const $drawerFilter   = $("drawer-filter");
+
+let aliasEditingSid   = null;
+let toastTimer        = null;
+
+// ───────────── 渲染 ─────────────
+function passesFilter(s) {
+  if (!state.filter.statuses.has(s.status)) return false;
+  const q = (state.filter.text || "").toLowerCase().trim();
+  if (!q) return true;
+  const hay = [
+    s.alias, s.first_user_prompt, s.display_name, s.project,
+    s.cwd, s.cwd_short, s.session_id, s.last_message,
+  ].filter(Boolean).join("\n").toLowerCase();
+  return hay.includes(q);
+}
+
+function renderSessions() {
+  const all = (state.sessions || []).slice().sort((a, b) => {
+    const wa = statusWeight(a.status);
+    const wb = statusWeight(b.status);
+    if (wa !== wb) return wa - wb;
+    const ta = new Date(a.last_event_ts || 0).getTime();
+    const tb = new Date(b.last_event_ts || 0).getTime();
+    return tb - ta;
+  });
+  const visible = all.filter(passesFilter);
+  if (visible.length === 0) {
+    const hint = state.filter.text || state.filter.statuses.size < 6
+      ? `无匹配会话（${all.length} 个被过滤掉）`
+      : "暂无会话。等待第一个 hook 事件…";
+    $sessions.innerHTML = `<p class="empty">${escapeHtml(hint)}</p>`;
+    updateDocTitle();
+    renderSummaryPill();
+    return;
+  }
+  $sessions.innerHTML = visible.map(sessionCardHTML).join("");
+  $sessions.querySelectorAll(".session-item").forEach(el => {
+    el.addEventListener("click", (e) => {
+      // 内部按钮自己处理
+      if (e.target.closest(".alias-edit, .btn-focus")) return;
+      // 阻止冒泡到 document（document 监听 outside-click 关闭抽屉，会与本逻辑冲突）
+      e.stopPropagation();
+      openDrawer(el.dataset.sid);
+    });
+  });
+  $sessions.querySelectorAll(".alias-edit").forEach(el => {
+    el.addEventListener("click", (e) => {
+      e.stopPropagation();
+      onEditAlias(el.dataset.sid);
+    });
+  });
+  $sessions.querySelectorAll(".btn-focus").forEach(el => {
+    el.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (el.disabled) return;
+      onFocusTerminal(el.dataset.sid);
+    });
+  });
+  // 卡片键盘可达：Enter / Space 打开抽屉
+  $sessions.querySelectorAll(".session-item").forEach(el => {
+    el.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        openDrawer(el.dataset.sid);
+      }
+    });
+  });
+  updateDocTitle();
+  renderSummaryPill();
+  // 若 URL hash 命中，应用高亮
+  applyHashHighlight();
+}
+
+function updateDocTitle() {
+  const n = (state.sessions || []).filter(s =>
+    s.status === "waiting" || s.status === "suspect"
+  ).length;
+  document.title = n > 0 ? `(${n}) claude-notify` : "claude-notify";
+}
+
+function sessionCardHTML(s) {
+  // List view（v4 rework）：每行一个 session
+  //   行 1：[●] [名字] [✎ hover 出现] [状态徽] ………………… [→ 终端]
+  //   行 2：摘要（line-clamp 2，纯文字 label + · 分隔，去 chip 化）
+  //   行 3：[cwd · mode · effort]  ……  [time · 心跳]
+  const dotHtml = colorDot(s.color_token || 0);
+  const status = s.status || "unknown";
+  const statusCls = ` s-${escapeHtml(status)}`;
+  const sid = s.session_id || "";
+  const name = escapeHtml(displayName(s));
+  const aliasInUse = !!(s.alias && s.alias.trim());
+
+  // 副标题 = v3 spec §2.2 状态触发模板。主信息从工具层 → 语义层（last_milestone）。
+  //   waiting   → 请你 → {next_action}
+  //   running   → {last_milestone ? '上次 ${m}' : '正在 ${last_action}'} · 当前 {last_action || '等结果'}
+  //   suspect   → 卡 {N} 分钟 · 上次 {last_action || '...'}
+  //   idle/done → 刚完成 · {last_milestone || '...'} · 下一步 {next_action}
+  //   idle/已歇 → 上次 · {last_milestone || '...'} · 等你 resume
+  //   ended/dead→ 已结束 · {last_milestone || '可归档'}
+  //   空        → 刚启动 · 等你输入第一条 prompt
+  const ps = s.progress_state || "";
+  const waitingFor = (s.waiting_for || "").trim();
+  const lastAction = (s.last_action || "").trim();
+  const lastMilestone = (s.last_milestone || "").trim();
+  const turnSummary = (s.turn_summary || "").trim();
+  const nextAction = (s.next_action || "").trim();
+  const lastMsg = (s.last_message || "").trim();
+  const ageMin = Math.max(1, Math.floor((s.age_seconds || 0) / 60));
+
+  let summary = "";
+  let summaryLabel = "";
+  let summaryRaw = "";
+
+  if (s.status === "waiting") {
+    summaryLabel = "请你 →";
+    summary = nextAction || waitingFor || "确认";
+    summaryRaw = waitingFor || nextAction;
+  } else if (s.status === "running") {
+    if (lastMilestone) {
+      summaryLabel = "上次";
+      summary = `${lastMilestone}${lastAction ? ` · 当前 ${lastAction}` : ""}`;
+    } else {
+      summaryLabel = "正在";
+      summary = lastAction ? `${lastAction} · 等结果` : "工作中";
+    }
+    summaryRaw = lastMilestone || lastAction;
+  } else if (s.status === "suspect") {
+    summaryLabel = "可能卡住";
+    summary = `卡 ${ageMin} 分钟${lastAction ? ` · 上次 ${lastAction}` : ""}`;
+    summaryRaw = lastAction || lastMsg;
+  } else if (s.status === "idle") {
+    const milestone = lastMilestone || turnSummary;
+    if (ps === "刚完成") {
+      summaryLabel = "刚完成";
+      summary = milestone ? `${milestone} · 下一步 ${nextAction || "提下一轮"}` : (nextAction || "提下一轮 / 或归档");
+    } else {
+      summaryLabel = "上次";
+      summary = milestone ? `${milestone} · 等你 resume` : "等你 resume";
+    }
+    summaryRaw = s.last_assistant_message || milestone;
+  } else if (s.status === "ended" || s.status === "dead") {
+    summaryLabel = "已结束";
+    summary = lastMilestone || turnSummary || "可归档";
+    summaryRaw = s.last_assistant_message || lastMilestone;
+  } else if (s.note) {
+    summaryLabel = "备注"; summary = s.note; summaryRaw = s.note;
+  } else {
+    summaryLabel = "刚启动"; summary = "等你输入第一条 prompt";
+  }
+
+  const summaryHtml = `<div class="item-summary" title="${escapeHtml(summaryRaw || summary)}"><span class="item-summary-label">${escapeHtml(summaryLabel)}</span><span class="item-summary-text">${escapeHtml(summary)}</span></div>`;
+
+  const hasTty = !!(s.tty && String(s.tty).trim());
+  const focusBtnHtml = `<button class="btn-focus" data-sid="${escapeHtml(sid)}" type="button" ${hasTty ? "" : "disabled"} title="${hasTty ? "在终端中打开（切到对应 tab）" : "该 session 还没记录到 tty（再触发一次 hook 即可）"}" aria-label="打开终端">→ 终端</button>`;
+
+  const metaLeftBits = [s.cwd_short, s.permission_mode, s.effort_level]
+    .filter(Boolean).map(escapeHtml).join(" · ");
+  const heartbeatBit = s.last_heartbeat_ts
+    ? ` · 心跳 ${escapeHtml(relTime(s.last_heartbeat_ts))}`
+    : "";
+  const absTime = absTimeShanghai(s.last_event_ts);
+  const fullTitle = fullTimeShanghai(s.last_event_ts);
+  // v3：上海绝对时间（HH:MM 同天 / MM-DD HH:MM 跨天）+ 相对时间，hover 完整
+  const metaRightBits = `<span title="${escapeHtml(fullTitle)}">${escapeHtml(absTime ? `${absTime} · ${relTime(s.last_event_ts)}` : relTime(s.last_event_ts))}</span>${heartbeatBit}`;
+
+  return `
+    <div class="session-item${statusCls}" data-sid="${escapeHtml(sid)}" tabindex="0" role="button" aria-label="${escapeHtml(name)}">
+      <div class="item-head-l">
+        ${dotHtml}
+        <span class="name" title="${escapeHtml(sid)}">${name}</span>
+        <button class="alias-edit" data-sid="${escapeHtml(sid)}" type="button" title="起别名/备注" aria-label="起别名">✎</button>
+        <span class="${statusBadgeClass(status)}">${escapeHtml(statusLabel(status))}</span>
+      </div>
+      <div class="item-actions">${focusBtnHtml}</div>
+      ${summaryHtml}
+      <div class="item-meta">
+        <span class="meta-left" title="${escapeHtml(s.cwd || "")}">${metaLeftBits || "—"}</span>
+        <span class="meta-right">${metaRightBits}</span>
+      </div>
+    </div>
+  `;
+}
+
+function renderDrawerEvents() {
+  // autoscroll：最新事件置顶时，用户在最顶部就保持顶部锁定（auto-stick to newest）
+  const wasAtTop = $drawerBody.scrollTop <= 4;
+
+  // 重新渲染过滤 chip
+  renderDrawerFilter();
+
+  if (!state.drawerEvents || state.drawerEvents.length === 0) {
+    $drawerBody.innerHTML = `<p class="muted">暂无事件。</p>`;
+    return;
+  }
+  const filtered = state.drawerEvents.filter(ev =>
+    !state.drawerHiddenTypes.has(ev.event)
+  );
+  if (filtered.length === 0) {
+    $drawerBody.innerHTML = `<p class="muted">所有事件类型已被过滤。</p>`;
+    return;
+  }
+  // 倒序：最新事件置顶（用户预期的「最近的在最上」）
+  const rows = filtered.slice().reverse().map(eventRowHTML).join("");
+  $drawerBody.innerHTML = rows;
+
+  if (wasAtTop) {
+    $drawerBody.scrollTop = 0;
+  }
+}
+
+function renderDrawerFilter() {
+  const types = Array.from(new Set(
+    (state.drawerEvents || []).map(ev => ev.event).filter(Boolean)
+  )).sort();
+  if (types.length === 0) {
+    $drawerFilter.innerHTML = "";
+    return;
+  }
+  $drawerFilter.innerHTML = types.map(t => {
+    const checked = state.drawerHiddenTypes.has(t) ? "" : "checked";
+    return `<label><input type="checkbox" data-evtype="${escapeHtml(t)}" ${checked}/> ${escapeHtml(t)}</label>`;
+  }).join("");
+}
+
+function eventRowHTML(ev) {
+  // v3 spec §2.3：单行（chip + 时间 + 主文本）。主文本优先 LLM 摘要 > 启发式 message > 默认。
+  // 砍掉的：
+  //   - 事件类型默认 message（如「任务一回合结束」与 chip 重复）
+  //   - LLM summary 与 message 实质相同时不再双行
+  const evType = ev.event || "?";
+  const msg = (ev.message || "").trim();
+  const llmSummary = (ev.llm_summary || "").trim();
+
+  // 与 chip 重复的默认中文化标题不进主文本
+  const DEFAULT_NOISE = new Set([
+    "任务一回合结束", "子 agent 完成", "Claude is waiting for your input",
+    "会话开始", "会话结束", "会话疑似已结束", "heartbeat",
+  ]);
+  const cleanMsg = (msg && !DEFAULT_NOISE.has(msg) && !msg.startsWith("heartbeat:")) ? msg : "";
+
+  // LLM 摘要 与 cleanMsg 实质相同（lower trim 等价 / 一方是另一方前缀）→ 只渲染一份
+  let mainText = llmSummary || cleanMsg;
+  if (llmSummary && cleanMsg && llmSummary !== cleanMsg) {
+    const a = llmSummary.toLowerCase();
+    const b = cleanMsg.toLowerCase();
+    if (!a.startsWith(b) && !b.startsWith(a)) {
+      // 都保留时 LLM 主、原文 hover 标题 — 不渲染第二行
+    }
+  }
+
+  const titleAttr = (cleanMsg && cleanMsg !== mainText) ? ` title="${escapeHtml(cleanMsg)}"` : "";
+  return `
+    <div class="event-row"${titleAttr}>
+      <div class="ev-head">
+        <span class="${eventBadgeClass(evType)}">${escapeHtml(evType)}</span>
+        <span class="muted">${escapeHtml(relTime(ev.ts))}</span>
+      </div>
+      ${mainText ? `<div class="ev-msg">${escapeHtml(mainText)}</div>` : ""}
+    </div>
+  `;
+}
+
+function setMenuStatus(el, text, kind) {
+  // kind: 'ok' | 'warn' | '' (idle)
+  if (!el) return;
+  const span = el.querySelector(".menu-status-text");
+  if (span) span.textContent = text;
+  el.classList.remove("ok", "warn");
+  if (kind === "ok") el.classList.add("ok");
+  else if (kind === "warn") el.classList.add("warn");
+}
+
+function renderWebhookBadge() {
+  const cfg = state.config;
+  if (!cfg) {
+    setMenuStatus($webhookBadge, "webhook: ?", "");
+    return;
+  }
+  if (cfg.feishu_webhook_set) {
+    setMenuStatus($webhookBadge, "webhook: 已配置", "ok");
+  } else {
+    setMenuStatus($webhookBadge, "webhook: 未配置", "warn");
+  }
+}
+
+function setWsStatus(s) {
+  const map = {
+    connecting: ["ws: 连接中", ""],
+    open:       ["ws: 已连接", "ok"],
+    closed:     ["ws: 已断开", "warn"],
+    error:      ["ws: 错误",   "warn"],
+  };
+  const [text, kind] = map[s] || ["ws: ?", ""];
+  setMenuStatus($wsBadge, text, kind);
+}
+
+// 状态汇总徽：仅计 waiting + suspect（dead/ended 不计，避免拉高待办数字）
+function renderSummaryPill() {
+  const all = state.sessions || [];
+  const wn = all.filter(s => s.status === "waiting").length;
+  const sn = all.filter(s => s.status === "suspect").length;
+  const total = all.length;
+  $summaryPill.classList.remove("is-empty", "has-waiting", "has-suspect");
+  if (wn > 0) $summaryPill.classList.add("has-waiting");
+  else if (sn > 0) $summaryPill.classList.add("has-suspect");
+  else $summaryPill.classList.add("is-empty");
+
+  if (wn === 0 && sn === 0) {
+    $summaryText.textContent = `全部 ${total}`;
+  } else {
+    const parts = [];
+    if (wn > 0) parts.push(`等确认 ${wn}`);
+    if (sn > 0) parts.push(`疑挂 ${sn}`);
+    $summaryText.textContent = parts.join(" · ");
+  }
+}
+
+// ───────────── 抽屉 ─────────────
+async function openDrawer(sessionId) {
+  state.drawerSessionId = sessionId;
+  const s = state.sessions.find(x => x.session_id === sessionId);
+
+  // 头部：dot / 名字 / 状态徽 + → 终端按钮
+  if (s) {
+    $drawerDot.style.background = colorDotValue(s.color_token || 0);
+    $drawerTitle.textContent = displayName(s);
+    $drawerTitle.title = sessionId;
+    const status = s.status || "idle";
+    $drawerStatus.className = statusBadgeClass(status);
+    $drawerStatus.textContent = statusLabel(status);
+    $drawerStatus.classList.remove("hidden");
+    // → 终端按钮：根据 tty 是否存在决定 disabled
+    if ($drawerFocus) {
+      const hasTty = !!(s.tty && String(s.tty).trim());
+      $drawerFocus.disabled = !hasTty;
+      $drawerFocus.dataset.sid = sessionId;
+      $drawerFocus.title = hasTty
+        ? "在终端中打开（切到对应 tab）"
+        : "该 session 还没记录到 tty（再触发一次 hook 即可）";
+    }
+  } else {
+    $drawerDot.style.background = "var(--c-idle-solid)";
+    $drawerTitle.textContent = sessionId;
+    $drawerStatus.className = "status-badge status-idle hidden";
+    $drawerStatus.textContent = "";
+    if ($drawerFocus) {
+      $drawerFocus.disabled = true;
+      $drawerFocus.dataset.sid = sessionId;
+    }
+  }
+
+  // 第一行：session id + cwd_short；第二行：与卡片同一句式（请你/正在/刚完成/...）
+  const subLine1 = `session: ${truncate(sessionId, 12)}${s && s.cwd_short ? "  ·  " + s.cwd_short : ""}`;
+  let subLine2 = "";
+  if (s) {
+    const ps = s.progress_state || "";
+    const wf = (s.waiting_for || "").trim();
+    const la = (s.last_action || "").trim();
+    const ts = (s.turn_summary || "").trim();
+    const na = (s.next_action || "").trim();
+    const ageMin = Math.max(1, Math.floor((s.age_seconds || 0) / 60));
+    let label = "", text = "";
+    if (s.status === "waiting") {
+      label = "请你"; text = na || wf || "确认";
+    } else if (s.status === "running") {
+      label = "正在"; text = la ? `${la} · 等结果` : "工作中";
+    } else if (s.status === "suspect") {
+      label = "可能卡住"; text = `${ageMin} 分钟无新事件 · 进终端看看`;
+    } else if (s.status === "idle") {
+      if (ps === "刚完成") { label = "刚完成"; text = ts ? `${ts} · 提下一轮` : "提下一轮 / 或归档"; }
+      else { label = "上次"; text = ts ? `${ts} · 等你 resume` : "等你 resume"; }
+    } else if (s.status === "ended" || s.status === "dead") {
+      label = "已结束"; text = ts || na || "可归档 / 或 resume";
+    } else if (s.alias && s.first_user_prompt) {
+      label = "任务"; text = truncate(s.first_user_prompt, 80);
+    }
+    if (label && text) {
+      subLine2 = `<span class="drawer-sub-label">${escapeHtml(label)}</span>${escapeHtml(text)}`;
+    }
+  }
+  $drawerSub.innerHTML = `<div class="drawer-sub-line">${escapeHtml(subLine1)}</div>${subLine2 ? `<div class="drawer-sub-line drawer-sub-headline">${subLine2}</div>` : ""}`;
+  $drawerSub.title = sessionId + (s && s.cwd ? "  ·  " + s.cwd : "");
+
+  // Meta 块默认折叠
+  $drawerMeta.classList.remove("open");
+  $drawerMetaToggle.setAttribute("aria-expanded", "false");
+  $drawerMetaBody.innerHTML = s ? renderMetaBody(s) : "";
+
+  $drawer.classList.remove("hidden");
+  $drawerBody.innerHTML = `<p class="empty">加载中…</p>`;
+  try {
+    const events = await api.listEvents(sessionId, 50);
+    state.drawerEvents = Array.isArray(events) ? events : [];
+    renderDrawerEvents();
+  } catch (e) {
+    $drawerBody.innerHTML = `<p class="empty">加载失败：${escapeHtml(e.message)}</p>`;
+  }
+}
+
+function fmtAbsTime(ts) {
+  if (!ts) return "—";
+  const t = new Date(ts);
+  if (Number.isNaN(t.getTime())) return ts;
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${t.getFullYear()}-${pad(t.getMonth()+1)}-${pad(t.getDate())} ${pad(t.getHours())}:${pad(t.getMinutes())}:${pad(t.getSeconds())}`;
+}
+
+function metaRowHTML(key, val, opts = {}) {
+  if (val == null || val === "") return "";
+  const safeVal = escapeHtml(String(val));
+  const valCls = opts.plain ? "val plain" : "val";
+  const copyBtn = opts.copy
+    ? `<button class="copy-btn" type="button" data-copy="${safeVal}" title="复制">复制</button>`
+    : "";
+  return `<div class="drawer-meta-row"><span class="key">${escapeHtml(key)}</span><span class="${valCls}">${safeVal}</span>${copyBtn}</div>`;
+}
+
+function renderMetaBody(s) {
+  const modeBits = [s.permission_mode, s.effort_level].filter(Boolean).join(" · ");
+  const rows = [
+    metaRowHTML("sid", s.session_id, { copy: true }),
+    metaRowHTML("cwd", s.cwd, { copy: true }),
+    metaRowHTML("pid", s.claude_pid),
+    metaRowHTML("transcript", s.transcript_path),
+    metaRowHTML("mode", modeBits, { plain: true }),
+    metaRowHTML("first_prompt", s.first_user_prompt, { plain: true }),
+    metaRowHTML("起始", fmtAbsTime(s.start_ts || s.first_event_ts), { plain: true }),
+    metaRowHTML("心跳", fmtAbsTime(s.last_heartbeat_ts), { plain: true }),
+  ].filter(Boolean).join("");
+  return rows || `<div class="drawer-meta-row"><span class="key muted">无</span></div>`;
+}
+
+function closeDrawer() {
+  state.drawerSessionId = null;
+  state.drawerEvents = [];
+  $drawer.classList.add("hidden");
+}
+
+// ───────────── alias 编辑 ─────────────
+async function onFocusTerminal(sessionId) {
+  if (!sessionId) return;
+  try {
+    const r = await api.focusTerminal(sessionId);
+    if (r && r.ok) {
+      const appLabel = r.app === "iterm2" ? "iTerm2" : (r.app === "terminal" ? "Terminal.app" : "终端");
+      showToast(`已切到 ${appLabel}（${r.tty}）`, "ok");
+    } else {
+      const reasonMap = {
+        no_tty: "该 session 还没记录 tty。让 Claude 跑一次工具调用产生新 hook 即可。",
+        tty_not_in_known_terminal: "iTerm2 / Terminal.app 中找不到该 tty（可能终端已关闭，或 Claude 跑在 VSCode/Termius 等不支持的环境）",
+        osascript_timeout: "osascript 响应超时",
+        osascript_not_available: "未检测到 osascript（仅 macOS 支持）",
+      };
+      const msg = (r && (reasonMap[r.reason] || r.reason)) || "未知错误";
+      showToast(`无法定位终端：${msg}`, "err");
+    }
+  } catch (e) {
+    showToast(`打开终端失败：${e.message}`, "err");
+  }
+}
+
+function onEditAlias(sessionId) {
+  const s = state.sessions.find(x => x.session_id === sessionId);
+  aliasEditingSid = sessionId;
+  $aliasForm.elements["alias"].value = (s && s.alias) || "";
+  $aliasForm.elements["note"].value = (s && s.note) || "";
+  $modalAlias.classList.remove("hidden");
+  // 焦点到 alias 输入
+  setTimeout(() => $aliasForm.elements["alias"].focus(), 0);
+}
+
+function closeAliasModal() {
+  aliasEditingSid = null;
+  $modalAlias.classList.add("hidden");
+}
+
+// ───────────── 配置弹窗 ─────────────
+function openConfigModal() {
+  if (!state.config) {
+    $configMsg.textContent = "配置加载中…";
+    return;
+  }
+  fillConfigForm(state.config);
+  $configMsg.textContent = "";
+  $modal.classList.remove("hidden");
+}
+function closeConfigModal() { $modal.classList.add("hidden"); }
+
+function ensureNpRows() {
+  if ($npFieldset.querySelector(".np-row")) return;
+  // 注入 legend + 6 行控件
+  const legend = $npFieldset.querySelector("legend") || document.createElement("legend");
+  legend.textContent = "推送策略 (静默 = 等 N 秒后再推)";
+  if (!legend.parentNode) $npFieldset.appendChild(legend);
+  const frag = document.createDocumentFragment();
+  NP_KEYS.forEach(k => {
+    const row = document.createElement("div");
+    row.className = "np-row";
+    row.innerHTML = `
+      <span class="np-name">${escapeHtml(k)}</span>
+      <select data-np-mode="${escapeHtml(k)}">
+        <option value="immediate">立即</option>
+        <option value="silence">静默</option>
+        <option value="off">关闭</option>
+      </select>
+      <input type="number" min="1" step="1" data-np-sec="${escapeHtml(k)}"
+             value="${SILENCE_DEFAULTS[k] || 5}" />
+      <span class="np-unit">秒</span>
+    `;
+    frag.appendChild(row);
+  });
+  $npFieldset.appendChild(frag);
+  // 绑定 select 切换 → 启用/禁用秒数
+  $npFieldset.addEventListener("change", (e) => {
+    const t = e.target;
+    if (t && t.matches("select[data-np-mode]")) {
+      const k = t.dataset.npMode;
+      const sec = $npFieldset.querySelector(`input[data-np-sec="${k}"]`);
+      if (sec) sec.disabled = (t.value !== "silence");
+    }
+  });
+}
+
+function parseNpString(raw) {
+  // 输入: "immediate" | "off" | "silence:N" | ""（视作默认 immediate）
+  const s = (raw || "").trim();
+  if (!s || s === "immediate") return { mode: "immediate", sec: 0 };
+  if (s === "off") return { mode: "off", sec: 0 };
+  if (s.startsWith("silence:")) {
+    const n = parseInt(s.slice(8), 10);
+    return { mode: "silence", sec: Number.isFinite(n) && n > 0 ? n : 5 };
+  }
+  // fallback：当作 immediate
+  return { mode: "immediate", sec: 0 };
+}
+
+function fillConfigForm(cfg) {
+  const f = $configForm;
+  f.elements["feishu_webhook"].value = cfg.feishu_webhook || "";
+  f.elements["timeout_minutes"].value = cfg.timeout_minutes ?? 5;
+  f.elements["dead_threshold_minutes"].value = cfg.dead_threshold_minutes ?? 30;
+
+  ensureNpRows();
+  const np = cfg.notify_policy || {};
+  NP_KEYS.forEach(k => {
+    const parsed = parseNpString(np[k]);
+    const sel = $npFieldset.querySelector(`select[data-np-mode="${k}"]`);
+    const sec = $npFieldset.querySelector(`input[data-np-sec="${k}"]`);
+    if (sel) sel.value = parsed.mode;
+    if (sec) {
+      sec.value = parsed.sec || (SILENCE_DEFAULTS[k] || 5);
+      sec.disabled = (parsed.mode !== "silence");
+    }
+  });
+
+  const disp = cfg.display || {};
+  f.elements["display_show_first_prompt"].checked = disp.show_first_prompt !== false;
+  f.elements["display_show_last_assistant"].checked = disp.show_last_assistant !== false;
+
+  // LLM 配置
+  const llm = cfg.llm || {};
+  const ant = llm.anthropic || {};
+  const oai = llm.openai || {};
+  const lcli = llm.local_cli || {};
+  if (f.elements["llm_enabled"]) f.elements["llm_enabled"].checked = !!llm.enabled;
+  if (f.elements["llm_provider"]) f.elements["llm_provider"].value = llm.provider || "local_cli";
+  if (f.elements["llm_anthropic_api_key"]) f.elements["llm_anthropic_api_key"].value = ant.api_key || "";
+  if (f.elements["llm_anthropic_model"]) f.elements["llm_anthropic_model"].value = ant.model || "claude-haiku-4-5";
+  if (f.elements["llm_anthropic_base_url"]) f.elements["llm_anthropic_base_url"].value = ant.base_url || "";
+  if (f.elements["llm_openai_api_key"]) f.elements["llm_openai_api_key"].value = oai.api_key || "";
+  if (f.elements["llm_openai_model"]) f.elements["llm_openai_model"].value = oai.model || "gpt-4o-mini";
+  if (f.elements["llm_openai_base_url"]) f.elements["llm_openai_base_url"].value = oai.base_url || "https://api.openai.com";
+  if (f.elements["llm_local_cli_binary"]) f.elements["llm_local_cli_binary"].value = lcli.binary || "";
+  if (f.elements["llm_local_cli_model"]) f.elements["llm_local_cli_model"].value = lcli.model || "claude-haiku-4-5";
+  if (f.elements["llm_local_cli_mode"]) f.elements["llm_local_cli_mode"].value = lcli.mode || "auto";
+  if (f.elements["llm_local_cli_timeout_s"]) f.elements["llm_local_cli_timeout_s"].value = lcli.timeout_s || 30;
+  if (f.elements["llm_topic_enabled"]) f.elements["llm_topic_enabled"].checked = llm.topic_enabled !== false;
+  if (f.elements["llm_event_summary_enabled"]) f.elements["llm_event_summary_enabled"].checked = llm.event_summary_enabled !== false;
+  syncProviderBlocks();
+}
+
+// 仅展示当前选中 provider 的配置块，其它折叠隐藏
+function syncProviderBlocks() {
+  const f = $configForm;
+  if (!f) return;
+  const providerSelect = f.elements["llm_provider"];
+  if (!providerSelect) return;
+  const current = providerSelect.value || "anthropic";
+  f.querySelectorAll(".provider-block[data-provider]").forEach(block => {
+    if (block.dataset.provider === current) block.classList.remove("hidden");
+    else block.classList.add("hidden");
+  });
+}
+
+function readConfigForm() {
+  const f = $configForm;
+  const np = {};
+  NP_KEYS.forEach(k => {
+    const sel = $npFieldset.querySelector(`select[data-np-mode="${k}"]`);
+    const sec = $npFieldset.querySelector(`input[data-np-sec="${k}"]`);
+    if (!sel) return;
+    const mode = sel.value;
+    if (mode === "immediate") np[k] = "immediate";
+    else if (mode === "off") np[k] = "off";
+    else if (mode === "silence") {
+      const n = parseInt(sec && sec.value, 10);
+      np[k] = `silence:${Number.isFinite(n) && n > 0 ? n : (SILENCE_DEFAULTS[k] || 5)}`;
+    }
+  });
+  // 保留现有 snooze_until（不在表单里编辑，由免打扰按钮维护）
+  const snooze_until = (state.config && state.config.snooze_until) || "";
+  return {
+    feishu_webhook: f.elements["feishu_webhook"].value.trim(),
+    timeout_minutes: parseInt(f.elements["timeout_minutes"].value, 10) || 5,
+    dead_threshold_minutes: parseInt(f.elements["dead_threshold_minutes"].value, 10) || 30,
+    notify_policy: np,
+    display: {
+      show_first_prompt: f.elements["display_show_first_prompt"].checked,
+      show_last_assistant: f.elements["display_show_last_assistant"].checked,
+    },
+    llm: {
+      enabled: f.elements["llm_enabled"] ? f.elements["llm_enabled"].checked : false,
+      provider: f.elements["llm_provider"] ? f.elements["llm_provider"].value : "local_cli",
+      anthropic: {
+        api_key: f.elements["llm_anthropic_api_key"] ? f.elements["llm_anthropic_api_key"].value.trim() : "",
+        model: f.elements["llm_anthropic_model"] ? (f.elements["llm_anthropic_model"].value.trim() || "claude-haiku-4-5") : "claude-haiku-4-5",
+        base_url: f.elements["llm_anthropic_base_url"] ? f.elements["llm_anthropic_base_url"].value.trim() : "",
+      },
+      openai: {
+        api_key: f.elements["llm_openai_api_key"] ? f.elements["llm_openai_api_key"].value.trim() : "",
+        model: f.elements["llm_openai_model"] ? (f.elements["llm_openai_model"].value.trim() || "gpt-4o-mini") : "gpt-4o-mini",
+        base_url: f.elements["llm_openai_base_url"] ? (f.elements["llm_openai_base_url"].value.trim() || "https://api.openai.com") : "https://api.openai.com",
+      },
+      local_cli: {
+        binary: f.elements["llm_local_cli_binary"] ? f.elements["llm_local_cli_binary"].value.trim() : "",
+        model: f.elements["llm_local_cli_model"] ? (f.elements["llm_local_cli_model"].value.trim() || "claude-haiku-4-5") : "claude-haiku-4-5",
+        mode: f.elements["llm_local_cli_mode"] ? f.elements["llm_local_cli_mode"].value : "auto",
+        timeout_s: f.elements["llm_local_cli_timeout_s"] ? (parseInt(f.elements["llm_local_cli_timeout_s"].value, 10) || 30) : 30,
+      },
+      topic_enabled: f.elements["llm_topic_enabled"] ? f.elements["llm_topic_enabled"].checked : true,
+      event_summary_enabled: f.elements["llm_event_summary_enabled"] ? f.elements["llm_event_summary_enabled"].checked : true,
+    },
+    snooze_until,
+  };
+}
+
+// ───────────── 数据加载 ─────────────
+async function loadSessions() {
+  try {
+    const list = await api.listSessions(true);
+    state.sessions = Array.isArray(list) ? list : [];
+    renderSessions();
+  } catch (e) {
+    $sessions.innerHTML = `<p class="empty">加载会话失败：${escapeHtml(e.message)}</p>`;
+  }
+}
+
+async function loadConfig() {
+  try {
+    state.config = await api.getConfig();
+  } catch (e) {
+    state.config = null;
+  }
+  renderWebhookBadge();
+  renderSnoozeBadge();
+}
+
+// ───────────── toast ─────────────
+function showToast(text, kind = "info") {
+  $toast.textContent = text;
+  $toast.className = "toast";
+  if (kind === "ok") $toast.classList.add("toast-ok");
+  else if (kind === "err") $toast.classList.add("toast-err");
+  $toast.classList.remove("hidden");
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    $toast.classList.add("hidden");
+    toastTimer = null;
+  }, 3000);
+}
+
+// ───────────── 免打扰 ─────────────
+function renderSnoozeBadge() {
+  // spec §6：按钮文字直接显示状态。未静音 = "免打扰 ▾"；静音中 = "🔕 静音至 HH:MM"
+  const until = state.config && state.config.snooze_until;
+  let active = false;
+  if (until) {
+    const t = new Date(until).getTime();
+    if (Number.isFinite(t) && t > Date.now()) {
+      const d = new Date(t);
+      const hh = String(d.getHours()).padStart(2, "0");
+      const mm = String(d.getMinutes()).padStart(2, "0");
+      $btnSnooze.textContent = `🔕 静音至 ${hh}:${mm}`;
+      active = true;
+    }
+  }
+  if (!active) $btnSnooze.textContent = "免打扰 ▾";
+  $btnSnooze.classList.toggle("is-active", active);
+}
+
+function isoLocalPlus08(date) {
+  // 输出 "+08:00" 偏移的 ISO 字符串（按本地时间字段，假定本地即东八区或保留本地壁钟）
+  const pad = (n) => String(n).padStart(2, "0");
+  const y = date.getFullYear();
+  const mo = pad(date.getMonth() + 1);
+  const d = pad(date.getDate());
+  const h = pad(date.getHours());
+  const mi = pad(date.getMinutes());
+  const s = pad(date.getSeconds());
+  return `${y}-${mo}-${d}T${h}:${mi}:${s}+08:00`;
+}
+
+function computeSnoozeUntil(kind) {
+  if (kind === "off") return "";
+  if (kind === "eod") {
+    const now = new Date();
+    const eod = new Date(now);
+    eod.setHours(18, 0, 0, 0);
+    if (eod.getTime() <= now.getTime()) {
+      // 已过 18:00，则推到次日 18:00
+      eod.setDate(eod.getDate() + 1);
+    }
+    return isoLocalPlus08(eod);
+  }
+  const minutes = parseInt(kind, 10);
+  if (!Number.isFinite(minutes) || minutes <= 0) return "";
+  const t = new Date(Date.now() + minutes * 60 * 1000);
+  return isoLocalPlus08(t);
+}
+
+async function applySnooze(kind) {
+  if (!state.config) {
+    showToast("配置未加载", "err");
+    return;
+  }
+  const snooze_until = computeSnoozeUntil(kind);
+  // 复用现有 config，仅改 snooze_until
+  const cfg = { ...state.config, snooze_until };
+  // notify_policy/display 已在 state.config 里；不要带上 feishu_webhook 明文（保留服务端值）
+  // 但 saveConfig 接口约定接受全字段；保留 feishu_webhook 为现有值（可能是空字符串占位）
+  try {
+    const saved = await api.saveConfig(cfg);
+    state.config = saved || cfg;
+    renderSnoozeBadge();
+    showToast(snooze_until ? "已静音" : "已取消静音", "ok");
+  } catch (e) {
+    showToast(`设置失败：${e.message}`, "err");
+  }
+}
+
+// ───────────── URL hash 高亮 ─────────────
+function applyHashHighlight() {
+  const m = (window.location.hash || "").match(/s=([^&]+)/);
+  if (!m) return;
+  const sid = decodeURIComponent(m[1]);
+  const el = $sessions.querySelector(`.session-item[data-sid="${cssEscape(sid)}"]`);
+  if (!el) return;
+  el.classList.add("highlighted");
+  try {
+    el.scrollIntoView({ block: "center", behavior: "smooth" });
+  } catch (e) { /* ignore */ }
+  setTimeout(() => el.classList.remove("highlighted"), 3000);
+}
+
+function cssEscape(s) {
+  if (window.CSS && CSS.escape) return CSS.escape(s);
+  return String(s).replace(/[^a-zA-Z0-9_-]/g, c => `\\${c}`);
+}
+
+function onHashChange() {
+  const m = (window.location.hash || "").match(/s=([^&]+)/);
+  if (!m) return;
+  const sid = decodeURIComponent(m[1]);
+  openDrawer(sid);
+  applyHashHighlight();
+}
+
+// ───────────── WS ─────────────
+function onWsEnvelope(env) {
+  if (!env || typeof env !== "object") return;
+  if (env.type === "event") {
+    const evt = env.event;
+    const summary = env.session;
+    if (!evt || !evt.session_id) return;
+    upsertSessionFromEvent(evt, summary);
+    renderSessions();
+    if (state.drawerSessionId && evt.session_id === state.drawerSessionId) {
+      state.drawerEvents.push(evt);
+      if (state.drawerEvents.length > 50) state.drawerEvents = state.drawerEvents.slice(-50);
+      renderDrawerEvents();
+    }
+    return;
+  }
+  if (env.type === "session_updated" && env.session) {
+    const idx = state.sessions.findIndex(s => s.session_id === env.session.session_id);
+    if (idx >= 0) state.sessions[idx] = env.session;
+    else state.sessions.push(env.session);
+    renderSessions();
+    return;
+  }
+  if (env.type === "enrichment_updated") {
+    // LLM 摘要补到位（topic 或 event）；更新对应 session + 抽屉事件流
+    if (env.session && env.session.session_id) {
+      const idx = state.sessions.findIndex(s => s.session_id === env.session.session_id);
+      if (idx >= 0) state.sessions[idx] = env.session;
+      renderSessions();
+    }
+    // 抽屉打开 + 同 session → 重新拉一次事件流以便附上 llm_summary
+    if (state.drawerSessionId && env.session_id === state.drawerSessionId) {
+      api.listEvents(state.drawerSessionId, 50).then(events => {
+        state.drawerEvents = Array.isArray(events) ? events : [];
+        renderDrawerEvents();
+      }).catch(() => {});
+    }
+    return;
+  }
+  // hello / ping 不处理
+}
+
+function upsertSessionFromEvent(evt, summary) {
+  if (summary && summary.session_id) {
+    const idx = state.sessions.findIndex(s => s.session_id === summary.session_id);
+    if (idx >= 0) state.sessions[idx] = summary;
+    else state.sessions.push(summary);
+    return;
+  }
+  const idx = state.sessions.findIndex(s => s.session_id === evt.session_id);
+  if (idx >= 0) {
+    const s = state.sessions[idx];
+    s.last_event = evt.event;
+    s.last_event_ts = evt.ts;
+    s.event_count = (s.event_count || 0) + 1;
+  } else {
+    state.sessions.push({
+      session_id: evt.session_id,
+      project: evt.project || "",
+      cwd: evt.cwd || "",
+      cwd_short: evt.cwd_short || "",
+      status: "running",
+      last_event: evt.event,
+      last_event_ts: evt.ts,
+      event_count: 1,
+    });
+    loadSessions();
+  }
+}
+
+// ───────────── 工具 ─────────────
+function escapeHtml(s) {
+  if (s == null) return "";
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+// ───────────── 事件绑定 ─────────────
+$btnTest.addEventListener("click", async () => {
+  $btnTest.disabled = true;
+  const orig = $btnTest.textContent;
+  $btnTest.textContent = "推送中…";
+  try {
+    const r = await api.testNotify();
+    if (r && r.ok) showToast("测试推送成功", "ok");
+    else showToast(`测试推送返回：${JSON.stringify(r)}`, "err");
+  } catch (e) {
+    showToast(`测试推送失败：${e.message}`, "err");
+  } finally {
+    $btnTest.disabled = false;
+    $btnTest.textContent = orig;
+  }
+});
+
+$btnConfig.addEventListener("click", openConfigModal);
+// LLM provider 切换 → 显示对应配置块
+$configForm.addEventListener("change", (e) => {
+  if (e.target && e.target.name === "llm_provider") syncProviderBlocks();
+});
+$configCancel.addEventListener("click", closeConfigModal);
+$modal.addEventListener("click", (e) => { if (e.target === $modal) closeConfigModal(); });
+
+$configForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  $configMsg.textContent = "保存中…";
+  try {
+    const cfg = readConfigForm();
+    const saved = await api.saveConfig(cfg);
+    state.config = saved || cfg;
+    renderWebhookBadge();
+    renderSnoozeBadge();
+    $configMsg.textContent = "已保存。";
+    showToast("配置已保存", "ok");
+    setTimeout(closeConfigModal, 600);
+  } catch (err) {
+    $configMsg.textContent = `保存失败：${err.message}`;
+    showToast(`保存失败：${err.message}`, "err");
+  }
+});
+
+// alias modal 绑定
+$aliasCancel.addEventListener("click", closeAliasModal);
+$modalAlias.addEventListener("click", (e) => { if (e.target === $modalAlias) closeAliasModal(); });
+$aliasForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (!aliasEditingSid) { closeAliasModal(); return; }
+  const sid = aliasEditingSid;
+  const alias = $aliasForm.elements["alias"].value;
+  const note = $aliasForm.elements["note"].value;
+  try {
+    await api.setAlias(sid, alias, note);
+    closeAliasModal();
+    await loadSessions();
+    showToast("别名已保存", "ok");
+  } catch (err) {
+    showToast(`保存别名失败：${err.message}`, "err");
+  }
+});
+
+// 免打扰按钮
+$btnSnooze.addEventListener("click", (e) => {
+  e.stopPropagation();
+  closeMoreMenu();
+  $snoozeMenu.classList.toggle("hidden");
+  $btnSnooze.setAttribute("aria-expanded", String(!$snoozeMenu.classList.contains("hidden")));
+});
+$snoozeMenu.addEventListener("click", async (e) => {
+  const t = e.target;
+  if (!(t instanceof HTMLElement)) return;
+  const kind = t.getAttribute("data-snooze");
+  if (!kind) return;
+  $snoozeMenu.classList.add("hidden");
+  $btnSnooze.setAttribute("aria-expanded", "false");
+  await applySnooze(kind);
+});
+
+// 状态汇总徽：点击展开/折叠 chip 行
+$summaryPill.addEventListener("click", (e) => {
+  e.stopPropagation();
+  const wasHidden = $statusFilter.classList.contains("hidden");
+  $statusFilter.classList.toggle("hidden");
+  $summaryPill.setAttribute("aria-expanded", String(wasHidden));
+});
+
+// ⋯ 菜单：点击展开/折叠
+function closeMoreMenu() {
+  $moreMenu.classList.add("hidden");
+  $btnMore.setAttribute("aria-expanded", "false");
+}
+$btnMore.addEventListener("click", (e) => {
+  e.stopPropagation();
+  $snoozeMenu.classList.add("hidden");
+  $btnSnooze.setAttribute("aria-expanded", "false");
+  $moreMenu.classList.toggle("hidden");
+  $btnMore.setAttribute("aria-expanded", String(!$moreMenu.classList.contains("hidden")));
+});
+// ⋯ 菜单内点 button 后关菜单（让原 click handler 仍然触发）
+$moreMenu.addEventListener("click", (e) => {
+  const t = e.target;
+  if (!(t instanceof HTMLElement)) return;
+  if (t.tagName === "BUTTON") closeMoreMenu();
+});
+
+// outside click 统一关菜单 + 抽屉
+document.addEventListener("click", (e) => {
+  if (!$snoozeMenu.classList.contains("hidden")) {
+    if (!$btnSnooze.contains(e.target) && !$snoozeMenu.contains(e.target)) {
+      $snoozeMenu.classList.add("hidden");
+      $btnSnooze.setAttribute("aria-expanded", "false");
+    }
+  }
+  if (!$moreMenu.classList.contains("hidden")) {
+    if (!$btnMore.contains(e.target) && !$moreMenu.contains(e.target)) {
+      closeMoreMenu();
+    }
+  }
+  // 抽屉打开时点空白关闭：排除抽屉本身、modal、卡片（卡片自己已 stopPropagation 切换 session）
+  if (!$drawer.classList.contains("hidden")) {
+    const t = e.target;
+    if ($drawer.contains(t)) return;          // 抽屉内
+    if (t.closest(".session-item")) return;   // 卡片由自身 click 切换
+    if (t.closest(".modal")) return;          // 弹窗优先
+    if (t.closest(".topbar")) return;         // 顶栏交互
+    closeDrawer();
+  }
+});
+
+// Meta 折叠
+$drawerMetaToggle.addEventListener("click", () => {
+  const open = $drawerMeta.classList.toggle("open");
+  $drawerMetaToggle.setAttribute("aria-expanded", String(open));
+});
+
+// Meta 复制按钮（事件委托）
+$drawerMetaBody.addEventListener("click", async (e) => {
+  const t = e.target;
+  if (!(t instanceof HTMLElement)) return;
+  if (!t.classList.contains("copy-btn")) return;
+  const val = t.getAttribute("data-copy") || "";
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(val);
+    } else {
+      // fallback：临时 textarea
+      const ta = document.createElement("textarea");
+      ta.value = val; document.body.appendChild(ta); ta.select();
+      document.execCommand("copy"); document.body.removeChild(ta);
+    }
+    const orig = t.textContent;
+    t.classList.add("copied");
+    t.textContent = "已复制";
+    setTimeout(() => {
+      t.classList.remove("copied");
+      t.textContent = orig || "复制";
+    }, 1200);
+  } catch (err) {
+    showToast(`复制失败：${err.message}`, "err");
+  }
+});
+
+// Esc 关闭抽屉 / 弹窗 / 菜单
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (!$snoozeMenu.classList.contains("hidden")) {
+    $snoozeMenu.classList.add("hidden"); return;
+  }
+  if (!$moreMenu.classList.contains("hidden")) {
+    closeMoreMenu(); return;
+  }
+  if (!$modalAlias.classList.contains("hidden")) {
+    closeAliasModal(); return;
+  }
+  if (!$modal.classList.contains("hidden")) {
+    closeConfigModal(); return;
+  }
+  if (!$drawer.classList.contains("hidden")) {
+    closeDrawer(); return;
+  }
+});
+
+$drawerClose.addEventListener("click", (e) => { e.stopPropagation(); closeDrawer(); });
+if ($drawerFocus) {
+  $drawerFocus.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if ($drawerFocus.disabled) return;
+    const sid = $drawerFocus.dataset.sid;
+    if (sid) onFocusTerminal(sid);
+  });
+}
+
+// 抽屉过滤 chip：勾掉 = 隐藏
+$drawerFilter.addEventListener("change", (e) => {
+  if (!(e.target instanceof HTMLInputElement)) return;
+  const t = e.target.dataset.evtype;
+  if (!t) return;
+  if (e.target.checked) state.drawerHiddenTypes.delete(t);
+  else state.drawerHiddenTypes.add(t);
+  renderDrawerEvents();
+});
+
+$search.addEventListener("input", () => {
+  state.filter.text = $search.value;
+  renderSessions();
+});
+
+$statusFilter.addEventListener("change", (e) => {
+  if (!(e.target instanceof HTMLInputElement)) return;
+  if (e.target.checked) state.filter.statuses.add(e.target.value);
+  else state.filter.statuses.delete(e.target.value);
+  renderSessions();
+});
+
+// hashchange：飞书跳转过来时打开抽屉 + 高亮
+window.addEventListener("hashchange", onHashChange);
+
+// 30s 刷新相对时间显示
+setInterval(renderSessions, 30 * 1000);
+// 60s 兜底拉一次权威 sessions
+setInterval(loadSessions, 60 * 1000);
+// 60s 刷新静音徽章（过期自动隐藏）
+setInterval(renderSnoozeBadge, 60 * 1000);
+
+// 启动
+(async function main() {
+  setWsStatus("connecting");
+  await Promise.all([loadSessions(), loadConfig()]);
+  // 处理 URL hash #s=<session_id>
+  const m = (window.location.hash || "").match(/s=([^&]+)/);
+  if (m) {
+    openDrawer(decodeURIComponent(m[1]));
+    applyHashHighlight();
+  }
+  connectWS({ onEvent: onWsEnvelope, onStatus: setWsStatus });
+})();

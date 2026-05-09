@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>claude-notify</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header class="topbar" role="banner">
+    <div class="brand">claude-notify</div>
+
+    <div class="topbar-search">
+      <input id="search" type="search" placeholder="搜索别名 / 任务 / cwd / session…" autocomplete="off" />
+    </div>
+
+    <!-- 右侧操作组：状态汇总 / 免打扰 / 更多 -->
+    <div class="topbar-actions">
+      <!-- 状态汇总徽（点击展开 chip 行） -->
+      <button id="summary-pill" class="summary-pill is-empty" type="button" aria-expanded="false" aria-controls="status-filter">
+        <span id="summary-text" class="summary-text">全部 0</span>
+        <span class="caret" aria-hidden="true">▾</span>
+      </button>
+
+      <!-- 免打扰 -->
+      <div class="snooze-wrap">
+        <button id="btn-snooze" type="button" aria-haspopup="menu" aria-expanded="false">免打扰 ▾</button>
+        <div id="snooze-menu" class="snooze-menu hidden" role="menu">
+          <button type="button" data-snooze="30" role="menuitem">30 分钟</button>
+          <button type="button" data-snooze="60" role="menuitem">1 小时</button>
+          <button type="button" data-snooze="120" role="menuitem">2 小时</button>
+          <button type="button" data-snooze="eod" role="menuitem">直到下班 (18:00)</button>
+          <button type="button" data-snooze="off" role="menuitem">取消静音</button>
+        </div>
+      </div>
+
+      <!-- ⋯ 菜单：webhook 状态 / ws 状态 / 测试 / 配置 -->
+      <div class="snooze-wrap">
+        <button id="btn-more" class="btn-icon" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="更多">⋯</button>
+        <div id="more-menu" class="more-menu hidden" role="menu">
+          <div id="webhook-badge" class="menu-status" role="presentation">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span class="menu-status-text">webhook: ?</span>
+          </div>
+          <div id="ws-badge" class="menu-status" role="presentation">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span class="menu-status-text">ws: ?</span>
+          </div>
+          <div class="menu-sep" aria-hidden="true"></div>
+          <button id="btn-test" type="button" role="menuitem">测试推送</button>
+          <button id="btn-config" type="button" role="menuitem">配置</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- 折叠的状态过滤 chip 行（默认 hidden，点 summary-pill 展开） -->
+  <div id="status-filter" class="filter-chips hidden" role="group" aria-label="状态过滤">
+    <label><input type="checkbox" value="running" checked /> running</label>
+    <label><input type="checkbox" value="waiting" checked /> waiting</label>
+    <label><input type="checkbox" value="suspect" checked /> suspect</label>
+    <label><input type="checkbox" value="idle" checked /> idle</label>
+    <label><input type="checkbox" value="ended" /> ended</label>
+    <label><input type="checkbox" value="dead" /> dead</label>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <main>
+    <section id="sessions" class="sessions-list">
+      <p class="empty">加载中…</p>
+    </section>
+  </main>
+
+  <!-- 抽屉：session 详情 + 事件流 -->
+  <aside id="drawer" class="drawer hidden" aria-label="会话详情">
+    <div class="drawer-head">
+      <div class="drawer-head-title">
+        <div class="drawer-title-row">
+          <span id="drawer-dot" class="dot" aria-hidden="true" style="background:var(--c-idle-solid)"></span>
+          <span id="drawer-title" class="name">session</span>
+          <span id="drawer-status" class="status-badge status-idle"></span>
+        </div>
+        <div id="drawer-sub" class="drawer-sub"></div>
+      </div>
+      <div class="drawer-head-actions">
+        <button id="drawer-focus" class="btn-focus" type="button" aria-label="打开对应终端">→ 终端</button>
+        <button id="drawer-close" type="button" aria-label="关闭抽屉">关闭</button>
+      </div>
+    </div>
+
+    <div id="drawer-meta" class="drawer-meta">
+      <button id="drawer-meta-toggle" class="drawer-meta-toggle" type="button" aria-expanded="false">
+        <span class="caret" aria-hidden="true">▸</span>
+        <span>Meta 元数据</span>
+      </button>
+      <div id="drawer-meta-body" class="drawer-meta-body"></div>
+    </div>
+
+    <div id="drawer-filter" class="drawer-filter"></div>
+    <div id="drawer-body" class="drawer-body">
+      <p class="empty">加载中…</p>
+    </div>
+  </aside>
+
+  <!-- alias 编辑弹窗 -->
+  <div id="modal-alias" class="modal hidden">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-label="编辑别名">
+      <h3>编辑别名 / 备注</h3>
+      <form id="alias-form">
+        <label>
+          别名（留空清除）
+          <input type="text" name="alias" autocomplete="off" />
+        </label>
+        <label>
+          备注（可选，留空清除）
+          <input type="text" name="note" autocomplete="off" />
+        </label>
+        <div class="form-actions">
+          <button type="button" id="alias-cancel">取消</button>
+          <button type="submit" class="btn-primary">保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 配置弹窗 -->
+  <div id="modal-config" class="modal hidden">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-label="配置">
+      <h3>配置</h3>
+      <form id="config-form">
+        <label>
+          飞书 webhook URL
+          <input type="password" name="feishu_webhook" autocomplete="off" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..." />
+        </label>
+        <label>
+          长任务超时阈值（分钟）—— 触发 TimeoutSuspect
+          <input type="number" name="timeout_minutes" min="1" step="1" />
+        </label>
+        <label>
+          会话死亡阈值（分钟）—— transcript 多久没动判 dead
+          <input type="number" name="dead_threshold_minutes" min="5" step="5" />
+        </label>
+        <fieldset id="np-fieldset">
+          <legend>推送策略</legend>
+          <!-- 由 JS 动态填充 6 行结构化控件 -->
+        </fieldset>
+        <fieldset>
+          <legend>推送内容</legend>
+          <label class="row"><input type="checkbox" name="display_show_first_prompt" /> 显示首次任务（first_user_prompt）</label>
+          <label class="row"><input type="checkbox" name="display_show_last_assistant" /> 显示刚才说（last_assistant_message）</label>
+        </fieldset>
+        <fieldset>
+          <legend>LLM 智能摘要</legend>
+          <label class="row"><input type="checkbox" name="llm_enabled" /> 启用 LLM 摘要（大标题 + 事件实质）</label>
+          <label>
+            Provider
+            <select name="llm_provider">
+              <option value="local_cli">本机 claude -p</option>
+              <option value="anthropic">Anthropic 兼容格式</option>
+              <option value="openai">OpenAI 兼容格式</option>
+            </select>
+          </label>
+          <fieldset class="provider-block" data-provider="local_cli">
+            <legend>本机 claude -p</legend>
+            <p class="muted small">默认调官方 claude。可填 reclaude / ctf 路径替换。</p>
+            <label>
+              二进制路径
+              <input type="text" name="llm_local_cli_binary" placeholder="留空 → 自动找 claude" />
+            </label>
+            <label>
+              模型
+              <input type="text" name="llm_local_cli_model" placeholder="claude-haiku-4-5" />
+            </label>
+            <label>
+              模式
+              <select name="llm_local_cli_mode">
+                <option value="auto">auto（有 key 走 --bare，否则 OAuth）</option>
+                <option value="oauth">oauth（走 Claude Max 订阅）</option>
+                <option value="bare">--bare（需 ANTHROPIC_API_KEY）</option>
+              </select>
+            </label>
+            <label>
+              超时（秒）
+              <input type="number" name="llm_local_cli_timeout_s" min="5" max="120" step="1" placeholder="30" />
+            </label>
+          </fieldset>
+          <fieldset class="provider-block" data-provider="anthropic">
+            <legend>Anthropic 兼容格式</legend>
+            <p class="muted small">直连 api.anthropic.com Messages API。需 sk-ant-... 密钥。</p>
+            <label>
+              API Key
+              <input type="password" name="llm_anthropic_api_key" autocomplete="off" placeholder="留空 → 走 ANTHROPIC_API_KEY 环境变量" />
+            </label>
+            <label>
+              模型
+              <input type="text" name="llm_anthropic_model" placeholder="claude-haiku-4-5" />
+            </label>
+            <label>
+              Base URL
+              <input type="text" name="llm_anthropic_base_url" placeholder="留空 → api.anthropic.com" />
+            </label>
+          </fieldset>
+          <fieldset class="provider-block" data-provider="openai">
+            <legend>OpenAI 兼容格式</legend>
+            <p class="muted small">通吃 OpenAI / DeepSeek / Qwen / Ollama / 自托管 vLLM 等。</p>
+            <label>
+              API Key
+              <input type="password" name="llm_openai_api_key" autocomplete="off" placeholder="留空 → 走 OPENAI_API_KEY 环境变量" />
+            </label>
+            <label>
+              模型
+              <input type="text" name="llm_openai_model" placeholder="gpt-4o-mini / deepseek-chat / qwen-turbo …" />
+            </label>
+            <label>
+              Base URL
+              <input type="text" name="llm_openai_base_url" placeholder="https://api.openai.com" />
+            </label>
+          </fieldset>
+          <label class="row"><input type="checkbox" name="llm_topic_enabled" /> 大标题（task_topic）</label>
+          <label class="row"><input type="checkbox" name="llm_event_summary_enabled" /> 事件实质摘要（抽屉里）</label>
+        </fieldset>
+        <div class="form-actions">
+          <button type="button" id="config-cancel">取消</button>
+          <button type="submit" class="btn-primary">保存</button>
+        </div>
+        <p id="config-msg" class="muted small"></p>
+      </form>
+    </div>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

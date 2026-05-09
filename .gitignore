@@ -1,0 +1,26 @@
+# 用户数据 / 凭据 / 运行时状态
+data/
+*.bak
+*.bak.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# 日志 / 临时
+*.log
+nohup.out
+.DS_Store
+
+# 个人协作目录（项目内 Tian 工作流，不公开）
+00TEM/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.cache/
