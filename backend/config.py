@@ -53,8 +53,13 @@ DEFAULT_NOTIFY_FILTER = {
     # Notification 是用户唯一信号源。L18 修复 stop_low_signal 后恢复 3min：Stop 已推
     # 等于用户已知，3min 内的 idle prompt 是冗余；3min+ 视为用户长时间没动作再提醒。
     "notif_suppress_after_stop_min": 3,
+    # L19：Claude Code 实际有 2 种 idle prompt 文本，旧 default 只覆盖了一种导致漏吞。
+    # 完整列表（每条 strip+lower 后整句相等才算 filler，避免误吞带后缀的真权限请求）：
+    #   - "Claude is waiting for your input"
+    #   - "Claude Code needs your attention"  ← 之前漏配
     "notif_filler_phrases": [
-        "waiting for your input",
+        "claude is waiting for your input",
+        "claude code needs your attention",
         "press to continue",
         "press enter",
     ],

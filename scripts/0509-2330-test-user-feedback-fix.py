@@ -31,13 +31,26 @@ def test_notification_after_3min_pushes_long_idle():
 
 
 def test_real_permission_notification_always_passes():
-    """L18：真权限请求（不在 filler_phrases）任何时候都推 —— 用户必须看到"""
+    """L18/L19：真权限请求（不在 filler_phrases）任何时候都推 —— 用户必须看到"""
     cfg = {"notify_filter": dict(DEFAULT_FILTER_CFG)}
     summary = {"last_stop_pushed_unix": time.time() - 10}  # 10s 前刚推 Stop
-    evt = {"event": "Notification", "message": "Bash command 'rm -rf /tmp/foo' needs approval"}
+    # 这句包含 "needs your attention" 子串，但不完整匹配（带后缀），不应被吞
+    evt = {"event": "Notification", "message": "Claude Code needs your attention - Bash 'rm -rf /tmp/foo' needs approval"}
     ok, reason = _notification_decision(evt, summary, cfg)
-    assert ok, f"权限请求绝不能吞 reason={reason}"
-    print(f"  PASS Bash approval @ 10s → push  ({reason})")
+    assert ok, f"带后缀的权限请求绝不能吞 reason={reason}"
+    print(f"  PASS Bash approval (with attention prefix) @ 10s → push  ({reason})")
+
+
+def test_l19_two_idle_prompt_variants_both_dropped():
+    """L19：Claude Code 两种 idle prompt message 都应被吞"""
+    cfg = {"notify_filter": dict(DEFAULT_FILTER_CFG)}
+    summary = {"last_stop_pushed_unix": time.time() - 60}
+    for msg in ("Claude is waiting for your input", "Claude Code needs your attention"):
+        evt = {"event": "Notification", "message": msg}
+        ok, reason = _notification_decision(evt, summary, cfg)
+        assert not ok, f"{msg!r} 应被吞，实际推送 reason={reason}"
+        assert "notif_dup_idle_prompt" in reason
+    print(f"  PASS L19 两种 idle prompt 均 drop")
 
 
 def test_short_stop_with_enough_assistant_msg_pushes():
@@ -101,11 +114,12 @@ def test_user_real_scenario_replay():
 
 
 def main():
-    print("L16+L18 用户反馈修复验证")
+    print("L16+L18+L19 用户反馈修复验证")
     print("=" * 60)
     test_notification_within_3min_dropped_idle_prompt()
     test_notification_after_3min_pushes_long_idle()
     test_real_permission_notification_always_passes()
+    test_l19_two_idle_prompt_variants_both_dropped()
     test_short_stop_with_enough_assistant_msg_pushes()
     test_stop_low_signal_still_blocks_garbage()
     test_user_real_scenario_replay()

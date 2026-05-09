@@ -31,7 +31,8 @@ DEFAULT_BLACKLIST = (
 )
 
 DEFAULT_FILLER_PHRASES = (
-    "waiting for your input",
+    "claude is waiting for your input",
+    "claude code needs your attention",
     "press to continue",
     "press enter",
 )
@@ -190,10 +191,11 @@ def _notification_decision(
         gap_min = (time.time() - last_stop_unix) / 60.0
         if gap_min < suppress_min:
             msg = (evt.get("message") or "").strip().lower()
-            is_filler = (not msg) or any(p in msg for p in filler_phrases)
+            # L19：从子串匹配改为整句相等。否则 Claude Code 真权限请求
+            # "Claude Code needs your attention - Bash needs approval"
+            # 也会因含 "needs your attention" 被误吞。
+            is_filler = (not msg) or msg in filler_phrases
             if is_filler:
-                # L18：明确写"idle_prompt"而不是泛指 dedup，让 trace 一眼能看懂
-                # 这是 Claude Code 60s 自动 idle prompt 的副本，非真权限请求
                 return False, f"notif_dup_idle_prompt({gap_min:.1f}min<{suppress_min}min)"
     return True, "notification_kept"
 
