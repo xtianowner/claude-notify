@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 
-from . import config as cfg_mod, event_store
+from . import config as cfg_mod, event_store, sources
 
 log = logging.getLogger("claude-notify.feishu")
 
@@ -74,15 +74,19 @@ def _format_hms(ts: str) -> str:
 
 
 def _format_text(evt: dict[str, Any], summary: dict[str, Any] | None, cfg: dict[str, Any]) -> str:
-    """5 行紧凑模板（参考 OneSignal BLUF / Slack-Notify 模板）：
+    """紧凑模板（≤ 7 行；参考 OneSignal BLUF / Slack-Notify 模板）：
 
-      L1  ✅ hello · 任务完成               ← emoji + focus + 状态
-      L2  你好！有什么需要帮忙的？           ← 核心一句（条件渲染）
-      L3  → 提下一轮 / 或归档                ← next_action（条件渲染）
-      L4  ─────────────────                  ← 分隔
-      L5  bypass · xhigh · 19:08:29          ← mode · effort · HH:MM:SS
-      L6  f39866f5 · ~/Tian · ↗ dashboard   ← sid8 · cwd_short · 链接
+      L1  ✅ hello · 任务完成                ← emoji + focus + 状态
+      L2  📌 修 feishu 内容质量             ← 任务线（task_topic / 最近 prompt 头）
+      L3  ✓ 全部 5 项任务完成               ← conclusion（"完成了什么"）
+      L4  → 提下一轮 / 或归档                ← next_action（条件渲染）
+      L5  ─────────────────                  ← 分隔
+      L6  bypass · xhigh · 19:08:29          ← mode · effort · HH:MM:SS
+      L7  f39866f5 · ~/Tian · ↗ dashboard    ← sid8 · cwd_short · 链接
 
+    Stop / SubagentStop 单独走"任务线 + 完成了什么"两块（教训 L10）：
+      task_topic 与 conclusion 重叠时只保留 conclusion。
+    其它事件类型（Notification / TimeoutSuspect / SessionDead 等）保持单行核心信息。
     日期由飞书消息列表自带时间戳承担，正文只放 HH:MM:SS。
     """
     ev = evt.get("event") or "Event"
@@ -123,10 +127,48 @@ def _format_text(evt: dict[str, Any], summary: dict[str, Any] | None, cfg: dict[
         lines.append(f"卡 {age_min} 分钟{action_hint}")
         lines.append(f"→ {next_action or '进终端检查'}")
     elif ev in ("Stop", "SubagentStop"):
-        if last_milestone:
-            lines.append(_truncate(last_milestone, 100))
+        # 教训 L10：分两块——「任务线」+「完成了什么」，避免单行 milestone 被末段日志/代码污染
+        # task_line: 优先 task_topic；若与 L1 focus 一致（无 alias 时常见），降级到 first_user_prompt
+        focus_norm = (focus or "").strip().lower()
+        candidates = [
+            (task_topic or "").strip(),
+            (sm.get("first_user_prompt") or "").strip(),
+            (sm.get("recent_user_prompt") or "").strip(),
+        ]
+        task_line_raw = ""
+        for cand in candidates:
+            if not cand:
+                continue
+            cn = cand.lower()
+            # 与 L1 focus 等价（包含关系任一方向）→ 看下一个候选
+            if focus_norm and (cn == focus_norm or cn in focus_norm or focus_norm in cn):
+                continue
+            task_line_raw = cand
+            break
+
+        # conclusion: "完成了什么"（从 last_assistant_message 抽，比单行 last_milestone 更稳）
+        last_assistant = (
+            evt.get("last_assistant_message")
+            or (sm.get("last_assistant_message") or "")
+        )
+        conclusion = sources.extract_conclusion(last_assistant, max_len=90) if last_assistant else ""
+        if not conclusion:
+            # fallback：保留旧 last_milestone（可能来自 LLM cache，质量也 OK）
+            conclusion = last_milestone or ""
+
+        # 渲染策略：conclusion 与 task_line 高度重叠 → 只保留 conclusion
+        show_task_line = bool(task_line_raw)
+        show_conclusion = bool(conclusion)
+        if show_task_line and show_conclusion and sources.topic_overlaps_conclusion(task_line_raw, conclusion):
+            show_task_line = False
+
+        if show_task_line:
+            lines.append(f"📌 {_truncate(task_line_raw, 60)}")
+        if show_conclusion:
+            lines.append(f"✓ {_truncate(conclusion, 100)}")
         elif last_action:
             lines.append(f"上一步: {last_action}")
+
         if next_action:
             lines.append(f"→ {next_action}")
     elif ev == "SessionDead":

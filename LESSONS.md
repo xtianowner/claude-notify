@@ -1,7 +1,7 @@
 <!-- purpose: 设计教训记录 — 删除/否定一个设计前先写一段简要总结，避免后续重复犯错 -->
 
 创建时间: 2026-05-09 16:25:00
-更新时间: 2026-05-09 20:38:20
+更新时间: 2026-05-09 21:15:00
 
 # 设计教训
 
@@ -318,3 +318,100 @@ if effective_age >= timeout_min * 60:  # 5 分钟一刀切
 2. **新增字段而不改既有字段语义** —— `last_event` 已被定义为「会改 status 的事件」（NON_STATUS_EVENTS 过滤），扩它的语义会牵动 dashboard / status。直接加 `last_event_kind` 是隔离的最小改动，与 L08 的 `is_sidechain` 字段思路一致。
 3. **保留可关闭开关** —— 默认开新逻辑（修复用户痛点），但 `enabled=False` 退化到旧逻辑作为安全网。任何 watcher 类核心判定的修改都该有 kill switch。
 4. **transcript mtime 是廉价的旁路信号（与 L08 同源）** —— PID 还活说明进程在跑、transcript mtime 还新说明 Claude 在写文件。两者结合比单看事件流稳得多（tool 执行期间 Claude Code 不发 PostToolUse hook 的话，transcript mtime 仍能识别活性）。
+
+---
+
+## L11 — Stop 短回合漏推：字数阈值过严 + 黑词子串吞合法回合（已修）
+
+**修改时间**：2026-05-09
+
+**事故现象**：用户问"查一下 X"，Claude 一行回"已完成"。Stop 触发后 `notify_filter._stop_decision` 拒推 → 飞书收不到 → 用户只能手动刷 dashboard 才知道任务结束。短回合 + 短回复在用户实际使用中占很大比例，这违反「Stop 立即可见」的核心承诺。
+
+**根因（双重判负）**：
+1. 字数阈值过严：`stop_min_milestone_chars=12` / `stop_min_summary_chars=15`。"已完成"3 字 / "看一下啊"4 字、"我已经处理完毕"7 字均不到 15 → 拒。
+2. 黑词表用 `in` 子串匹配："已完成端到端验证" 这种**带任务说明**的回合，因为含子串"已完成"被吞。
+3. 没有时间窗 fallback：长任务跑了 10 分钟回一句"完成"，旧逻辑同样按字数拒，丢的是最重要的"任务结束时刻"。
+
+**替代方案（已实施）**：把 Stop 通过判定改为「以下任一」OR 关系，旧逻辑只是其中一支。
+
+**新条件**：
+1. milestone / summary 字数过阈值（保留旧逻辑，但阈值大幅放宽：12/15 → 6/8）
+2. **锚词放过**：`last_milestone` / `turn_summary` / `last_assistant` 任一含 `sources._ANCHOR_KEYWORDS`（"完成 / done / passed / 失败 / 报错 …"）→ 直接放过不计字数
+3. **时间窗 fallback**：距离同 sid 上一次推送（Stop 推 ts 与 Notification 事件 ts 取 max）> `stop_short_summary_grace_min`（默认 8 分钟）→ 即使 summary 极短也推。从未推过 → 视为首推也放过
+4. 旧的"距上次 Notification > min_gap" 兜底保留
+
+**新 config**：
+- `stop_min_summary_chars` 默认 12 → **8**（normal 档）
+- `stop_min_milestone_chars` 默认 12 → **6**（normal 档）
+- `stop_short_summary_grace_min` **新增**，默认 8 分钟
+- `stop_sensitivity` **新增**，"fast" | "normal" | "strict"，默认 "normal"
+  - fast：milestone=4 / summary=4（几乎全推）
+  - normal：6 / 8（默认；尊重用户自定义 stop_min_*_chars 字段）
+  - strict：20 / 20（仅有内容回合）
+  - 非 normal 时 sensitivity 覆盖 chars 字段值
+
+**黑词整句相等**：
+- 旧 `_is_blacklisted` 实际就是 `norm in blacklist`，已经是整句相等。但用户曾抱怨"已完成端到端验证"被吞，原因不在 blacklist 本身（黑词只判 last_assistant），而是字数条件不够 + 没有锚词逃逸。L11 通过加锚词条件、加时间窗 fallback，让"已完成端到端验证"无论走 summary_len（8 字过 normal 阈值）还是 anchor 都能通过。
+- 黑词的"长度 ≤ 4 字 + 完全无标点空格"短回复保护**保留**，避免把"两字"这种没语义的内容也推。
+
+**验证**：`scripts/0509-2100-test-stop-threshold.py` 11/11 case pass，覆盖三档 sensitivity 实际阈值表 + grace 窗 fallback + 锚词放过 + 黑词整句 + 长任务首推。
+
+**核心教训**：
+1. **字数阈值是最粗暴的过滤器** —— 短回合本质上是真实使用模式（一问一答），用字数当唯一阀门会系统性丢失这部分。要么加多元信号（锚词、时间窗），要么默认放过。L05 / L08 / L09 的方向都是"加上下文标签 + 多元判定"，L11 同源。
+2. **过滤层的 OR 关系比 AND 关系安全** —— 任一条件通过即放过 = 用户少吃漏推。AND 关系（所有条件都过）= 用户多吃漏推。Stop 这种"用户已经发了请求等回执"的事件，**漏推比错推致命**。
+3. **sensitivity 预设比单独调字数有用** —— 用户不知道字数阈值的合适数字，但能直观说"我希望短回合也推（fast）"或"只推有内容的（strict）"。三档预设把决策抽象到用户语言层。
+4. **跨事件 ts 的 max 是廉价的"上一次推送"代理** —— 不需要新加 dispatcher 字段，复用已有的 `last_stop_pushed_unix` + `last_notification_unix` 取 max 即可。最少改动原则（L08 / L09 同源）。
+5. **配置默认值改动需要在 LESSONS 标注前后值** —— 这次 12/15 → 6/8 是显著行为变更，老用户会感知。文档里写清"为什么改"，未来回头看时不会再误以为"6/8 一直是默认"。
+
+---
+
+## L10 — 飞书消息看不出"完成了什么"：单行 milestone 被末段日志/代码污染（已修）
+
+**修改时间**：2026-05-09
+
+**用户痛点**：飞书推送原模板的第二行：
+```
+✅ hello · 任务完成
+<single-line milestone>             ← 这一行常是末段日志、代码尾、"执行环境"声明
+→ <next_action>
+```
+milestone 来源 = `clean_summary(last_assistant_message)`：先把整段 markdown 拼成一行，再切句、选首句。当 LLM 答复的"流式段落"里第一句就是结论时（如"全部 5 项任务完成。"）这种"先合再切"还能用；但实测样本里大量答复是"段落首行 = 结论 / 中段 = 详情列表 / 末段 = 执行环境 footer"的"分块"风格——把整段拼成一行后，要么截断到很短（OLD：`端到端验证通过：` 后面接了无关延迟句），要么把 markdown heading 残留拼进来（`改动总结 核心认知错误已修正 之前 L04 ...`）。**用户看不出"对应哪个任务诉求 + 实际做了什么"**。
+
+**实地诊断（采自 data/events.jsonl 最近 28 条 Stop）**：
+- `last_assistant_message` 抽取本身是对的（永远是 assistant 的最终文本，不是工具响应）
+- 段落首行常是结论："全部 N 项任务完成。" / "**端到端验证通过**：" / "全部跑通。" / "改完。"
+- 短回合答复整段就是结论："你好！有什么需要帮忙的？" / "1+1=2。"
+- 结尾常带 footer："**执行环境**：local mac" / "**本轮修改文件**：..."（Tian 全局规则要求标注 → 内化进 LLM 输出）
+- 大量答复以 markdown heading 开头："## 改动总结" → 接 "### 核心认知错误已修正"
+
+**替代方案（已实施）**：分两块（任务线 + 完成了什么）+ 行级抽取
+1. `backend/sources.py` 新增 `extract_conclusion(raw, max_len)`：与 `clean_summary` 互补，按"行"看而不是"先拼后切"
+   - 切原文 → 跳过空行 / 代码块内部 / footer 行（`执行环境` / `本轮修改` 等前缀）/ 纯结构行（`---` 分隔、空 heading、表格行）
+   - 优先级 1：前 6 行内含锚词（"完成 / 修复 / 修完 / 改完 / 跑通 / 通过 / 已修正 / fixed / done / passed"）的那一行 → 即用
+   - 优先级 2：前 5 行第一条非寒暄的实质行；但若是"短小标题"（≤ 8 字 + 原文是 # 开头，例 "改动总结"）→ 视为占位，跳到下一行
+   - 优先级 3：lines[0] 兜底；最后再 fallback 到 `clean_summary`
+   - 输出经 `_polish` 去 markdown 残留（粗体/斜体/链接/列表前缀），剥寒暄前缀，去尾冒号
+2. 同模块新增 `topic_overlaps_conclusion(topic, conclusion)`：判断 task_topic 与 conclusion 前缀字符重合 ≥ 50% 或包含关系，用于飞书去重
+3. `backend/feishu.py` 改 `_format_text()` Stop / SubagentStop 分支为两块：
+   - `📌 task_line`：优先 task_topic → 与 L1 focus 重复（无 alias 时）就降级到 first_user_prompt → 仍重复就降级到 recent_user_prompt → 都重复就略掉这行
+   - `✓ conclusion`：调 `extract_conclusion(last_assistant_message)`，fallback 用旧 last_milestone
+   - 重叠去重：conclusion 与 task_line 重合 ≥ 50% → 只保留 conclusion
+4. 总行数 ≤ 7 行（emoji + 任务线 + 完成 + 下一步 + 分隔 + meta + tail），保持紧凑
+
+**实测对比**（5 个真实 last_assistant_message 样本，OLD = clean_summary，NEW = extract_conclusion）：
+| 场景 | OLD | NEW |
+|---|---|---|
+| 长 markdown 答复（heading + 列表 + 表 + footer） | `改动总结 核心认知错误已修正 之前 L04 的修法在...` | `核心认知错误已修正` |
+| 锚词在首行 + 长尾详情 | `端到端验证通过： 延迟从 17.76s 降到 6.94s 验证 cache 在工作。` | `端到端验证通过` |
+| 列表前置 + 多段 | `改完。一处微调： **renderDrawerEvents()** —— 抽屉事件流改为...` | `改完。一处微调` |
+| 短答复 | `有什么需要帮忙的？`（丢"你好"） | `你好！有什么需要帮忙的？` |
+| 寒暄 + 实质 | `我已修复 X。` | `我已修复 X。重启后生效。` |
+
+**验证**：`scripts/0509-2100-test-feishu-content.py` 全部 case pass（8 个抽取样本 + 5 个端到端飞书结构 + 重叠 / 非重叠去重）。
+
+**核心教训**：
+1. **"先拼后切" vs "先切后选" 适用场景不同** —— `clean_summary` 把整段当流式段落拼成一行再切句，适合自然语言连续叙述；但 LLM 实测输出是"分块"（首行结论 / 中段详情 / 末段 footer），"按行看"再用锚词 / heading 启发式选才对路。两个函数共存，不互相吞。
+2. **锚词命中是最可靠的单信号** —— 中文/英文锚词列表（"完成 / 修复 / 跑通 / fixed / passed"）覆盖了 80%+ 的"任务结束"模式。用锚词当首选 + 第一条实质行兜底，比纯位置（首句）或纯长度（取最长）稳得多。
+3. **footer 前缀黑名单是廉价过滤** —— Tian 全局规则要求 LLM 答复尾部带"执行环境 / 本轮修改文件" footer，但飞书是"快速浏览"不是"完整记录"，footer 应明确剥掉而不是让它参选首句。这种"语义噪声"用 startswith 黑名单一刀干净。
+4. **降级链要看上下文重复，不光看是否非空** —— L1 focus 已经是 `task_topic or display_name`，L2 再写 task_topic 就是冗余。降级链应该看"与上一行是否重复"再决定显不显。这是 BLUF 原则的延伸：每行只承载一个新信号。
+5. **"分两块"比"塞一行更密"信息密度高** —— 用户视线扫第二行/第三行比扫一行 80 字快。把"任务线（用户问的什么）"和"完成线（agent 干的什么）"分开，在屏幕高度成本可接受时（≤ 7 行）总能用。L05 飞书模板从 9 行压到 6 行是对的方向，但极端紧凑反而牺牲了关键信号；L10 是反向微调，关键信号补回来。

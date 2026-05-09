@@ -6,13 +6,18 @@
 - TimeoutSuspect / TestNotify → 永远 True
 - Notification → 跨事件 dedupe（教训 L05）：Stop 已推过 N 分钟内 + 内容是空话 → 吞
 - SubagentStop / SessionStart / SessionEnd / SessionDead / Heartbeat / PreToolUse / PostToolUse → 永远 False
-- Stop → 复合判别（last_milestone 长度 / turn_summary 长度 + 黑词表 / Notification 间距）
+- Stop → 复合判别（教训 L11）：以下任一即放过
+    1. milestone / summary 字数过阈值（fast/normal/strict 三档可调）
+    2. 含锚词（"完成 / done / passed / 失败 / 报错 …"）→ 放过不计字数
+    3. 距离同 sid 上一次推送 > grace_min → 长任务收尾即使一字也推
 """
 from __future__ import annotations
 import time
 from typing import Any
 
 # v3 spec §4.4 默认黑词表（短纯应答，不构成"任务回合结束"）
+# L11：黑词检测改为「整句严格相等」（norm in blacklist），不再做子串匹配，
+# 否则"已完成端到端验证"会被"已完成"误吞。
 DEFAULT_BLACKLIST = (
     "ok", "yes", "no", "好", "好的", "已完成", "完成", "收到",
     "嗯", "是", "不", "对", "行", "可以", "thanks", "thank you", "ack",
@@ -24,10 +29,22 @@ DEFAULT_FILLER_PHRASES = (
     "press enter",
 )
 
+# Stop sensitivity 三档预设（L11）
+# fast：用户希望"短回合也推"，字数阈值 4
+# normal：默认，字数阈值 milestone=6 / summary=8（比旧版 12/15 显著放宽）
+# strict：用户希望"只推有内容回合"，字数阈值 20
+STOP_SENSITIVITY_PRESETS = {
+    "fast":   {"stop_min_milestone_chars": 4,  "stop_min_summary_chars": 4},
+    "normal": {"stop_min_milestone_chars": 6,  "stop_min_summary_chars": 8},
+    "strict": {"stop_min_milestone_chars": 20, "stop_min_summary_chars": 20},
+}
+
 DEFAULT_FILTER_CFG = {
-    "stop_min_milestone_chars": 12,
-    "stop_min_summary_chars": 15,
+    "stop_min_milestone_chars": 6,
+    "stop_min_summary_chars": 8,
     "stop_min_gap_after_notification_min": 5,
+    "stop_short_summary_grace_min": 8,
+    "stop_sensitivity": "normal",
     "notif_suppress_after_stop_min": 3,
     "notif_filler_phrases": list(DEFAULT_FILLER_PHRASES),
     "blacklist_words": list(DEFAULT_BLACKLIST),
@@ -43,6 +60,22 @@ _ALWAYS_FALSE = {
     "SubagentStop", "SessionStart", "SessionEnd", "SessionDead",
     "Heartbeat", "PreToolUse", "PostToolUse",
 }
+
+
+def _resolve_thresholds(fcfg: dict[str, Any]) -> tuple[int, int]:
+    """根据 stop_sensitivity 解析最终的 milestone / summary 字数阈值。
+
+    sensitivity != "normal" 时覆盖用户配的 stop_min_*_chars；
+    sensitivity == "normal" 时尊重用户配置（即用户调过 chars 字段也保留）。
+    """
+    sens = (fcfg.get("stop_sensitivity") or "normal").strip().lower()
+    if sens in STOP_SENSITIVITY_PRESETS and sens != "normal":
+        preset = STOP_SENSITIVITY_PRESETS[sens]
+        return int(preset["stop_min_milestone_chars"]), int(preset["stop_min_summary_chars"])
+    return (
+        int(fcfg.get("stop_min_milestone_chars", 6)),
+        int(fcfg.get("stop_min_summary_chars", 8)),
+    )
 
 
 def should_notify(
@@ -100,15 +133,43 @@ def _notification_decision(
     return True, "notification_kept"
 
 
+def _has_anchor(text: str) -> bool:
+    """是否含锚词（结论性 / 状态性词汇）。复用 sources.py 的 _ANCHOR_KEYWORDS。
+
+    导入失败 → 用最小内置兜底，不阻塞过滤逻辑。
+    """
+    if not text:
+        return False
+    try:
+        from .sources import _ANCHOR_KEYWORDS as kws
+    except Exception:
+        kws = (
+            "完成", "已完成", "已修复", "已实现", "通过", "成功", "失败", "报错",
+            "fixed", "done", "passed", "failed", "completed",
+        )
+    s = text.lower()
+    return any(kw.lower() in s for kw in kws)
+
+
 def _stop_decision(
     evt: dict[str, Any],
     summary: dict[str, Any],
     cfg: dict[str, Any],
 ) -> tuple[bool, str]:
+    """Stop 推送判定（L11 重构）。
+
+    通过条件「以下任一」：
+    1. milestone 长度 ≥ stop_min_milestone_chars
+    2. summary 长度 ≥ stop_min_summary_chars 且 last_assistant 不命中黑词（整句相等）
+    3. last_milestone / turn_summary / last_assistant 任一含锚词 → 直接放过
+    4. 距离同 sid 上一次推送（Stop 推 ts 与 Notification 事件 ts 取 max）
+       > stop_short_summary_grace_min → 长任务收尾即使一字也推
+    5. 距离上一次 Notification > stop_min_gap_after_notification_min（保留旧兜底）
+    """
     fcfg = (cfg.get("notify_filter") or {})
-    min_milestone = int(fcfg.get("stop_min_milestone_chars", 12))
-    min_summary = int(fcfg.get("stop_min_summary_chars", 15))
+    min_milestone, min_summary = _resolve_thresholds(fcfg)
     min_gap_min = float(fcfg.get("stop_min_gap_after_notification_min", 5))
+    grace_min = float(fcfg.get("stop_short_summary_grace_min", 8))
     blacklist = {w.strip().lower() for w in (fcfg.get("blacklist_words") or DEFAULT_BLACKLIST) if w}
 
     last_milestone = (summary.get("last_milestone") or "").strip()
@@ -119,16 +180,36 @@ def _stop_decision(
         or ""
     ).strip()
 
-    # 条件 1：LLM 已提取出有内容的里程碑
+    # 条件 1：里程碑够长
     if len(last_milestone) >= min_milestone:
         return True, f"stop_milestone_len={len(last_milestone)}"
 
-    # 条件 2：turn_summary 够长 + 不命中黑词表
+    # 条件 2：summary 够长 + 不命中黑词表（整句严格相等）
     if len(turn_summary) >= min_summary and not _is_blacklisted(last_assistant, blacklist):
         return True, f"stop_summary_len={len(turn_summary)}"
 
-    # 条件 3：距离上一次 Notification > M 分钟（兜底，cache miss 时用）
+    # 条件 3：含锚词 → 放过不计字数
+    for src_name, src_text in (
+        ("milestone", last_milestone),
+        ("summary", turn_summary),
+        ("last_assistant", last_assistant),
+    ):
+        if _has_anchor(src_text):
+            return True, f"stop_anchor:{src_name}"
+
+    # 条件 4：长任务时间窗 fallback —— 距离同 sid 上一次推送 > grace_min
+    last_stop_unix = float(summary.get("last_stop_pushed_unix") or 0)
     last_notif_unix = float(summary.get("last_notification_unix") or 0)
+    last_any_push = max(last_stop_unix, last_notif_unix)
+    if grace_min > 0:
+        if last_any_push <= 0:
+            # 同 sid 从未推过任何东西 → 这是回合首推，直接放过
+            return True, "stop_grace_first_push"
+        gap_min = (time.time() - last_any_push) / 60.0
+        if gap_min > grace_min:
+            return True, f"stop_grace_gap={gap_min:.1f}min"
+
+    # 条件 5：旧兜底，距离上一次 Notification > min_gap_min（cache miss 时仍能救）
     if last_notif_unix > 0:
         gap_min = (time.time() - last_notif_unix) / 60.0
         if gap_min > min_gap_min:
@@ -138,16 +219,18 @@ def _stop_decision(
 
 
 def _is_blacklisted(text: str, blacklist: set[str]) -> bool:
-    """判定 last_assistant_message 是否是「短纯应答」黑词。
+    """L11：判定 last_assistant_message 是否是「短纯应答」黑词。
 
-    规则：strip + lower 后完全等于黑词，或长度 ≤ 4 字且不含标点/空格。
+    旧规则：strip + lower 后完全等于黑词，或长度 ≤ 4 字且不含标点/空格。
+    L11 改动：黑词只比对**整句严格相等**（norm in blacklist），不再退化到子串匹配。
+    "已完成端到端验证" 不再被 "已完成" 吞；"完成" 一字仍被吞。
     """
     if not text:
         return True  # 空回复也算无信息
     norm = text.strip().lower()
     if norm in blacklist:
         return True
-    # 短回复但含标点/空格 → 可能是有内容的短句，不算黑
+    # 长度 ≤ 4 字 + 完全无标点空格 → 仍按短纯应答处理（边界保护）
     if len(text.strip()) <= 4:
         if not any(c.isspace() or c in "，。！？.!?,;；:：" for c in text.strip()):
             return True

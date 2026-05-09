@@ -32,10 +32,20 @@ DEFAULT_NOTIFY_POLICY = {
 }
 
 DEFAULT_NOTIFY_FILTER = {
-    # v3 spec §4：Stop 推送过滤阈值，避免「OK」这种短回复也被推
-    "stop_min_milestone_chars": 12,
-    "stop_min_summary_chars": 15,
+    # v3 spec §4 + 教训 L11：Stop 推送过滤阈值。
+    # L11 把字数阈值大幅放宽（旧 12/15 → 6/8），并加入"时间窗 fallback + 锚词放过"
+    # 两条新通过条件，解决"短回合直接漏推"的 P1 bug。
+    "stop_min_milestone_chars": 6,
+    "stop_min_summary_chars": 8,
     "stop_min_gap_after_notification_min": 5,
+    # L11：长任务收尾兜底窗。距离同 sid 上一次任意推送 > N 分钟 → 即使 summary 极短也推
+    "stop_short_summary_grace_min": 8,
+    # L11：sensitivity 字符串 "fast" | "normal" | "strict"。
+    #   fast → milestone/summary 阈值都 4，几乎全推
+    #   normal → 6/8（默认值，本字段为 normal 时尊重 stop_min_*_chars 自定义）
+    #   strict → 都 20，仅推有内容回合
+    # 非 normal 时 sensitivity 覆盖 stop_min_*_chars 字段值。
+    "stop_sensitivity": "normal",
     # 跨事件 dedupe（教训 L05）：Stop 推过后 N 分钟内，同 sid 的 Notification 若是空话则吞
     "notif_suppress_after_stop_min": 3,
     "notif_filler_phrases": [
@@ -43,6 +53,8 @@ DEFAULT_NOTIFY_FILTER = {
         "press to continue",
         "press enter",
     ],
+    # L11：黑词表只对"整句严格相等"生效（norm in blacklist），不做子串匹配，
+    # 防"已完成端到端验证"被"已完成"误吞
     "blacklist_words": [
         "ok", "yes", "no", "好", "好的", "已完成", "完成", "收到",
         "嗯", "是", "不", "对", "行", "可以", "thanks", "thank you", "ack",

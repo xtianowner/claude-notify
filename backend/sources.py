@@ -41,7 +41,8 @@ _FILLER_PREFIXES = (
 
 # 锚词：含这些的句子优先选（结论性 / 状态性）
 _ANCHOR_KEYWORDS = (
-    "完成", "已完成", "已修复", "已修好", "已实现", "已上线", "已通过",
+    "完成", "已完成", "已修复", "已修好", "已修正", "已实现", "已上线", "已通过",
+    "修完", "改完", "搞定", "搞完",
     "跑通", "通过了", "通过", "成功", "失败", "出错", "报错",
     "fixed", "done", "passed", "failed", "completed", "implemented",
     "ready", "shipped", "merged",
@@ -86,6 +87,174 @@ def _strip_filler_prefix(s: str) -> str:
 def _has_anchor(sentence: str) -> bool:
     s = sentence.lower()
     return any(kw in s for kw in _ANCHOR_KEYWORDS)
+
+
+# 去掉 LLM 答复尾部常见的"执行环境/本轮文件" footer（Tian 全局规则要求标注，但
+# 飞书一行展示空间紧张，纯环境声明不属于"完成了什么"）。
+_FOOTER_PREFIXES = (
+    "**执行环境**", "执行环境",
+    "**本轮", "本轮创建", "本轮修改",
+    "**修改文件**", "修改文件",
+    "**文件路径**", "文件路径",
+)
+
+
+def _is_footer_line(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return True
+    for prefix in _FOOTER_PREFIXES:
+        if s.startswith(prefix):
+            return True
+    return False
+
+
+def _is_structural_line(line: str) -> bool:
+    """纯结构（heading / 列表前缀 / 表格 / 分隔线 / 仅 emoji）—— 没有结论实质。"""
+    s = line.strip()
+    if not s:
+        return True
+    # 纯分隔线
+    if re.fullmatch(r"[-=_*─—\s]{3,}", s):
+        return True
+    # 仅 heading 没内容（空 ##）
+    if re.fullmatch(r"#{1,6}\s*", s):
+        return True
+    # 表格行
+    if _RE_TABLE_ROW.match(s):
+        return True
+    # 仅引号开头无内容
+    if re.fullmatch(r">\s*", s):
+        return True
+    return False
+
+
+def _line_lines(raw: str) -> list[str]:
+    """切原始 last_assistant_message → 实质性行列表（保留原文，不做 markdown 净化）。
+
+    - 跳过空行
+    - 跳过代码块内部（` ``` ` 之间）
+    - 跳过 footer / 纯结构行
+    """
+    if not raw:
+        return []
+    lines: list[str] = []
+    in_code = False
+    for ln in str(raw).split("\n"):
+        stripped = ln.rstrip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        if not stripped.strip():
+            continue
+        if _is_footer_line(stripped):
+            continue
+        if _is_structural_line(stripped):
+            continue
+        lines.append(stripped.strip())
+    return lines
+
+
+def extract_conclusion(raw: str, max_len: int = 90) -> str:
+    """从 last_assistant_message 抽出"完成了什么"的结论句。
+
+    优先级（命中即用）：
+    1. 前 6 条实质行内 → 含锚词（"完成 / 修复 / 跑通 / 通过 / fixed / done / passed"）的那一条
+    2. 前 3 条实质行内 → 第一条非寒暄的"段落首行"（heading 也保留：去掉 `#` 前缀后参选）
+    3. fallback：clean_summary(raw)
+
+    与 clean_summary 的区别：clean_summary 先把整段 markdown 拼成一行再切句，
+    适合"流水段落"；extract_conclusion 按"行"看，更贴合 Claude 实测的"首行就是结论"
+    风格（"全部 N 项任务完成"、"**端到端验证通过**："、"改完。"）。
+    """
+    if not raw:
+        return ""
+    lines = _line_lines(raw)
+    if not lines:
+        return clean_summary(raw, max_len=max_len)
+
+    def _polish(line: str) -> str:
+        # 去 heading / 粗体 / 斜体 / 链接 / inline code 标记，保留实质内容
+        s = line
+        s = _RE_HEADING.sub("", s)
+        s = _RE_BOLD.sub(r"\1", s)
+        s = _RE_ITALIC.sub(r"\1", s)
+        s = _RE_INLINE_CODE.sub(r"\1", s)
+        s = _RE_LINK.sub(r"\1", s)
+        s = _RE_ULIST.sub("", s)
+        s = _RE_OLIST.sub("", s)
+        s = _RE_BLOCKQUOTE.sub("", s)
+        s = _RE_WS.sub(" ", s).strip()
+        s = _strip_filler_prefix(s)
+        # 去掉句末冒号 / 多余分隔
+        s = s.rstrip(" ：:、—-")
+        return s
+
+    # (1) 锚词命中（前 6 行任一含锚词 → 即用）
+    for ln in lines[:6]:
+        was_heading = bool(_RE_HEADING.match(ln))
+        polished = _polish(ln)
+        if not polished or _is_filler(polished):
+            continue
+        if _has_anchor(polished):
+            if len(polished) > max_len:
+                polished = polished[: max_len - 1].rstrip() + "…"
+            return polished
+        # 标记一下以便后续 fallback 时认得（不在此处返回）
+        _ = was_heading
+
+    # (2) 第一条非寒暄实质行；但若是"短小标题"（≤ 8 字 + 原文是 # 开头）→ 视为结构占位，跳过
+    for idx, ln in enumerate(lines[:5]):
+        was_heading = bool(_RE_HEADING.match(ln))
+        polished = _polish(ln)
+        if not polished or _is_filler(polished):
+            continue
+        # 短标题（"改动总结"、"修改"）= 占位标记，无实质 → 优先看下一行
+        if was_heading and len(polished) <= 8 and idx < len(lines) - 1:
+            continue
+        if len(polished) > max_len:
+            polished = polished[: max_len - 1].rstrip() + "…"
+        return polished
+
+    # (3) 仍空 → 取 lines[0] polished 兜底
+    if lines:
+        polished = _polish(lines[0])
+        if polished:
+            if len(polished) > max_len:
+                polished = polished[: max_len - 1].rstrip() + "…"
+            return polished
+
+    # (4) 最后 fallback
+    return clean_summary(raw, max_len=max_len)
+
+
+def topic_overlaps_conclusion(topic: str, conclusion: str, threshold: float = 0.5) -> bool:
+    """判断 task_topic 与 conclusion 前缀是否高度重复（用于飞书去重）。
+
+    语义：把短串作为基准，看它在长串前缀中的字符重合比例 ≥ threshold 即视为重复。
+    主要场景："hello" 任务的 conclusion 是 "你好！..." → 不重叠（保留两行）；
+            "修复 X" 任务的 conclusion 是 "修复 X 完成" → 重叠（只显示 conclusion）。
+    """
+    if not topic or not conclusion:
+        return False
+    t = topic.strip().lower()
+    c = conclusion.strip().lower()
+    if not t or not c:
+        return False
+    # 完全包含
+    short, long = (t, c) if len(t) <= len(c) else (c, t)
+    if short and short in long[: len(short) + 8]:
+        return True
+    # 前缀重合字符数 / 短串长度
+    common = 0
+    for a, b in zip(short, long):
+        if a == b:
+            common += 1
+        else:
+            break
+    return common / max(1, len(short)) >= threshold
 
 
 def clean_summary(raw: str, max_len: int = 80) -> str:
