@@ -146,6 +146,31 @@ TERMINATING_EVENTS = {"SessionEnd", "SessionDead"}
 # v3：这些事件不改变 status —— 心跳/会话开始/工具前置不应该把 idle 状态翻回 running
 NON_STATUS_EVENTS = {"Heartbeat", "PreToolUse", "SessionStart"}
 
+# L20：dashboard status 派生时跳过 idle prompt Notification 副本。
+# Stop 推过后 60s Claude Code 自动 trigger 的 idle prompt 在用户视角是"同一回合的尾声"，
+# 不应让卡片状态从 idle(回合结束) 跳到 waiting(等输入)，否则用户感觉一次任务"变化两次"。
+# 与 notify_filter._notification_decision 的 dedup 判定保持一致（整句相等 + 距离 Stop < N min）。
+_IDLE_PROMPT_FILLER_PHRASES = {
+    "claude is waiting for your input",
+    "claude code needs your attention",
+    "press to continue",
+    "press enter",
+}
+_IDLE_PROMPT_DEDUP_WINDOW_MIN = 3.0
+
+
+def _is_idle_prompt_dup(evt: dict[str, Any], last_stop_unix: float) -> bool:
+    """事件是否是 Stop 后副本的 idle prompt（不应改变 dashboard 状态）。"""
+    if (evt.get("event") or "") != "Notification":
+        return False
+    msg = (evt.get("message") or "").strip().lower()
+    if msg not in _IDLE_PROMPT_FILLER_PHRASES:
+        return False  # 真权限请求 / 自定义文本 → 正常算 last_event
+    if last_stop_unix <= 0:
+        return False  # 没推过 Stop 视为新提醒，正常更新
+    gap_min = (parse_iso(evt.get("ts", "")) - last_stop_unix) / 60.0
+    return 0 <= gap_min < _IDLE_PROMPT_DEDUP_WINDOW_MIN
+
 
 def derive_status(last_event: str) -> str:
     if last_event == "SessionEnd":
@@ -510,7 +535,9 @@ def list_sessions(active_window_minutes: int = 30,
         # 供 liveness_watcher 做分状态超时判定（L09 — 长 tool 不应误报 hang）
         if ev_name:
             s["last_event_kind"] = ev_name
-        if ev_name and ev_name not in NON_STATUS_EVENTS:
+        # L20：idle prompt Notification 副本不更新 last_event（dashboard status 保持回合结束）
+        is_idle_dup = _is_idle_prompt_dup(evt, s.get("_last_stop_unix") or 0.0)
+        if ev_name and ev_name not in NON_STATUS_EVENTS and not is_idle_dup:
             s["last_event"] = ev_name
         elif s.get("last_event") is None:
             # 第一条事件如果是 NON_STATUS_EVENTS 类型（如 SessionStart），也得占个位
