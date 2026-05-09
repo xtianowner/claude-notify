@@ -52,7 +52,8 @@ DEFAULT_FILTER_CFG = {
     "stop_min_gap_after_notification_min": 5,
     "stop_short_summary_grace_min": 8,
     "stop_sensitivity": "normal",
-    "notif_suppress_after_stop_min": 3,
+    # L16：3 → 0.5min（30s）。之前 3min 默认会把所有真等输入都误吞。
+    "notif_suppress_after_stop_min": 0.5,
     "notif_filler_phrases": list(DEFAULT_FILLER_PHRASES),
     "blacklist_words": list(DEFAULT_BLACKLIST),
     # 教训 L08：子 agent 内触发的 Notification 用户切到终端看不到提示（父 session
@@ -179,7 +180,7 @@ def _notification_decision(
     if fcfg.get("filter_sidechain_notifications", True) and evt.get("is_sidechain"):
         return False, "sidechain_active"
 
-    suppress_min = float(fcfg.get("notif_suppress_after_stop_min", 3))
+    suppress_min = float(fcfg.get("notif_suppress_after_stop_min", 0.5))
     filler_phrases = [p.strip().lower() for p in
                       (fcfg.get("notif_filler_phrases") or DEFAULT_FILLER_PHRASES) if p]
 
@@ -275,6 +276,13 @@ def _stop_decision(
         gap_min = (time.time() - last_notif_unix) / 60.0
         if gap_min > min_gap_min:
             return True, f"stop_gap_after_notif={gap_min:.1f}min"
+
+    # 条件 6（L16）：last_assistant_message 长度兜底。
+    # 新 session 刚 SessionStart 完，enrichment 还没来得及派生 milestone/turn_summary，
+    # 此时短 Stop 会被 stop_low_signal 误吞。原始 last_assistant_message ≥ 12 字
+    # 且不命中黑词，视为"用户视角有内容"放过。
+    if len(last_assistant) >= 12 and not _is_blacklisted(last_assistant, blacklist):
+        return True, f"stop_assistant_len={len(last_assistant)}"
 
     return False, "stop_low_signal"
 

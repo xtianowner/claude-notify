@@ -64,8 +64,8 @@ export function statusBadgeClass(status) {
 export function statusLabel(status) {
   const map = {
     running: "运行中",
-    waiting: "等确认",
-    idle: "待命",
+    waiting: "等输入",
+    idle: "回合结束",
     suspect: "疑挂起",
     ended: "已退出",
     dead: "已死亡",
