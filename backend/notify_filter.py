@@ -15,6 +15,8 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from . import decision_log
+
 # v3 spec §4.4 默认黑词表（短纯应答，不构成"任务回合结束"）
 # L11：黑词检测改为「整句严格相等」（norm in blacklist），不再做子串匹配，
 # 否则"已完成端到端验证"会被"已完成"误吞。
@@ -82,19 +84,38 @@ def should_notify(
     evt: dict[str, Any],
     summary: dict[str, Any] | None,
     cfg: dict[str, Any] | None = None,
+    *,
+    log_trace: bool = True,
 ) -> tuple[bool, str]:
-    """返回 (是否推送, 拒推原因 / 推送原因)。"""
+    """返回 (是否推送, 拒推原因 / 推送原因)。
+
+    log_trace=False 时不写 decision_log（用于"预览/合并去重"等不算独立决策的调用）。
+    """
     ev_type = (evt.get("event") or "").strip()
+    sid = evt.get("session_id") or ""
     if ev_type in _ALWAYS_TRUE:
-        return True, f"always_true:{ev_type}"
-    if ev_type in _ALWAYS_FALSE:
-        return False, f"always_false:{ev_type}"
-    if ev_type == "Notification":
-        return _notification_decision(evt, summary or {}, cfg or {})
-    if ev_type == "Stop":
-        return _stop_decision(evt, summary or {}, cfg or {})
-    # 未知事件类型保守 → False（与 notify_policy.submit 的 fallback 一致）
-    return False, f"unknown_event:{ev_type}"
+        ok, reason = True, f"always_true:{ev_type}"
+    elif ev_type in _ALWAYS_FALSE:
+        ok, reason = False, f"always_false:{ev_type}"
+    elif ev_type == "Notification":
+        ok, reason = _notification_decision(evt, summary or {}, cfg or {})
+    elif ev_type == "Stop":
+        ok, reason = _stop_decision(evt, summary or {}, cfg or {})
+    else:
+        # 未知事件类型保守 → False（与 notify_policy.submit 的 fallback 一致）
+        ok, reason = False, f"unknown_event:{ev_type}"
+    if log_trace and sid:
+        try:
+            decision_log.append(
+                session_id=sid,
+                event_type=ev_type,
+                decision=("push" if ok else "drop"),
+                reason=reason,
+                policy="filter",
+            )
+        except Exception:
+            pass
+    return ok, reason
 
 
 def _notification_decision(

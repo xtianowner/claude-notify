@@ -20,7 +20,7 @@ import logging
 import time
 from typing import Any
 
-from . import config as cfg_mod, feishu, notify_filter
+from . import config as cfg_mod, decision_log, feishu, notify_filter
 
 log = logging.getLogger("claude-notify.notify")
 
@@ -52,6 +52,7 @@ class NotifyDispatcher:
         # 活动事件：取消 pending（用户还在交互，别打扰）
         if ev_type in ACTIVITY_EVENTS:
             await self._cancel(sid)
+            # 活动事件本就是用来"取消推送窗口"的，不算独立决策，不写 trace
             return {"ok": False, "reason": "activity_cancels_pending"}
 
         policy_map = cfg.get("notify_policy") or {}
@@ -59,6 +60,7 @@ class NotifyDispatcher:
         policy = (policy_map.get(ev_type) or "off").strip().lower()
 
         if policy == "off":
+            self._trace(sid, ev_type, "drop", "policy_off", policy)
             return {"ok": False, "reason": "policy_off"}
 
         # 推送过滤（v3 spec §4）：注 immediate / silence 路径都要过滤；
@@ -87,11 +89,11 @@ class NotifyDispatcher:
             except Exception:
                 delay = 10.0
             merged = await self._schedule_or_merge(sid, evt, delay)
-            return {
-                "ok": True,
-                "reason": (f"merged_into_pending_{merged}_events" if merged > 1
-                           else f"scheduled_silence_{int(delay)}s"),
-            }
+            decision = "merged" if merged > 1 else "scheduled"
+            reason = (f"merged_into_pending_{merged}_events" if merged > 1
+                      else f"scheduled_silence_{int(delay)}s")
+            self._trace(sid, ev_type, decision, reason, policy)
+            return {"ok": True, "reason": reason}
 
         # 兜底：立即推
         await self._cancel(sid)
@@ -141,6 +143,8 @@ class NotifyDispatcher:
                               if notify_filter.should_notify(e, summary, cfg)[0]]
                     if not passed:
                         log.info("silence-then all-filtered sid=%s n=%d", sid, len(events))
+                        self._trace(sid, "Stop", "drop",
+                                    f"merged_all_filtered(n={len(events)})", "silence")
                         return
                     result = await feishu.send_events_combined(passed)
                     # 合并卡片若包含 Stop，也算 Stop 已推过
@@ -178,6 +182,25 @@ class NotifyDispatcher:
             s = dict(s)
             s["last_stop_pushed_unix"] = ts
         return s or None
+
+    @staticmethod
+    def _trace(sid: str, ev_type: str, decision: str, reason: str, policy: str) -> None:
+        """policy 层决策 trace（off / scheduled / merged / merged_all_filtered）。
+
+        filter 层（Notification dedup / Stop 阈值）由 notify_filter.should_notify 自己写 trace。
+        """
+        if not sid:
+            return
+        try:
+            decision_log.append(
+                session_id=sid,
+                event_type=ev_type,
+                decision=decision,
+                reason=reason,
+                policy=policy or "",
+            )
+        except Exception:
+            pass
 
     def _record_stop_push(self, ev_type: str, sid: str, result: dict[str, Any] | None) -> None:
         """Stop 推送成功后写 ts，供 Notification dedupe 用。"""

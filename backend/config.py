@@ -10,6 +10,7 @@ DATA_DIR = PROJECT_ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
 CONFIG_PATH = DATA_DIR / "config.json"
 EVENTS_PATH = DATA_DIR / "events.jsonl"
+ARCHIVE_DIR = DATA_DIR / "archive"
 
 # notify_policy 取值：
 #   "immediate"   立即推送
@@ -65,6 +66,16 @@ DEFAULT_NOTIFY_FILTER = {
     "filter_sidechain_notifications": True,
 }
 
+DEFAULT_ARCHIVAL = {
+    # 教训 L13：events.jsonl 长期 append 会无界增长（重度用户 100+ session/天 × 几周 → 100MB+）
+    # → list_sessions 启动时全量读，内存占用大、查询卡。
+    # 滚动归档：hot 文件保留近期事件（list_sessions 默认只读它），老事件 gzip 落到 data/archive/。
+    "enabled": True,
+    "max_hot_size_mb": 50,       # hot 文件 >= 此大小触发归档检查
+    "rotation_grace_days": 1,    # 只归档 ts 早于 N 天前的事件，保留近期热事件
+    "archive_dir": "data/archive",
+}
+
 DEFAULT_LIVENESS_PER_STATE_TIMEOUT = {
     # L09 — 按 last_event_kind 分状态设阈值，避免「长 tool 执行」误判 hang
     # enabled=False 时退化为旧逻辑（timeout_minutes 一刀切）
@@ -88,6 +99,7 @@ DEFAULTS: dict[str, Any] = {
     "dead_threshold_minutes": 30,
     "active_window_minutes": 30,
     "liveness_per_state_timeout": DEFAULT_LIVENESS_PER_STATE_TIMEOUT,
+    "archival": DEFAULT_ARCHIVAL,
     "notify_policy": DEFAULT_NOTIFY_POLICY,
     "notify_filter": DEFAULT_NOTIFY_FILTER,
     "muted": False,

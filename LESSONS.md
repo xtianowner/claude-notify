@@ -1,7 +1,7 @@
 <!-- purpose: 设计教训记录 — 删除/否定一个设计前先写一段简要总结，避免后续重复犯错 -->
 
 创建时间: 2026-05-09 16:25:00
-更新时间: 2026-05-09 21:15:00
+更新时间: 2026-05-09 22:15:00
 
 # 设计教训
 
@@ -365,6 +365,54 @@ if effective_age >= timeout_min * 60:  # 5 分钟一刀切
 
 ---
 
+## L12 — 推送决策 reason 只在 logger，dashboard 看不到"为什么没推"（已修）
+
+**修改时间**：2026-05-09
+
+**用户痛点**：`notify_filter._stop_decision` / `_notification_decision` / `notify_policy.submit` 已经返回了大量精确的 reason 字符串（`sidechain_active` / `notif_dedup_after_stop(1.5min)` / `stop_grace_first_push` / `stop_anchor:last_assistant` / `policy_off` / `merged_into_pending_3_events` …），但这些 reason **只在 logger 输出**，不落盘、不返回前端。用户怀疑漏推时只能 `tail -f` backend log 配合自己解析时间戳排查。dashboard 上的卡片完全没暴露"这条事件为什么被吞 / 为什么延迟到 12s 后再推"。
+
+**替代方案（已实施）**：单独的环形决策日志 + 注入到 list_sessions + 卡片底部 trace + modal。
+1. 新模块 `backend/decision_log.py`：
+   - 写入 `data/push_decisions.jsonl`，每行 `{ts, session_id, event, decision, reason, policy}`
+   - `recent_for(sid, limit=5)` / `all_for(sid)` 读路径，倒序最新在前
+   - `PER_SESSION_MAX=50`：trim 时按 sid 分组，保留每组最近 50 条
+   - `TRIM_THRESHOLD=1000`：累计文件行数 ≥ 此值才整体重写一次（避免每次写都全量）
+   - 文件锁 `fcntl.flock`，跨进程安全
+2. 接入点：
+   - `notify_filter.should_notify` 每个 return 处自动 `decision_log.append(...)`，policy="filter"
+   - `notify_policy.submit` 在 `policy_off` / `silence-scheduled` / `merged` / `merged_all_filtered` 路径调 `_trace(...)` helper
+   - 故意**不**记 `activity_cancels_pending`（活动事件本就用来取消推送窗口，不算独立决策）
+   - `should_notify` 加 `log_trace=True` 形参，policy 层在"合并发送前 dry-run"等不算独立决策的路径可以传 False（暂未启用，留扩展点）
+3. 暴露：
+   - `event_store.list_sessions` 每个 session 注入 `recent_decisions`（最近 5 条）
+   - 新 endpoint `GET /api/sessions/{sid}/decisions` 返回完整 50 条
+4. UI（前端）：
+   - 卡片新增第 4 行 `.push-trace`：`最近：12:30 ✓ stop_anchor · 12:31 ✗ notif_dedup_after_stop`
+   - 11px 灰字，dashed 边框，hover 高亮，点击展开 modal
+   - modal 里按 ts 倒序列 50 条决策，push 标绿、drop 标灰
+
+**验证**：
+- `scripts/0509-2200-test-decision-log.py` 5/5 case pass：
+  - case 1：notify_filter 各路径（anchor / blacklist / sidechain / TestNotify）写决策
+  - case 2：recent_for / all_for 倒序 + 字段完整 + sid 隔离
+  - case 3：list_sessions 注入字段
+  - case 4：trim 严格上限 PER_SESSION_MAX=50
+  - case 5：notify_policy.off path 写 drop trace
+- 真实重启 backend 后访问 dashboard：
+  - 触发 `POST /api/event` 一条 Stop（policy=silence:12）→ 卡片底部立即出现 `最近：21:03 ⌛ scheduled_silence_12s`
+  - 触发 TestNotify → 卡片底部显示 `最近：21:04 ✓ always_true:TestNotify`
+  - 点击 trace 按钮 → modal 展开完整 50 条历史
+  - `/api/sessions` 接口已返回 `recent_decisions` 数组
+
+**核心教训**：
+1. **`reason` 字符串只生成不落盘 = 浪费**。日志层的 reason 是低成本观测，落盘成本几乎为零（轻量 jsonl + per-sid trim），不落盘就等于让用户必须 `tail -f` 才能 debug。任何"用户看不见 = 用户怀疑系统坏了"的场景，都该把内部状态升级成第一类 UI 元素。
+2. **新增独立 jsonl 比给 events.jsonl 加字段更稳**。events.jsonl 是事件日志（"发生了什么"），决策日志是策略观测（"我们怎么判的"），两者生命周期不同（决策只对最近 50 条有意义，事件要长期保留）。**强行嵌套在 raw 里会让 list_sessions 读路径每次都加载完整 raw，性能下滑**。这与 L09 加 `last_event_kind`、L08 加 `is_sidechain` 同思路：新增隔离字段 / 文件，不改既有字段语义。
+3. **Per-session trim + 估算行数触发** 是廉价的环形缓冲实现。每次都精确计数要全文件读，但 trim 容忍误差，按文件大小 / 平均行长估算就够用了。这种"懒清理"策略适用于"写多读少 + 总量有上限"的场景。
+4. **API 新字段 + UI 新行 + 后端新文件 = 三处协同改动一次 commit**。这种端到端 P1 改进必须三层一起改才有用：单只改后端用户看不到、单只改前端没数据来源。教训：跨层改动尽量在同一轮内完成，避免半成品状态。
+5. **不记录"取消活动"类事件**避免 trace 噪声。`activity_cancels_pending`（PreToolUse / Heartbeat）每秒都触发，不写 trace 是有意的：决策日志要看"决定推不推"，活动事件只是 cancel pending 不是独立决策。这条边界要在 helper 注释里写清楚，避免下次重复辩论。
+
+---
+
 ## L10 — 飞书消息看不出"完成了什么"：单行 milestone 被末段日志/代码污染（已修）
 
 **修改时间**：2026-05-09
@@ -415,3 +463,54 @@ milestone 来源 = `clean_summary(last_assistant_message)`：先把整段 markdo
 3. **footer 前缀黑名单是廉价过滤** —— Tian 全局规则要求 LLM 答复尾部带"执行环境 / 本轮修改文件" footer，但飞书是"快速浏览"不是"完整记录"，footer 应明确剥掉而不是让它参选首句。这种"语义噪声"用 startswith 黑名单一刀干净。
 4. **降级链要看上下文重复，不光看是否非空** —— L1 focus 已经是 `task_topic or display_name`，L2 再写 task_topic 就是冗余。降级链应该看"与上一行是否重复"再决定显不显。这是 BLUF 原则的延伸：每行只承载一个新信号。
 5. **"分两块"比"塞一行更密"信息密度高** —— 用户视线扫第二行/第三行比扫一行 80 字快。把"任务线（用户问的什么）"和"完成线（agent 干的什么）"分开，在屏幕高度成本可接受时（≤ 7 行）总能用。L05 飞书模板从 9 行压到 6 行是对的方向，但极端紧凑反而牺牲了关键信号；L10 是反向微调，关键信号补回来。
+
+---
+
+## L13 — events.jsonl 单文件无界增长（已修）
+
+**修改时间**：2026-05-09
+
+**用户痛点**：`backend/data/events.jsonl` 是单个 append-only 文件。重度用户 100+ session/天 × 几周 → 100MB+。后果：
+- 启动期 `list_sessions()` 全量读 → 内存峰值 + 启动慢
+- `iter_events()` 是 list_sessions 主路径，每次 dashboard 刷新都 O(全量)
+- 调用频率高（每 hook、每 ws 推送都触发 `_session_summary`）→ 用户感知卡顿
+
+**替代方案（已实施）**：滚动归档（hot + archive 两层）。
+
+设计 spec：
+- 阈值：`max_hot_size_mb=50`（hot 文件 ≥ 此值触发检查）
+- 保留窗：`rotation_grace_days=1`（只归档 ts 早于 24h 前的事件，保留近期热）
+- 归档目录：`data/archive/events-YYYY-MM-DD.jsonl.gz`（按事件**最早 ts** 的本地日期分桶）
+- gzip 多 member 串联：同 date 桶用 `'ab'` 模式追加，读端 `gzip.open('rt')` 自动跨 member 顺序读
+- 触发点：app 启动 lifespan 时调一次 `event_store.archive_if_needed()`
+- 默认行为：`list_sessions()` / `read_events_for()` / `iter_events()` 只读 hot；显式 `?include_archive=1` 才合并归档（懒加载 + 解压）
+
+并发安全：
+- `archive_if_needed()` 持 `LOCK_EX` 整个归档过程（与 `append_event()` 的 flock 同 path）
+- 归档先写 archive（gzip append），再 `os.replace(tmp, hot)` 原子替换
+- 任何环节失败 → 删 .tmp → hot 不动 → events 保留（永远不丢事件）
+
+实测（mock 5 万条 ~64MB hot，30MB threshold）：
+| 指标 | 归档前 | 归档后 |
+|---|---|---|
+| hot 大小 | 63.9 MB | 19.2 MB |
+| hot 行数 | 50,000 | 15,000（保留近期） |
+| archive 文件数 | 0 | 9 个 .gz（按日期分桶） |
+| 归档总条数 | 0 | 35,000 |
+| 总数守恒 | 50,000 | 15,000 hot + 35,000 archive = 50,000 ✓ |
+| `iter_events` 全量读 | 118.9ms | hot-only 36.2ms（**3.3× 加速**） |
+| `list_sessions` | — | hot-only 248ms / full 1003ms |
+| 触发 archive 耗时 | — | 630ms（一次性，启动时） |
+
+**核心教训**：
+1. **append-only 日志要带滚动机制，但不要用"按行数 / 按时间"** —— 「按大小阈值 + grace 窗」更鲁棒：用户突发产生大量事件时，按 size 触发；用户安静期不动；grace 窗保证近期事件永远在 hot（list_sessions 命中率 100%）。
+2. **gzip multi-member 是 append-friendly 的归档格式** —— 不需要"先解压、合并、重压"，每次 `'ab'` 直接拼一个新 gzip member，读端透明。代价：压缩率略降（每 member 各自 header），但相对于"必须读完整压缩文件再 append"的开销，胜算明显。
+3. **flock 必须跨"读+写"全过程** —— 归档要读 hot → 决定哪些归档 → 重写 hot 三个步骤同临界区，否则中间 append_event 写入的事件会被 os.replace 覆盖丢失。`open(path, 'r+')` + LOCK_EX 一把锁罩住整段。
+4. **失败兜底是"事件保留 hot"，不是"事件丢失"** —— 归档失败的语义边界：宁可 hot 不缩，也不能丢任何事件。读 hot 出错 → 跳过本轮；写 archive 出错 → 不动 hot；写 .tmp 出错 → unlink .tmp。每个阶段都有 rollback。
+5. **新增 API param 而不是新增 endpoint** —— `?include_archive=1` 是 query param，复用 `/api/sessions` `/api/events` 既有路由 + 既有 schema，前端零改动。新 endpoint 会带来路由命名 / 鉴权 / 文档同步 N 倍工作量。
+6. **path 解析两层 fallback** —— archive_dir 优先从 config（用户可改），fallback 到 `cfg_mod.ARCHIVE_DIR` 默认。相对路径基于 `PROJECT_ROOT` 解析（绝对路径直接用）—— 用户配 `data/archive` 或 `/var/log/claude-notify` 都生效。
+
+**未来留白（可做但本轮不做）**：
+- archive 老于 N 天的文件清理（避免 archive 自己也无限大）
+- dashboard 显示"已归档 X 个事件 / Y 个文件"meta（前端字段已具备查询能力，UI 待加）
+- 周期归档（不只启动）：当前是"启动时一次"，长跑实例需要再加一个 watcher loop 调用，但实测启动时跑过一次后 hot < threshold 概率高，按需再加

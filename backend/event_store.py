@@ -11,8 +11,8 @@ from threading import RLock
 from typing import Any, Iterable
 
 import re
-from . import aliases, enrichments, sources, stopwords, transcript_reader
-from .config import EVENTS_PATH
+from . import aliases, archival, decision_log, enrichments, sources, stopwords, transcript_reader
+from .config import EVENTS_PATH, ARCHIVE_DIR, PROJECT_ROOT
 
 SHANGHAI_TZ = timezone(timedelta(hours=8))
 COLOR_TOKEN_COUNT = 8
@@ -53,7 +53,19 @@ def append_event(evt: dict[str, Any]) -> None:
                     pass
 
 
-def iter_events() -> Iterable[dict[str, Any]]:
+def iter_events(include_archive: bool = False) -> Iterable[dict[str, Any]]:
+    """迭代事件流。
+
+    默认只读 hot 文件（events.jsonl）—— 配合 archive_if_needed() 控大小，list_sessions 性能稳定。
+    include_archive=True 时先读归档（按日期升序）再读 hot，保证 ts 整体单调递增。
+
+    教训 L13：归档目录懒加载 + gzip 解压，单次调用代价随 archive 总量线性。
+    一般用户场景（dashboard 默认查询）不应触发，仅显式 ?include_archive=1 才走全量。
+    """
+    if include_archive:
+        archive_dir = _resolve_archive_dir()
+        for evt in archival.iter_archived_events(archive_dir):
+            yield evt
     if not EVENTS_PATH.exists():
         return
     with open(EVENTS_PATH, "r", encoding="utf-8") as f:
@@ -67,9 +79,48 @@ def iter_events() -> Iterable[dict[str, Any]]:
                 continue
 
 
-def read_events_for(session_id: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+def _resolve_archive_dir() -> Path:
+    """从 config 读 archive_dir（相对路径基于 PROJECT_ROOT），fallback 到 ARCHIVE_DIR 默认。"""
+    try:
+        from .config import load as _load_cfg
+        cfg = _load_cfg()
+        rel = (cfg.get("archival") or {}).get("archive_dir") or "data/archive"
+        p = Path(rel)
+        if not p.is_absolute():
+            p = PROJECT_ROOT / rel
+        return p
+    except Exception:
+        return ARCHIVE_DIR
+
+
+def archive_if_needed() -> dict[str, Any]:
+    """触发归档（启动时 + 周期调用）。
+
+    读 config.archival 配置，调 archival.archive_if_needed()。
+    enabled=False 时跳过。归档失败不抛异常，log warning 后返回 stats。
+    """
+    try:
+        from .config import load as _load_cfg
+        cfg = _load_cfg()
+        ar_cfg = cfg.get("archival") or {}
+        if not ar_cfg.get("enabled", True):
+            return {"triggered": False, "reason": "disabled"}
+        archive_dir = _resolve_archive_dir()
+        return archival.archive_if_needed(
+            events_path=EVENTS_PATH,
+            archive_dir=archive_dir,
+            max_hot_size_mb=int(ar_cfg.get("max_hot_size_mb", 50)),
+            rotation_grace_days=int(ar_cfg.get("rotation_grace_days", 1)),
+        )
+    except Exception as e:
+        # 归档失败绝不影响主流程（事件保留在 hot）
+        return {"triggered": False, "reason": f"exception: {e}"}
+
+
+def read_events_for(session_id: str | None = None, limit: int = 200,
+                    include_archive: bool = False) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for evt in iter_events():
+    for evt in iter_events(include_archive=include_archive):
         if session_id and evt.get("session_id") != session_id:
             continue
         out.append(evt)
@@ -365,9 +416,10 @@ def _display_name(s: dict[str, Any]) -> str:
     return sid[:8] if sid else "(unknown)"
 
 
-def list_sessions(active_window_minutes: int = 30) -> list[dict[str, Any]]:
+def list_sessions(active_window_minutes: int = 30,
+                  include_archive: bool = False) -> list[dict[str, Any]]:
     sessions: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
-    for evt in iter_events():
+    for evt in iter_events(include_archive=include_archive):
         sid = evt.get("session_id")
         if not sid:
             continue
@@ -538,6 +590,11 @@ def list_sessions(active_window_minutes: int = 30) -> list[dict[str, Any]]:
         )
         s["last_notification_unix"] = s.get("_last_notification_unix") or 0.0
         s["next_action"] = _derive_next_action(s["status"], s["waiting_for"], s["last_action"])
+        # L12：注入推送决策 trace（最近 5 条），让用户在 dashboard 看"为什么这条推了/没推"
+        try:
+            s["recent_decisions"] = decision_log.recent_for(s["session_id"], limit=5)
+        except Exception:
+            s["recent_decisions"] = []
         # 清理累积内部字段
         for k in ("_last_pretool_raw", "_last_notification_msg", "_last_notification_unix",
                   "_last_stop_assistant", "_last_stop_unix",

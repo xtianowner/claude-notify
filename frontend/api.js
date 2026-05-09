@@ -18,6 +18,8 @@ export const api = {
     jsonFetch(`/api/sessions?include_terminal=${includeTerminal ? 1 : 0}`),
   listEvents: (sessionId, limit = 50) =>
     jsonFetch(`/api/events?session_id=${encodeURIComponent(sessionId)}&limit=${limit}`),
+  listDecisions: (sessionId, limit = 50) =>
+    jsonFetch(`/api/sessions/${encodeURIComponent(sessionId)}/decisions?limit=${limit}`),
   getConfig: () => jsonFetch("/api/config"),
   saveConfig: (cfg) =>
     jsonFetch("/api/config", { method: "POST", body: JSON.stringify(cfg) }),

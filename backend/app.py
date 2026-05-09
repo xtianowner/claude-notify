@@ -11,7 +11,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg_mod
-from . import aliases, enrichments, event_store, feishu, liveness_watcher, notify_policy
+from . import aliases, decision_log, enrichments, event_store, feishu, liveness_watcher, notify_policy
 from . import llm as llm_mod
 from . import transcript_reader
 
@@ -81,6 +81,16 @@ async def _on_watcher_event(evt: dict[str, Any]):
 async def lifespan(app: FastAPI):
     cfg = cfg_mod.load()
     interval = int(cfg.get("liveness_interval_seconds") or 30)
+    # 教训 L13：启动时尝试一次滚动归档（events.jsonl 太大就把老事件 gzip 落到 data/archive/）
+    try:
+        stats = event_store.archive_if_needed()
+        if stats.get("triggered") and stats.get("reason") == "ok":
+            log.info("startup archive: %d events archived, %d kept hot",
+                     stats.get("archived_count", 0), stats.get("kept_count", 0))
+        elif stats.get("reason") not in ("below_threshold", "hot_not_exist", "disabled"):
+            log.warning("startup archive: %s", stats)
+    except Exception:
+        log.exception("startup archive failed; continuing without archival")
     task = asyncio.create_task(liveness_watcher.watch_loop(_on_watcher_event, interval_seconds=interval))
     log.info("claude-notify backend started; data=%s", cfg_mod.DATA_DIR)
     try:
@@ -231,10 +241,10 @@ def _read_transcript_tail(path: str, max_chars: int = 800) -> str:
 
 
 @app.get("/api/sessions")
-def list_sessions(include_terminal: bool = True):
+def list_sessions(include_terminal: bool = True, include_archive: bool = False):
     cfg = cfg_mod.load()
     win = int(cfg.get("active_window_minutes") or 30)
-    sessions = event_store.list_sessions(active_window_minutes=win)
+    sessions = event_store.list_sessions(active_window_minutes=win, include_archive=include_archive)
     out = []
     for s in sessions:
         if not include_terminal and s.get("terminal"):
@@ -244,8 +254,18 @@ def list_sessions(include_terminal: bool = True):
 
 
 @app.get("/api/events")
-def list_events(session_id: str | None = None, limit: int = 200):
-    return event_store.read_events_for(session_id=session_id, limit=max(1, min(limit, 1000)))
+def list_events(session_id: str | None = None, limit: int = 200, include_archive: bool = False):
+    return event_store.read_events_for(
+        session_id=session_id,
+        limit=max(1, min(limit, 1000)),
+        include_archive=include_archive,
+    )
+
+
+@app.get("/api/sessions/{session_id}/decisions")
+def list_decisions(session_id: str, limit: int = 50):
+    """L12：返回该 sid 的全部推送决策记录（最多 50 条），按 ts 倒序最新在前。"""
+    return decision_log.all_for(session_id, limit=limit)
 
 
 @app.get("/api/sessions/{session_id}/alias")

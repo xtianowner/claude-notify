@@ -368,7 +368,8 @@ main {
   grid-template-areas:
     "head    actions"
     "summary summary"
-    "meta    meta";
+    "meta    meta"
+    "trace   trace";
   column-gap: var(--sp-3);
   row-gap: var(--sp-3);
   background: var(--c-surface);
@@ -557,6 +558,63 @@ main {
   flex-shrink: 0;
   font-variant-numeric: tabular-nums;
 }
+
+/* ───── 行 4：push-trace（L12 推送决策 trace） ───── */
+.push-trace {
+  grid-area: trace;
+  height: auto;
+  padding: 4px var(--sp-2);
+  border: 1px dashed var(--c-hairline);
+  background: transparent;
+  color: var(--c-fg-muted);
+  font-size: 11px;
+  font-weight: var(--fw-regular);
+  border-radius: var(--r-sm);
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  transition: background-color 120ms ease-out, border-color 120ms ease-out, color 120ms ease-out;
+  font-variant-numeric: tabular-nums;
+}
+.push-trace:hover {
+  background: var(--c-subtle);
+  border-color: var(--c-fg-muted);
+  color: var(--c-fg-soft);
+}
+.push-trace .trace-item { color: inherit; }
+.push-trace .trace-sep  { color: var(--c-hairline); padding: 0 2px; }
+.push-trace .trace-more { color: var(--c-fg-muted); font-style: italic; margin-left: var(--sp-1); }
+
+/* trace modal 内容 */
+.trace-body {
+  max-height: 60vh;
+  overflow-y: auto;
+  border: var(--bd-hair);
+  border-radius: var(--r-sm);
+  background: var(--c-surface);
+  padding: var(--sp-2);
+}
+.trace-row {
+  display: grid;
+  grid-template-columns: auto auto auto 1fr auto;
+  gap: var(--sp-2);
+  padding: 6px var(--sp-2);
+  border-bottom: 1px solid var(--c-hairline);
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+  align-items: baseline;
+}
+.trace-row:last-child { border-bottom: 0; }
+.trace-row.trace-push  { color: var(--c-ok-solid); }
+.trace-row.trace-drop  { color: var(--c-fg-soft); }
+.trace-row.trace-other { color: var(--c-fg-soft); }
+.trace-time   { color: var(--c-fg-muted); font-size: var(--fs-xs); }
+.trace-event  { font-weight: var(--fw-medium); }
+.trace-mark   { font-weight: var(--fw-medium); }
+.trace-reason { color: var(--c-fg-soft); word-break: break-word; }
+.trace-policy { color: var(--c-fg-muted); font-size: var(--fs-xs); }
 
 /* ───────── Status badge ───────── */
 .status-badge {
