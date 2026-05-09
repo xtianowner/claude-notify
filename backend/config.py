@@ -47,12 +47,12 @@ DEFAULT_NOTIFY_FILTER = {
     #   strict → 都 20，仅推有内容回合
     # 非 normal 时 sensitivity 覆盖 stop_min_*_chars 字段值。
     "stop_sensitivity": "normal",
-    # 跨事件 dedupe（教训 L05/L16）：Stop 推过后 N 分钟内，同 sid 的 Notification
-    # 若 message 命中 filler_phrases 则吞。
-    # L16 修：默认 3min → 0.5min（30s）。Claude Code 的 "waiting for your input"
-    # 在 Stop 后 60s 内是 idle prompt 副本（应吞），但 60s+ 是用户真没操作的真等输入
-    # （应推）。3min 窗会把所有真等输入都误吞，用户漏推。
-    "notif_suppress_after_stop_min": 0.5,
+    # 跨事件 dedupe（教训 L05/L16/L18）：Stop 推过后 N 分钟内，同 sid 的 Notification
+    # 若 message 命中 filler_phrases 则吞，避免"任务完成"和"等输入"重复打扰用户。
+    # L16 错误地改成 0.5min，是因为当时 stop_low_signal bug 让 Stop 也漏推，误以为
+    # Notification 是用户唯一信号源。L18 修复 stop_low_signal 后恢复 3min：Stop 已推
+    # 等于用户已知，3min 内的 idle prompt 是冗余；3min+ 视为用户长时间没动作再提醒。
+    "notif_suppress_after_stop_min": 3,
     "notif_filler_phrases": [
         "waiting for your input",
         "press to continue",

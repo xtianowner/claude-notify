@@ -52,8 +52,9 @@ DEFAULT_FILTER_CFG = {
     "stop_min_gap_after_notification_min": 5,
     "stop_short_summary_grace_min": 8,
     "stop_sensitivity": "normal",
-    # L16：3 → 0.5min（30s）。之前 3min 默认会把所有真等输入都误吞。
-    "notif_suppress_after_stop_min": 0.5,
+    # L18：恢复 3min（L16 调到 0.5 是错的——当时 Stop 漏推 bug 让用户以为 Notification
+    # 是唯一提醒，所以放宽 suppress 反而增加冗余。Stop 修好后 3min 内 idle prompt 是副本）。
+    "notif_suppress_after_stop_min": 3,
     "notif_filler_phrases": list(DEFAULT_FILLER_PHRASES),
     "blacklist_words": list(DEFAULT_BLACKLIST),
     # 教训 L08：子 agent 内触发的 Notification 用户切到终端看不到提示（父 session
@@ -180,7 +181,7 @@ def _notification_decision(
     if fcfg.get("filter_sidechain_notifications", True) and evt.get("is_sidechain"):
         return False, "sidechain_active"
 
-    suppress_min = float(fcfg.get("notif_suppress_after_stop_min", 0.5))
+    suppress_min = float(fcfg.get("notif_suppress_after_stop_min", 3))
     filler_phrases = [p.strip().lower() for p in
                       (fcfg.get("notif_filler_phrases") or DEFAULT_FILLER_PHRASES) if p]
 
@@ -191,7 +192,9 @@ def _notification_decision(
             msg = (evt.get("message") or "").strip().lower()
             is_filler = (not msg) or any(p in msg for p in filler_phrases)
             if is_filler:
-                return False, f"notif_dedup_after_stop({gap_min:.1f}min)"
+                # L18：明确写"idle_prompt"而不是泛指 dedup，让 trace 一眼能看懂
+                # 这是 Claude Code 60s 自动 idle prompt 的副本，非真权限请求
+                return False, f"notif_dup_idle_prompt({gap_min:.1f}min<{suppress_min}min)"
     return True, "notification_kept"
 
 

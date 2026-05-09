@@ -9,26 +9,35 @@ import time
 from backend.notify_filter import _stop_decision, _notification_decision, DEFAULT_FILTER_CFG
 
 
-def test_notification_after_stop_30s_pushes():
-    """L16 主修：Stop 后 31s 来的 'waiting for your input' Notification 应推（不被 dedup 吞）"""
+def test_notification_within_3min_dropped_idle_prompt():
+    """L18：Stop 后 3min 内的 'waiting for your input' 是 idle 副本，应吞（避免重复打扰）"""
     cfg = {"notify_filter": dict(DEFAULT_FILTER_CFG)}
-    summary = {"last_stop_pushed_unix": time.time() - 31}  # 31s 前推过 Stop
+    summary = {"last_stop_pushed_unix": time.time() - 60}  # 60s 前推过 Stop
     evt = {"event": "Notification", "message": "Claude is waiting for your input"}
     ok, reason = _notification_decision(evt, summary, cfg)
-    assert ok, f"应推，实际拒推 reason={reason}"
-    assert reason == "notification_kept"
-    print(f"  PASS Stop+31s waiting-for-input → push  ({reason})")
+    assert not ok, f"60s idle prompt 应吞，实际推送 reason={reason}"
+    assert "notif_dup_idle_prompt" in reason
+    print(f"  PASS Stop+60s idle prompt → drop  ({reason})")
 
 
-def test_notification_within_30s_still_dropped():
-    """30s 内的 idle prompt 副本仍应吞（dedup 保留有效场景）"""
+def test_notification_after_3min_pushes_long_idle():
+    """L18：Stop 后 3min+ 视为用户长时间没动作，再提醒一次"""
     cfg = {"notify_filter": dict(DEFAULT_FILTER_CFG)}
-    summary = {"last_stop_pushed_unix": time.time() - 15}  # 15s 前刚推过
+    summary = {"last_stop_pushed_unix": time.time() - 200}  # 3.3min 前
     evt = {"event": "Notification", "message": "Claude is waiting for your input"}
     ok, reason = _notification_decision(evt, summary, cfg)
-    assert not ok
-    assert "notif_dedup_after_stop" in reason
-    print(f"  PASS Stop+15s waiting-for-input → drop  ({reason})")
+    assert ok, f"3min+ 后应推，实际拒推 reason={reason}"
+    print(f"  PASS Stop+200s long-idle → push  ({reason})")
+
+
+def test_real_permission_notification_always_passes():
+    """L18：真权限请求（不在 filler_phrases）任何时候都推 —— 用户必须看到"""
+    cfg = {"notify_filter": dict(DEFAULT_FILTER_CFG)}
+    summary = {"last_stop_pushed_unix": time.time() - 10}  # 10s 前刚推 Stop
+    evt = {"event": "Notification", "message": "Bash command 'rm -rf /tmp/foo' needs approval"}
+    ok, reason = _notification_decision(evt, summary, cfg)
+    assert ok, f"权限请求绝不能吞 reason={reason}"
+    print(f"  PASS Bash approval @ 10s → push  ({reason})")
 
 
 def test_short_stop_with_enough_assistant_msg_pushes():
@@ -82,20 +91,21 @@ def test_user_real_scenario_replay():
     assert ok2, f"用户测试问题 Stop 应推 reason={r2}"
 
     # 3. Stop 后 60s, Claude Code 触发 "waiting for your input" Notification
-    #    L16 之前：被 3min suppress 吞；L16 之后：> 30s 推
+    #    L18：Stop 已推 = 用户已知，60s idle prompt 是副本，应吞
     summary3 = {"last_stop_pushed_unix": time.time() - 60}
     evt3 = {"event": "Notification", "message": "Claude is waiting for your input"}
     ok3, r3 = _notification_decision(evt3, summary3, cfg)
-    assert ok3, f"60s 后 Notification 应推 reason={r3}"
+    assert not ok3, f"60s idle prompt 应吞 reason={r3}"
 
-    print(f"  PASS 用户实测链：Stop1 push({r1}) → Stop2 push({r2}) → Notif push({r3})")
+    print(f"  PASS 用户实测链：Stop1 push({r1}) → Stop2 push({r2}) → idle Notif drop({r3})")
 
 
 def main():
-    print("L16 用户反馈 hotfix 验证")
+    print("L16+L18 用户反馈修复验证")
     print("=" * 60)
-    test_notification_after_stop_30s_pushes()
-    test_notification_within_30s_still_dropped()
+    test_notification_within_3min_dropped_idle_prompt()
+    test_notification_after_3min_pushes_long_idle()
+    test_real_permission_notification_always_passes()
     test_short_stop_with_enough_assistant_msg_pushes()
     test_stop_low_signal_still_blocks_garbage()
     test_user_real_scenario_replay()
