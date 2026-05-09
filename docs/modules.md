@@ -3,7 +3,7 @@
 # modules
 
 创建时间: 2026-05-08 20:29:45
-更新时间: 2026-05-09 11:20:00
+更新时间: 2026-05-09 20:38:20
 
 ## backend.config
 - 输入：磁盘 `data/config.json`，运行时 patch dict
@@ -28,12 +28,17 @@
 - 复用入口：`await feishu.send_event(evt)` / `await feishu.send_test()`
 - 节流：SubagentStop 默认 30s 同 session 合并；Notification/Stop 不节流；Heartbeat 不推
 
-## backend.liveness_watcher（v2 替代 timeout_watcher）
+## backend.liveness_watcher（v2 替代 timeout_watcher，L09 升级到分状态阈值）
 - 输入：`watch_loop(callback, interval_seconds)` + 配置阈值
 - 输出：
   - PID 失活 + transcript stale → append `SessionDead`
-  - 仍活但事件/transcript 静默 → append `TimeoutSuspect`
-- 依赖：backend.config + backend.event_store
+  - 仍活但事件/transcript 静默 ≥ 状态阈值 → append `TimeoutSuspect`（raw 带 last_event_kind/threshold_bucket/threshold_sec）
+- 阈值按 `last_event_kind` 分桶（教训 L09，避免长 tool 误判）：
+  - `Notification / Stop / SubagentStop` → 5 分钟（等用户 / 等下一回合）
+  - `PreToolUse` → 15 分钟（长 tool 容忍）+ transcript mtime ≤ 60s 视为活，跳过报警
+  - `PostToolUse / Heartbeat / SessionStart / 其它` → 10 分钟
+  - `liveness_per_state_timeout.enabled=False` → 退化到旧 `timeout_minutes` 一刀切（kill switch）
+- 依赖：backend.config + backend.event_store（读取 `last_event_kind` 字段）
 - 复用入口：`asyncio.create_task(liveness_watcher.watch_loop(on_event))`
 
 ## backend.sources（v2 新增）

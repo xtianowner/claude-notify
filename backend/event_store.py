@@ -382,6 +382,7 @@ def list_sessions(active_window_minutes: int = 30) -> list[dict[str, Any]]:
                 "first_event_ts": evt.get("ts"),
                 "first_event_unix": parse_iso(evt.get("ts", "")),
                 "last_event": evt.get("event"),
+                "last_event_kind": evt.get("event") or "",
                 "last_event_ts": evt.get("ts"),
                 "last_event_unix": parse_iso(evt.get("ts", "")),
                 "last_message": evt.get("message", ""),
@@ -412,6 +413,10 @@ def list_sessions(active_window_minutes: int = 30) -> list[dict[str, Any]]:
         # last_event_ts 仍跟最新事件（用于"距今"显示）
         s["last_event_ts"] = evt.get("ts")
         s["last_event_unix"] = parse_iso(evt.get("ts", ""))
+        # last_event_kind = 真实最后一条事件类型（含 PreToolUse / PostToolUse / Heartbeat），
+        # 供 liveness_watcher 做分状态超时判定（L09 — 长 tool 不应误报 hang）
+        if ev_name:
+            s["last_event_kind"] = ev_name
         if ev_name and ev_name not in NON_STATUS_EVENTS:
             s["last_event"] = ev_name
         elif s.get("last_event") is None:

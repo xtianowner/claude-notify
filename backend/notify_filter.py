@@ -31,6 +31,10 @@ DEFAULT_FILTER_CFG = {
     "notif_suppress_after_stop_min": 3,
     "notif_filler_phrases": list(DEFAULT_FILLER_PHRASES),
     "blacklist_words": list(DEFAULT_BLACKLIST),
+    # 教训 L08：子 agent 内触发的 Notification 用户切到终端看不到提示（父 session
+    # 已恢复或子 agent 自处理），形成"虚假打扰"。默认开启过滤。
+    # 关掉：data/config.json 设 notify_filter.filter_sidechain_notifications=false
+    "filter_sidechain_notifications": True,
 }
 
 
@@ -65,14 +69,22 @@ def _notification_decision(
     summary: dict[str, Any],
     cfg: dict[str, Any],
 ) -> tuple[bool, str]:
-    """L05 跨事件 dedupe：Claude Code 在主回合 Stop 后 ~60s 还会派一条
-    Notification('waiting for your input') 提醒。对用户而言这是同一交互回合
-    的两面（已完成 → 等输入），不该推两次。
+    """L05 跨事件 dedupe + L08 sidechain 过滤。
 
-    规则：last_stop_pushed_unix 距今 < N 分钟 且 message 是空话 → 吞。
-    `last_stop_pushed_unix` 由 NotifyDispatcher 在 Stop 推送成功后注入到 summary。
+    Claude Code 在主回合 Stop 后 ~60s 还会派一条 Notification('waiting for your input')
+    提醒。对用户而言这是同一交互回合的两面（已完成 → 等输入），不该推两次。
+    L05 规则：last_stop_pushed_unix 距今 < N 分钟 且 message 是空话 → 吞。
+
+    L08 规则：is_sidechain=True（hook 触发瞬间 subagents 目录有最近 5 秒活跃 jsonl）
+    → 子 agent 内的权限确认 / idle prompt 用户切到终端通常已被父 session 恢复，
+    推送只造成虚假打扰 → 吞。可在 config 用 filter_sidechain_notifications 关闭。
     """
     fcfg = cfg.get("notify_filter") or {}
+
+    # L08 sidechain 过滤
+    if fcfg.get("filter_sidechain_notifications", True) and evt.get("is_sidechain"):
+        return False, "sidechain_active"
+
     suppress_min = float(fcfg.get("notif_suppress_after_stop_min", 3))
     filler_phrases = [p.strip().lower() for p in
                       (fcfg.get("notif_filler_phrases") or DEFAULT_FILLER_PHRASES) if p]

@@ -1,7 +1,7 @@
 <!-- purpose: 设计教训记录 — 删除/否定一个设计前先写一段简要总结，避免后续重复犯错 -->
 
 创建时间: 2026-05-09 16:25:00
-更新时间: 2026-05-09 20:25:00
+更新时间: 2026-05-09 20:38:20
 
 # 设计教训
 
@@ -249,3 +249,72 @@ OAuth 模式下：
 2. **Stop 成功推送的 ts 是新 dedupe 信号**，必须从 dispatcher 流到 filter。最简方案：dispatcher 加内存表，summary lookup 时 merge 进去（不污染 event_store schema、不持久化、进程重启自动清空）。
 3. **filler 内容兜底**：纯时间窗判断在边界（2:59 vs 3:01）会有抖动，配合"内容是空话"再确认一层，更稳健。
 4. **用户直觉 "时间放最前" 反而是错的** —— 飞书消息列表自带时间戳渲染，正文第一行该让 BLUF。要敢和用户讨论用户预期不一定最优，给搜索结论 + 替代 mockup 让用户做出判断。
+
+---
+
+## L08 — 子 agent Notification 错推（已修，启发式）
+
+**修改时间**：2026-05-09
+
+**场景**：用户在跑主任务，主 agent 派子 agent（Task tool）；子 agent 内部触发权限确认 / idle prompt → Claude Code 打 Notification hook → backend 推送飞书 → 用户切到终端却看不到任何确认提示（因为子 agent 自己处理了或父 session 已恢复）→ 产生「虚假打扰」破坏信任。
+
+**问题**：Claude Code 的 Notification hook payload **不带任何 sidechain / parent_session / is_subagent 标记**。实测父 / 子 agent 触发的 Notification payload 几乎完全一致：
+- `session_id` 永远是父 session 的（子 agent 继承）
+- `transcript_path` 永远指向父 transcript（`<sid>.jsonl`，不指向 `<sid>/subagents/agent-*.jsonl`）
+- `cwd` / `permission_mode` / `hook_event_name` 都一样
+- 唯一携带 sub-agent 标识的 hook 是 SubagentStop（带 `agent_id` / `agent_type` / `agent_transcript_path`），其它事件没有
+
+对比：Claude Code 的 transcript jsonl **本身**有 `isSidechain: true` 字段（每条 user/assistant message 都带），但是写到独立目录 `<parent_dir>/<sid>/subagents/agent-<aid>.jsonl`，**不混进父 transcript**。父 transcript 永远 `isSidechain=false`。
+
+**解决（启发式）**：`detect_sidechain_active(transcript_path)` —— Notification 触发瞬间检查 `<parent_transcript_dir>/<sid>/subagents/` 目录是否有任何 `agent-*.jsonl` 在最近 5 秒内被写过。是 → 视为 sidechain active → `notify_filter` 吞这条 Notification（reason=`sidechain_active`）。
+- `backend/sources.py` `_normalize_claude_code()` 仅对 Notification 跑检测，写入 `is_sidechain` 字段
+- `backend/notify_filter.py` `_notification_decision()` 读 `is_sidechain` + `cfg.notify_filter.filter_sidechain_notifications`（默认 True，用户可关）
+- `backend/config.py` `DEFAULT_NOTIFY_FILTER` 加默认开关
+- 启发式精度：mtime 窗 5 秒，覆盖 hook 触发前后子 agent 任意 jsonl 写入；O(目录 entry 数) IO，无远程调用
+
+**验证**：`scripts/0509-2030-test-sidechain-filter.py` 6/6 case pass（主 session 推送 / 子 agent 过滤 / 配置关闭恢复推送 / 老 jsonl 不算 active / 空路径降级 / Stop 跳过检测）。
+
+**核心教训**：
+1. **Claude Code hook payload 没有原生 sidechain 标记** —— 不要凭空假设字段名。先 grep 现有代码 + 实测 events.jsonl payload 找出真正可用字段，再设计。
+2. **transcript 文件系统布局是隐藏信号源** —— 父 / 子 transcript 在不同路径（`<sid>.jsonl` vs `<sid>/subagents/agent-*.jsonl`），mtime 是几乎免费的活性指标。Claude Code 没暴露的状态，文件系统暴露了。
+3. **启发式有边界，必须可关** —— 5 秒窗会误吞「父 agent 在子 agent 刚结束 5s 内的真实 Notification」（罕见），用户必须能 `filter_sidechain_notifications=false` 退回原行为。默认 True 是因为「子 agent 错推」比「父 agent 5s 内边界误吞」频率高 1-2 个数量级。
+4. **保守 fallback** —— 任何检测失败（路径不存在 / 权限拒绝 / payload 没 transcript_path）一律返 False = 不过滤 = 不冤推空。少推不如错推，但虚假打扰比少推更伤信任，所以这里的兜底是 `is_sidechain=False = 推送`。
+5. **检测只在必要事件上跑** —— Notification 才需要，Stop / SessionEnd 等不跑（性能 + 清晰边界，避免未来 SubagentStop 也走错误分支）。
+
+---
+
+## L09 — TimeoutSuspect 单一阈值误判长 tool 执行为 hang（已修）
+
+**修改时间**：2026-05-09
+
+**事故现象**：用户跑长 tool（curl 大文件 / 4 分钟 build / 等 LLM 慢响应），3-8 分钟无新事件，飞书收到「⚠️ 疑似 hang」误推。任务实际正常跑。
+
+**根因**：旧版 `liveness_watcher.watch_loop` 只看「最后事件的时间戳」，不看「最后事件的类型」：
+```python
+if effective_age >= timeout_min * 60:  # 5 分钟一刀切
+    push TimeoutSuspect
+```
+但事件类型其实已经携带状态信息：
+- `Notification` / `Stop` 之后无新事件 = **真的等用户输入** → 5 分钟报 hang 合理
+- `PreToolUse` 之后无 `PostToolUse` = **正在执行 tool**（curl/build/LLM）→ tool 自己慢，不该报
+- `PostToolUse` 之后无新事件 = Claude 在思考下一步 → 短窗 OK，长窗可疑
+
+**替代方案（已实施）**：分状态阈值 + transcript 活性兜底
+1. `event_store.list_sessions` 暴露新字段 `last_event_kind` —— 真实最后一条事件的 `event` 字段（含 PreToolUse/PostToolUse/Heartbeat），与 status 派生用的 `last_event` 字段独立（后者过滤掉 NON_STATUS_EVENTS，扩它语义会牵动 dashboard / status）
+2. `config.py` 加 `liveness_per_state_timeout` dict（默认值见 `DEFAULT_LIVENESS_PER_STATE_TIMEOUT`）：
+   - `Notification_minutes / Stop_minutes / SubagentStop_minutes`：5（保持原 timeout 5 分钟）
+   - `PreToolUse_minutes`：15（长 tool 容忍）
+   - `PostToolUse_minutes`：10（思考下一步）
+   - `default_minutes`：10
+   - `pretool_transcript_alive_seconds`：60（PreToolUse 状态 transcript 活性兜底）
+   - `enabled`：True（关闭即退化为旧 timeout_minutes 一刀切，保留 kill switch）
+3. `liveness_watcher.watch_loop` 调 `_pick_timeout_seconds(last_kind, per_state_cfg, fallback)` 取阈值；PreToolUse 状态再加一层 transcript mtime 兜底（mtime 在最近 60s 内 → 视为活，跳过本轮报警）
+4. TimeoutSuspect 事件 raw 里多带 `last_event_kind` / `threshold_bucket` / `threshold_sec` 三字段，dashboard / 排障可追溯"为什么这次报 / 不报"
+
+**验证**：`scripts/0509-2030-test-liveness-states.py` 8/8 case pass。覆盖 Notification / PreToolUse(短·长) / PreToolUse 活性兜底 / PostToolUse(短·长) / legacy 退化。
+
+**核心教训**：
+1. **"距今多久"是指标，不是判定** —— 同样 8 分钟无事件，状态不同含义完全不同。指标设计要带"上下文标签"（这里是 `last_event_kind`）。
+2. **新增字段而不改既有字段语义** —— `last_event` 已被定义为「会改 status 的事件」（NON_STATUS_EVENTS 过滤），扩它的语义会牵动 dashboard / status。直接加 `last_event_kind` 是隔离的最小改动，与 L08 的 `is_sidechain` 字段思路一致。
+3. **保留可关闭开关** —— 默认开新逻辑（修复用户痛点），但 `enabled=False` 退化到旧逻辑作为安全网。任何 watcher 类核心判定的修改都该有 kill switch。
+4. **transcript mtime 是廉价的旁路信号（与 L08 同源）** —— PID 还活说明进程在跑、transcript mtime 还新说明 Claude 在写文件。两者结合比单看事件流稳得多（tool 执行期间 Claude Code 不发 PostToolUse hook 的话，transcript mtime 仍能识别活性）。

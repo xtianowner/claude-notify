@@ -10,7 +10,9 @@
 人类一眼可读的"首句概要"。
 """
 from __future__ import annotations
+import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -153,6 +155,49 @@ CLAUDE_CODE = "claude_code"
 CODEX = "codex"
 GENERIC = "generic"
 
+# 教训 L08：Claude Code Notification hook payload 没有原生 sidechain / parent_session 字段。
+# 子 agent transcript 写到独立目录 <parent_transcript_dir>/<sid>/subagents/agent-*.jsonl，
+# 父 transcript 是 <parent_transcript_dir>/<sid>.jsonl。Notification 触发瞬间，活跃子 agent
+# 的 jsonl mtime 会非常新（毫秒级）—— 用这个做启发式。
+SIDECHAIN_ACTIVE_WINDOW_SEC = 5.0
+
+
+def detect_sidechain_active(transcript_path: str, now: float | None = None) -> bool:
+    """启发式：判断 hook 触发瞬间是否有活跃子 agent。
+
+    输入 hook 给的 transcript_path（永远指向父 transcript：<sid>.jsonl）。
+    检查同级 <sid>/subagents/ 目录是否有 agent-*.jsonl 在最近 SIDECHAIN_ACTIVE_WINDOW_SEC
+    秒内被写过。任何失败静默返回 False（保守 = 不过滤 = 不冤推空）。
+
+    边界：
+    - 父 agent 在子 agent 刚结束 5 秒内触发的真实 Notification 会被误吞（罕见，且用户可关）
+    - hook payload 没给 transcript_path → 返回 False
+    - subagents 目录不存在或为空 → False（无活跃子 agent）
+    """
+    if not transcript_path:
+        return False
+    try:
+        p = Path(transcript_path)
+        # 父 transcript 是 <dir>/<sid>.jsonl，sub 目录是 <dir>/<sid>/subagents/
+        sid = p.stem  # 去掉 .jsonl
+        sub_dir = p.parent / sid / "subagents"
+        if not sub_dir.is_dir():
+            return False
+        cutoff = (now if now is not None else time.time()) - SIDECHAIN_ACTIVE_WINDOW_SEC
+        with os.scandir(sub_dir) as it:
+            for entry in it:
+                name = entry.name
+                if not (name.startswith("agent-") and name.endswith(".jsonl")):
+                    continue
+                try:
+                    if entry.stat().st_mtime >= cutoff:
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        return False
+    return False
+
 
 def _normalize_claude_code(raw: dict[str, Any]) -> dict[str, Any]:
     """Claude Code hook payload → 内部统一字段。"""
@@ -161,6 +206,9 @@ def _normalize_claude_code(raw: dict[str, Any]) -> dict[str, Any]:
     cwd_short = _cwd_tail(cwd, 2)
     event = raw.get("event") or raw.get("hook_event_name") or "Unknown"
     msg = raw.get("message") or _summarize_claude(raw)
+    transcript_path = raw.get("transcript_path") or ""
+    # sidechain 启发式只对 Notification 跑（Stop / SessionEnd 等不需要）
+    is_sidechain = detect_sidechain_active(transcript_path) if event == "Notification" else False
     return {
         "source": CLAUDE_CODE,
         "session_id": raw.get("session_id") or "unknown",
@@ -169,7 +217,7 @@ def _normalize_claude_code(raw: dict[str, Any]) -> dict[str, Any]:
         "cwd_short": cwd_short,
         "project": project,
         "message": msg,
-        "transcript_path": raw.get("transcript_path") or "",
+        "transcript_path": transcript_path,
         "claude_pid": raw.get("claude_pid"),
         "hook_pid": raw.get("hook_pid"),
         "tty": raw.get("tty") or "",
@@ -178,6 +226,7 @@ def _normalize_claude_code(raw: dict[str, Any]) -> dict[str, Any]:
         "last_assistant_message": (raw.get("raw") or {}).get("last_assistant_message")
             or raw.get("last_assistant_message"),
         "reason": (raw.get("raw") or {}).get("reason") or raw.get("reason"),
+        "is_sidechain": is_sidechain,
         "raw": raw.get("raw") if isinstance(raw.get("raw"), dict) else raw,
     }
 

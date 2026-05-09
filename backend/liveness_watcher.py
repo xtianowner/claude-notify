@@ -5,8 +5,15 @@
   2) Transcript mtime：transcript_path 距今多久未更新
   3) 综合判定：
      - 进程消失 且 transcript stale ≥ dead_threshold_minutes → SessionDead
-     - 仍活 但事件/transcript 静默 ≥ timeout_minutes → TimeoutSuspect
+     - 仍活 但静默超阈值 → TimeoutSuspect（阈值按 last_event_kind 分状态选取）
      - 已是终态（ended/dead） → 跳过
+
+L09 — 分状态超时：旧版只看「最后事件时间戳」，没分类型。结果"长 tool 执行 8 分钟"
+被当 hang 误推。新逻辑参考 last_event_kind：
+  - Notification / Stop / SubagentStop  →  原 timeout（5 分钟）  这是「等用户/等下一回合」状态
+  - PreToolUse                          →  pretool 阈值（15 分钟）+ transcript 活性兜底
+  - PostToolUse / Heartbeat / 其它      →  idle 阈值（10 分钟）
+若 config.liveness_per_state_timeout.enabled=False，退化为单一 timeout_minutes（旧逻辑）。
 
 每个状态对每个 session 仅 push 一次（用 suspect_pushed_for_unix / dead_pushed_for_unix 去重）。
 后续若该 session 又出现新事件（resume），可重置去重位（自然由更晚的事件 ts 触发）。
@@ -58,6 +65,35 @@ def _transcript_age(path: str) -> float:
         return float("inf")
 
 
+# 与 event_store.NON_STATUS_EVENTS 概念独立：那是 status 派生用，这里是 liveness 阈值选择用
+_WAITING_KINDS = {"Notification", "Stop", "SubagentStop"}
+
+
+def _pick_timeout_seconds(
+    last_event_kind: str,
+    per_state_cfg: dict,
+    fallback_timeout_min: int,
+) -> tuple[int, str]:
+    """根据最后事件类型返回 (阈值秒数, 命中 bucket 名)。
+
+    bucket 名给到事件 raw 字段，便于排查「为什么这次报/这次不报」。
+    """
+    if not per_state_cfg or not per_state_cfg.get("enabled", True):
+        return fallback_timeout_min * 60, "legacy_uniform"
+
+    kind = last_event_kind or ""
+    # 优先精确匹配 <Kind>_minutes
+    key = f"{kind}_minutes"
+    if kind and key in per_state_cfg and isinstance(per_state_cfg[key], (int, float)):
+        return int(per_state_cfg[key]) * 60, kind
+    # fallback 到 default_minutes
+    default_min = per_state_cfg.get("default_minutes")
+    if isinstance(default_min, (int, float)):
+        return int(default_min) * 60, "default"
+    # 配置缺失再退到老 timeout_minutes
+    return fallback_timeout_min * 60, "legacy_fallback"
+
+
 async def watch_loop(on_event: OnEvent, interval_seconds: int = 30):
     log.info("liveness watcher started, interval=%ss", interval_seconds)
     while True:
@@ -67,6 +103,7 @@ async def watch_loop(on_event: OnEvent, interval_seconds: int = 30):
             active_window = int(cfg.get("active_window_minutes") or 30)
             timeout_min = int(cfg.get("timeout_minutes") or 5)
             dead_threshold_min = int(cfg.get("dead_threshold_minutes") or 30)
+            per_state_cfg = cfg.get("liveness_per_state_timeout") or {}
             sessions = event_store.list_sessions(active_window_minutes=active_window)
             now = time.time()
 
@@ -117,7 +154,21 @@ async def watch_loop(on_event: OnEvent, interval_seconds: int = 30):
                     continue
 
                 # 2) TimeoutSuspect 判定（弱信号；可能在跑长任务）
-                if effective_age >= timeout_min * 60:
+                # L09 — 按 last_event_kind 选阈值：长 tool 执行 (PreToolUse) 给更宽容忍
+                last_kind = s.get("last_event_kind") or s.get("last_event") or ""
+                threshold_sec, bucket = _pick_timeout_seconds(
+                    last_kind, per_state_cfg, timeout_min
+                )
+
+                # PreToolUse 状态：transcript 还在被写 → 视为活，跳过本轮（不报）
+                # 用「pretool_transcript_alive_seconds」配置（默认 60s）
+                if last_kind == "PreToolUse" and per_state_cfg.get("enabled", True):
+                    alive_window = int(per_state_cfg.get("pretool_transcript_alive_seconds", 60) or 0)
+                    if alive_window > 0 and tx_age != float("inf") and tx_age < alive_window:
+                        # transcript 仍被 Claude 写 → 不报警
+                        continue
+
+                if effective_age >= threshold_sec:
                     if s.get("suspect_pushed_for_unix", 0) >= s["last_event_unix"]:
                         continue
                     evt = {
@@ -130,12 +181,15 @@ async def watch_loop(on_event: OnEvent, interval_seconds: int = 30):
                         "project": s.get("project", ""),
                         "transcript_path": s.get("transcript_path", ""),
                         "claude_pid": s.get("claude_pid"),
-                        "message": f"已 {int(effective_age // 60)} 分钟无新事件 / transcript 无更新（阈值 {timeout_min} 分钟）",
+                        "message": f"已 {int(effective_age // 60)} 分钟无新事件 / transcript 无更新（阈值 {threshold_sec // 60} 分钟，state={bucket}）",
                         "raw": {
                             "detector": "liveness_watcher",
                             "pid_alive": pid_alive,
                             "transcript_age_sec": int(tx_age) if tx_age != float("inf") else -1,
                             "last_event_age_sec": int(last_evt_age),
+                            "last_event_kind": last_kind,
+                            "threshold_bucket": bucket,
+                            "threshold_sec": threshold_sec,
                         },
                     }
                     event_store.append_event(evt)

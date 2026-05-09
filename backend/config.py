@@ -47,6 +47,26 @@ DEFAULT_NOTIFY_FILTER = {
         "ok", "yes", "no", "好", "好的", "已完成", "完成", "收到",
         "嗯", "是", "不", "对", "行", "可以", "thanks", "thank you", "ack",
     ],
+    # 教训 L08：子 agent 内触发的 Notification 用户切到终端看不到提示
+    # （父 session 已恢复 / 子 agent 自处理）→ 默认过滤。
+    # 关掉：本字段设 false（推送恢复全量 Notification）
+    "filter_sidechain_notifications": True,
+}
+
+DEFAULT_LIVENESS_PER_STATE_TIMEOUT = {
+    # L09 — 按 last_event_kind 分状态设阈值，避免「长 tool 执行」误判 hang
+    # enabled=False 时退化为旧逻辑（timeout_minutes 一刀切）
+    "enabled": True,
+    "Notification_minutes": 5,         # 等用户输入：与原 timeout 一致
+    "Stop_minutes": 5,                 # 主回合结束等下一步
+    "SubagentStop_minutes": 5,
+    "PreToolUse_minutes": 15,          # 长 tool 执行（curl 大文件 / build / LLM 慢响应）容忍 15 分钟
+    "PostToolUse_minutes": 10,         # 思考下一步
+    "Heartbeat_minutes": 10,
+    "SessionStart_minutes": 10,
+    "default_minutes": 10,             # 其它未列名事件
+    # PreToolUse 状态额外保护：transcript_path 在最近 N 秒内有 mtime 更新 → 视为活，继续等
+    "pretool_transcript_alive_seconds": 60,
 }
 
 DEFAULTS: dict[str, Any] = {
@@ -55,6 +75,7 @@ DEFAULTS: dict[str, Any] = {
     "timeout_minutes": 5,
     "dead_threshold_minutes": 30,
     "active_window_minutes": 30,
+    "liveness_per_state_timeout": DEFAULT_LIVENESS_PER_STATE_TIMEOUT,
     "notify_policy": DEFAULT_NOTIFY_POLICY,
     "notify_filter": DEFAULT_NOTIFY_FILTER,
     "muted": False,
