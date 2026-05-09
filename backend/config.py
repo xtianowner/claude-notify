@@ -47,11 +47,17 @@ DEFAULT_NOTIFY_FILTER = {
     #   strict → 都 20，仅推有内容回合
     # 非 normal 时 sensitivity 覆盖 stop_min_*_chars 字段值。
     "stop_sensitivity": "normal",
-    # 跨事件 dedupe（教训 L05/L16/L18/L21）：
-    # L21 用户选择「严格 1 次任务 1 次推送」：只要 Stop 推过，所有同 sid 后续 idle prompt
-    # Notification 一律吞，直到下一次 Stop 推送（= 下一个新任务完成）才允许再推。
-    # `notif_dedup_until_next_stop=True`（默认）→ 永久 dedup，忽略 suppress_min 时间窗
-    # `notif_dedup_until_next_stop=False` → 退回到时间窗模式，由 suppress_min 控制
+    # 跨事件 dedupe（教训 L05/L16/L18/L21/L22）：
+    # L22 最终设计 —— 每个任务最多 3 次推送：
+    #   1. 任务完成的 Stop 推送（由 _stop_decision 决定）
+    #   2. Stop 后 N 分钟用户无反应 → idle reminder 1 次
+    #   3. Stop 后 M 分钟用户还无反应 → idle reminder 最后一次
+    # `notif_idle_reminder_minutes`：每次 idle reminder 距 Stop push 的最小 gap。
+    #   [] = 严格 1 次（只推完成那次，类似 L21）
+    #   [5, 10] = 默认 2 次提醒（在 5min 和 10min 阈值后 各推 1 次）
+    # 下一次新 Stop push → 重置该 sid 的 reminder 计数
+    "notif_idle_reminder_minutes": [5, 10],
+    # 兼容字段（已废弃，保留是为了用户配置回退；新代码不读）
     "notif_dedup_until_next_stop": True,
     "notif_suppress_after_stop_min": 3,
     # L19：Claude Code 实际有 2 种 idle prompt 文本，旧 default 只覆盖了一种导致漏吞。

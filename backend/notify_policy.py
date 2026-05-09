@@ -203,12 +203,19 @@ class NotifyDispatcher:
             pass
 
     def _record_stop_push(self, ev_type: str, sid: str, result: dict[str, Any] | None) -> None:
-        """Stop 推送成功后写 ts，供 Notification dedupe 用。"""
+        """Stop 推送成功后写 ts，供 Notification dedupe 用。
+        L22：同时重置该 sid 的 idle reminder 计数 —— 新一回合开始，3 次配额刷新。"""
         if ev_type != "Stop" or not sid:
             return
         if not (result and result.get("ok")):
             return
         self._last_stop_pushed_at[sid] = time.time()
+        # L22：新 Stop push 来 → 重置 idle reminder 计数（下一回合重新走 3 次循环）
+        try:
+            from . import idle_reminder
+            idle_reminder.reset(sid)
+        except Exception:
+            pass
         # 简单防内存膨胀：> 256 条时清掉最老的一半
         if len(self._last_stop_pushed_at) > 256:
             for k in sorted(self._last_stop_pushed_at,

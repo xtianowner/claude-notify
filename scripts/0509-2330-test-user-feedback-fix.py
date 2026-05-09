@@ -9,36 +9,74 @@ import time
 from backend.notify_filter import _stop_decision, _notification_decision, DEFAULT_FILTER_CFG
 
 
-def test_l21_idle_prompt_dropped_until_next_task():
-    """L21：默认配置 dedup_until_next_stop=True，Stop 推过的 idle prompt 永远吞"""
+def test_l22_3cap_idle_reminders():
+    """L22：默认配置 [5, 10] —— 5min 后第 1 次 reminder，10min 后第 2 次，之后永远吞"""
+    from backend import idle_reminder
+    sid = "test-l22-3cap"
+    idle_reminder.reset(sid)
+
     cfg = {"notify_filter": dict(DEFAULT_FILTER_CFG)}
-    # 60s 前推过 Stop
-    summary = {"last_stop_pushed_unix": time.time() - 60}
-    evt = {"event": "Notification", "message": "Claude is waiting for your input"}
-    ok, reason = _notification_decision(evt, summary, cfg)
-    assert not ok and reason == "notif_dup_until_next_task", f"60s 应吞 reason={reason}"
-    # 30 分钟后（远超旧 3min 阈值）也应吞
-    summary30 = {"last_stop_pushed_unix": time.time() - 1800}
-    ok30, r30 = _notification_decision(evt, summary30, cfg)
-    assert not ok30 and r30 == "notif_dup_until_next_task", f"30min 也应吞 reason={r30}"
-    print(f"  PASS Stop+60s idle → drop ({reason}); Stop+30min idle → drop ({r30})")
+    base = time.time()
+
+    # 60s 后 idle prompt → gap=1min < 5min → 吞，count 仍 0
+    evt = {"event": "Notification", "session_id": sid, "message": "Claude is waiting for your input"}
+    ok, r = _notification_decision(evt, {"last_stop_pushed_unix": base - 60}, cfg)
+    assert not ok and "notif_idle_dup" in r, f"1min 应吞 reason={r}"
+    assert idle_reminder.get_count(sid) == 0
+
+    # 5.5min 后 idle prompt → gap=5.5 >= 5min → 推（reminder 1），count=1
+    ok, r = _notification_decision(evt, {"last_stop_pushed_unix": base - 330}, cfg)
+    assert ok and "notif_idle_reminder_1" in r, f"5.5min 应推 reminder 1 reason={r}"
+    assert idle_reminder.get_count(sid) == 1
+
+    # 6min 后 idle prompt → reminder 1 已发；下一阈值是 10min；gap=6 < 10 → 吞
+    ok, r = _notification_decision(evt, {"last_stop_pushed_unix": base - 360}, cfg)
+    assert not ok and "notif_idle_dup" in r, f"6min 第 2 次应等 10min 阈值 reason={r}"
+    assert idle_reminder.get_count(sid) == 1
+
+    # 11min 后 idle prompt → gap=11 >= 10min → 推（reminder 2），count=2 = 上限
+    ok, r = _notification_decision(evt, {"last_stop_pushed_unix": base - 660}, cfg)
+    assert ok and "notif_idle_reminder_2" in r, f"11min 应推 reminder 2 reason={r}"
+    assert idle_reminder.get_count(sid) == 2
+
+    # 30min 后 idle prompt → 已达 max → 永远吞
+    ok, r = _notification_decision(evt, {"last_stop_pushed_unix": base - 1800}, cfg)
+    assert not ok and "notif_idle_max_reminders" in r, f"已达上限应吞 reason={r}"
+    assert idle_reminder.get_count(sid) == 2
+
+    idle_reminder.reset(sid)
+    print(f"  PASS 3-cap reminder: 1min→drop, 5.5min→push#1, 6min→drop, 11min→push#2, 30min→drop")
 
 
-def test_l21_legacy_window_mode_when_disabled():
-    """L21：用户关闭严格模式（dedup_until_next_stop=False）→ 退回 3min 窗口"""
+def test_l22_reset_on_new_stop_push():
+    """L22：新 Stop push 后 reminder 计数重置 → 下一回合重新走 3 次"""
+    from backend import idle_reminder
+    sid = "test-l22-reset"
+    idle_reminder.reset(sid)
+    idle_reminder.mark_sent(sid)
+    idle_reminder.mark_sent(sid)
+    assert idle_reminder.get_count(sid) == 2
+    idle_reminder.reset(sid)
+    assert idle_reminder.get_count(sid) == 0
+
+    # reset 后又来 idle prompt → 视为第 1 次 reminder candidate
+    cfg = {"notify_filter": dict(DEFAULT_FILTER_CFG)}
+    evt = {"event": "Notification", "session_id": sid, "message": "Claude is waiting for your input"}
+    ok, r = _notification_decision(evt, {"last_stop_pushed_unix": time.time() - 330}, cfg)
+    assert ok and "notif_idle_reminder_1" in r, f"reset 后应能推 reason={r}"
+    idle_reminder.reset(sid)
+    print(f"  PASS reset 后计数清零，能再走 3 次")
+
+
+def test_l22_strict_mode_empty_list():
+    """L22：用户配置空列表 → 严格 1 次（任务完成那次推完后绝不再推）"""
     cfg_filter = dict(DEFAULT_FILTER_CFG)
-    cfg_filter["notif_dedup_until_next_stop"] = False
+    cfg_filter["notif_idle_reminder_minutes"] = []
     cfg = {"notify_filter": cfg_filter}
-    # 窗口内吞
-    summary60 = {"last_stop_pushed_unix": time.time() - 60}
-    evt = {"event": "Notification", "message": "Claude is waiting for your input"}
-    ok60, r60 = _notification_decision(evt, summary60, cfg)
-    assert not ok60 and "notif_dup_idle_prompt" in r60
-    # 窗口外推
-    summary200 = {"last_stop_pushed_unix": time.time() - 200}
-    ok200, r200 = _notification_decision(evt, summary200, cfg)
-    assert ok200, f"3min+ 应推 reason={r200}"
-    print(f"  PASS legacy window: 60s→drop({r60}), 200s→push({r200})")
+    evt = {"event": "Notification", "session_id": "test-strict", "message": "Claude is waiting for your input"}
+    ok, r = _notification_decision(evt, {"last_stop_pushed_unix": time.time() - 600}, cfg)
+    assert not ok and r == "notif_dup_until_next_task", f"空列表应严格 1 次 reason={r}"
+    print(f"  PASS 空列表 → 严格 1 次模式")
 
 
 def test_real_permission_notification_always_passes():
@@ -53,17 +91,19 @@ def test_real_permission_notification_always_passes():
 
 
 def test_l19_two_idle_prompt_variants_both_dropped():
-    """L19：Claude Code 两种 idle prompt message 都应被吞（L21 改为永久 dedup）"""
+    """L19+L22：Claude Code 两种 idle prompt message 都应被吞（< 5min 第一阈值前）"""
+    from backend import idle_reminder
     cfg = {"notify_filter": dict(DEFAULT_FILTER_CFG)}
     summary = {"last_stop_pushed_unix": time.time() - 60}
-    for msg in ("Claude is waiting for your input", "Claude Code needs your attention"):
-        evt = {"event": "Notification", "message": msg}
+    for i, msg in enumerate(("Claude is waiting for your input", "Claude Code needs your attention")):
+        sid = f"test-l19-{i}"
+        idle_reminder.reset(sid)
+        evt = {"event": "Notification", "session_id": sid, "message": msg}
         ok, reason = _notification_decision(evt, summary, cfg)
-        assert not ok, f"{msg!r} 应被吞，实际推送 reason={reason}"
-        # L21 默认走 notif_dup_until_next_task；L18/L19 旧名 notif_dup_idle_prompt 仅在
-        # notif_dedup_until_next_stop=False 时出现
-        assert reason == "notif_dup_until_next_task"
-    print(f"  PASS L19 两种 idle prompt 均 drop（L21 严格模式）")
+        assert not ok, f"{msg!r} 1min < 5min 阈值应吞 reason={reason}"
+        assert "notif_idle_dup" in reason
+        idle_reminder.reset(sid)
+    print(f"  PASS L19 两种 idle prompt 在 1min 都被吞（< 5min 阈值）")
 
 
 def test_short_stop_with_enough_assistant_msg_pushes():
@@ -117,20 +157,25 @@ def test_user_real_scenario_replay():
     assert ok2, f"用户测试问题 Stop 应推 reason={r2}"
 
     # 3. Stop 后 60s, Claude Code 触发 idle prompt
-    #    L21：永久 dedup until next Stop
+    #    L22：1min < 5min 阈值 → 吞
+    from backend import idle_reminder
+    sid = "test-real-replay"
+    idle_reminder.reset(sid)
     summary3 = {"last_stop_pushed_unix": time.time() - 60}
-    evt3 = {"event": "Notification", "message": "Claude is waiting for your input"}
+    evt3 = {"event": "Notification", "session_id": sid, "message": "Claude is waiting for your input"}
     ok3, r3 = _notification_decision(evt3, summary3, cfg)
     assert not ok3, f"idle prompt 应吞 reason={r3}"
+    idle_reminder.reset(sid)
 
     print(f"  PASS 用户实测链：Stop1 push({r1}) → Stop2 push({r2}) → idle Notif drop({r3})")
 
 
 def main():
-    print("L16+L18+L19+L21 用户反馈修复验证（含 L21 严格 1 次模式）")
+    print("L16+L18+L19+L22 用户反馈修复验证（L22 = 3-cap idle reminder）")
     print("=" * 60)
-    test_l21_idle_prompt_dropped_until_next_task()
-    test_l21_legacy_window_mode_when_disabled()
+    test_l22_3cap_idle_reminders()
+    test_l22_reset_on_new_stop_push()
+    test_l22_strict_mode_empty_list()
     test_real_permission_notification_always_passes()
     test_l19_two_idle_prompt_variants_both_dropped()
     test_short_stop_with_enough_assistant_msg_pushes()

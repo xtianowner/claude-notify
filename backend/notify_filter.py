@@ -16,7 +16,7 @@ import time
 from datetime import datetime
 from typing import Any
 
-from . import decision_log
+from . import decision_log, idle_reminder
 
 # L15：quiet_hours 默认放行的事件白名单（即使时段命中也照推）。
 # 用户视角：「真等输入 / 疑挂」是关键事件，再急也得叫醒；其它（Stop / SubagentStop / Heartbeat）夜里吞掉。
@@ -53,8 +53,9 @@ DEFAULT_FILTER_CFG = {
     "stop_min_gap_after_notification_min": 5,
     "stop_short_summary_grace_min": 8,
     "stop_sensitivity": "normal",
-    # L18：恢复 3min（L16 调到 0.5 是错的——当时 Stop 漏推 bug 让用户以为 Notification
-    # 是唯一提醒，所以放宽 suppress 反而增加冗余。Stop 修好后 3min 内 idle prompt 是副本）。
+    # L22：每个任务最多 3 次推送（任务完成 + 5min + 10min）
+    "notif_idle_reminder_minutes": [5, 10],
+    # 兼容字段（已废弃，仅当 notif_idle_reminder_minutes 被显式设为 [] 时才走 strict 模式）
     "notif_suppress_after_stop_min": 3,
     "notif_filler_phrases": list(DEFAULT_FILLER_PHRASES),
     "blacklist_words": list(DEFAULT_BLACKLIST),
@@ -187,20 +188,48 @@ def _notification_decision(
                       (fcfg.get("notif_filler_phrases") or DEFAULT_FILLER_PHRASES) if p]
 
     last_stop_unix = float(summary.get("last_stop_pushed_unix") or 0)
-    dedup_until_next = bool(fcfg.get("notif_dedup_until_next_stop", True))
     if last_stop_unix > 0:
         msg = (evt.get("message") or "").strip().lower()
         # L19：整句相等匹配，避免误吞带后缀的真权限请求
         is_filler = (not msg) or msg in filler_phrases
         if is_filler:
-            if dedup_until_next:
-                # L21：严格 1 次 —— 只要 Stop 推过，idle prompt 永远吞，直到下次 Stop 推送
-                return False, "notif_dup_until_next_task"
-            if suppress_min > 0:
-                gap_min = (time.time() - last_stop_unix) / 60.0
-                if gap_min < suppress_min:
-                    return False, f"notif_dup_idle_prompt({gap_min:.1f}min<{suppress_min}min)"
+            return _idle_reminder_decision(evt, fcfg, last_stop_unix)
     return True, "notification_kept"
+
+
+def _idle_reminder_decision(
+    evt: dict[str, Any],
+    fcfg: dict[str, Any],
+    last_stop_unix: float,
+) -> tuple[bool, str]:
+    """L22：idle prompt 来时按 reminder 计数 + gap 阈值决定推/吞。
+
+    规则：
+    - reminder_minutes 列表为空 → 严格 1 次模式（永远吞副本，等同 L21）
+    - 已发 reminder 数 >= len(reminder_minutes) → 达到上限，吞
+    - 未达上限 + gap >= reminder_minutes[count] → 推（mark_sent）
+    - 未达上限但 gap 不够 → 吞（等下一次 idle prompt 来再判）
+    """
+    sid = (evt.get("session_id") or "").strip()
+    reminder_minutes = fcfg.get("notif_idle_reminder_minutes")
+    if not isinstance(reminder_minutes, (list, tuple)):
+        reminder_minutes = []
+    reminder_minutes = [float(x) for x in reminder_minutes if x is not None]
+    if not reminder_minutes:
+        # 严格 1 次模式（用户配置 [] = 任务完成那次推完后绝不再推）
+        return False, "notif_dup_until_next_task"
+
+    sent = idle_reminder.get_count(sid)
+    if sent >= len(reminder_minutes):
+        return False, f"notif_idle_max_reminders({sent})"
+
+    threshold_min = reminder_minutes[sent]
+    gap_min = (time.time() - last_stop_unix) / 60.0
+    if gap_min < threshold_min:
+        return False, f"notif_idle_dup({gap_min:.1f}min<{threshold_min:.0f}min)"
+
+    new_count = idle_reminder.mark_sent(sid)
+    return True, f"notif_idle_reminder_{new_count}_at_{gap_min:.1f}min"
 
 
 def _has_anchor(text: str) -> bool:
