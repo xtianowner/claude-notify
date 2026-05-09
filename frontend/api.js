@@ -33,6 +33,17 @@ export const api = {
     jsonFetch(`/api/sessions/${encodeURIComponent(sessionId)}/focus-terminal`, {
       method: "POST",
     }),
+  // L14: per-session 静音
+  // minutes: number (分钟) | null（永久）；scope: "all" | "stop_only"
+  muteSession: (sessionId, { minutes = null, scope = "all", label = "" } = {}) =>
+    jsonFetch(`/api/sessions/${encodeURIComponent(sessionId)}/mute`, {
+      method: "POST",
+      body: JSON.stringify({ minutes, scope, label }),
+    }),
+  unmuteSession: (sessionId) =>
+    jsonFetch(`/api/sessions/${encodeURIComponent(sessionId)}/mute`, {
+      method: "DELETE",
+    }),
 };
 
 // WebSocket：自动 5s 重连，回调收到完整 envelope

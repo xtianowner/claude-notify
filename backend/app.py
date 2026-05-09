@@ -91,6 +91,13 @@ async def lifespan(app: FastAPI):
             log.warning("startup archive: %s", stats)
     except Exception:
         log.exception("startup archive failed; continuing without archival")
+    # L14：启动时清理过期 session_mutes（避免长时间静音残留）
+    try:
+        n = cfg_mod.prune_expired_session_mutes()
+        if n:
+            log.info("startup pruned %d expired session_mutes", n)
+    except Exception:
+        log.exception("startup prune session_mutes failed")
     task = asyncio.create_task(liveness_watcher.watch_loop(_on_watcher_event, interval_seconds=interval))
     log.info("claude-notify backend started; data=%s", cfg_mod.DATA_DIR)
     try:
@@ -362,6 +369,77 @@ async def focus_terminal(session_id: str):
         return {"ok": False, "reason": "osascript_not_available"}
     except Exception as e:
         return {"ok": False, "reason": f"exception: {e}"}
+
+
+@app.post("/api/sessions/{session_id}/mute")
+async def mute_session(session_id: str, request: Request):
+    """L14：给单个 session 设临时/永久静音。
+
+    body:
+      minutes: number | null  // 静音多少分钟；null 或缺省 = 永久（直到手动解除）
+      scope:   "all" | "stop_only"  // all 默认；stop_only 只静 Stop/SubagentStop
+      label:   string?         // 备注（可选）
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        raise HTTPException(400, "session_id required")
+    body: dict[str, Any] = {}
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+    except Exception:
+        body = {}
+    minutes = body.get("minutes", None)
+    scope = (body.get("scope") or "all").strip().lower()
+    if scope not in ("all", "stop_only"):
+        scope = "all"
+    label = (body.get("label") or "user-set").strip() or "user-set"
+    until: float | None
+    if minutes is None:
+        until = None
+    else:
+        try:
+            mins = float(minutes)
+        except Exception:
+            raise HTTPException(400, "minutes must be number or null")
+        if mins <= 0:
+            # 等价于解除静音
+            cfg_mod.clear_session_mute(sid)
+            summary = _session_summary(sid)
+            if summary:
+                await hub.broadcast({"type": "session_updated", "session": summary})
+            return {"ok": True, "muted": False, "session_id": sid}
+        import time as _t
+        until = _t.time() + mins * 60
+    entry = cfg_mod.set_session_mute(sid, until=until, scope=scope, label=label)
+    summary = _session_summary(sid)
+    if summary:
+        await hub.broadcast({"type": "session_updated", "session": summary})
+    return {
+        "ok": True,
+        "muted": True,
+        "session_id": sid,
+        "mute": {
+            "until": entry.get("until"),
+            "scope": entry.get("scope"),
+            "muted_at_iso": entry.get("muted_at_iso"),
+            "label": entry.get("label"),
+        },
+    }
+
+
+@app.delete("/api/sessions/{session_id}/mute")
+async def unmute_session(session_id: str):
+    """L14：解除某 session 的静音。"""
+    sid = (session_id or "").strip()
+    if not sid:
+        raise HTTPException(400, "session_id required")
+    cleared = cfg_mod.clear_session_mute(sid)
+    summary = _session_summary(sid)
+    if summary:
+        await hub.broadcast({"type": "session_updated", "session": summary})
+    return {"ok": True, "session_id": sid, "muted": False, "was_muted": cleared}
 
 
 @app.get("/api/config")

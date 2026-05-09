@@ -1084,6 +1084,35 @@ main {
   margin-top: var(--sp-4);
 }
 
+/* L15: quiet_hours 时段行 —— 开始 / 结束 / 时区 三块并排，窄屏自动换行 */
+.qh-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1.4fr;
+  gap: var(--sp-2);
+  margin: var(--sp-2) 0;
+}
+.qh-row label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  font-size: var(--fs-xs);
+  color: var(--c-fg-soft);
+  margin-bottom: 0;
+}
+.qh-row input[type="time"],
+.qh-row input[type="text"] {
+  height: 28px;
+  font: inherit;
+  font-size: var(--fs-sm);
+  padding: 0 var(--sp-2);
+  border: var(--bd-1);
+  border-radius: var(--r-sm);
+}
+@media (max-width: 480px) {
+  .qh-row { grid-template-columns: 1fr 1fr; }
+  .qh-row .qh-tz { grid-column: 1 / -1; }
+}
+
 /* notify policy 行：左右 grid，窄屏 wrap */
 .np-row {
   display: grid;
@@ -1221,4 +1250,92 @@ main {
   .modal-card {
     padding: var(--sp-4);
   }
+}
+
+/* ───────────── L14: per-session 静音 ───────────── */
+.btn-mute {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 2px 6px;
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--c-muted, #888);
+  opacity: 0.55;
+  transition: opacity 0.15s, background 0.15s, border-color 0.15s;
+}
+.btn-mute:hover {
+  opacity: 1;
+  background: rgba(0, 0, 0, 0.04);
+  border-color: rgba(0, 0, 0, 0.06);
+}
+.btn-mute.is-muted {
+  opacity: 1;
+  color: #b15a00;
+  background: rgba(255, 165, 0, 0.10);
+  border-color: rgba(255, 165, 0, 0.25);
+  font-size: 12px;
+  padding: 2px 8px;
+}
+.btn-mute.is-muted:hover {
+  background: rgba(255, 165, 0, 0.18);
+}
+
+/* 静音中卡片整体淡灰 */
+.session-item.muted {
+  opacity: 0.7;
+  filter: grayscale(0.25);
+}
+.session-item.muted:hover {
+  opacity: 0.92;
+}
+.mute-corner-badge {
+  margin-left: auto;
+  font-size: 11px;
+  padding: 1px 6px;
+  background: rgba(255, 165, 0, 0.12);
+  color: #b15a00;
+  border: 1px solid rgba(255, 165, 0, 0.25);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+/* mute 小弹层 */
+.mute-menu {
+  background: var(--c-bg, #fff);
+  border: 1px solid rgba(0, 0, 0, 0.10);
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.12);
+  padding: 4px 0;
+  min-width: 160px;
+  font-size: 13px;
+}
+.mute-menu-title {
+  padding: 6px 12px 4px;
+  font-size: 11px;
+  color: var(--c-muted, #888);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.mute-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  padding: 6px 12px;
+  cursor: pointer;
+  color: var(--c-fg, #222);
+  font-size: 13px;
+}
+.mute-menu-item:hover {
+  background: rgba(0, 0, 0, 0.05);
+}
+.mute-menu-off {
+  color: #b15a00;
+}
+.mute-menu-sep {
+  height: 1px;
+  margin: 4px 0;
+  background: rgba(0, 0, 0, 0.08);
 }

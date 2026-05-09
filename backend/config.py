@@ -76,6 +76,21 @@ DEFAULT_ARCHIVAL = {
     "archive_dir": "data/archive",
 }
 
+DEFAULT_QUIET_HOURS = {
+    # L15 — 夜间不打扰：start-end 时段内吞掉非关键事件，但保留"真等输入 / 疑似 hang"穿透
+    # enabled=False 时整段逻辑短路（与旧版完全等价）
+    # 跨午夜处理：start > end（如 23:00→08:00）时按 "start..24:00 + 00:00..end" 理解
+    # tz 走 zoneinfo（IANA 字符串）；非法或缺失 → 回退本地时区
+    "enabled": False,
+    "start": "23:00",
+    "end": "08:00",
+    "tz": "Asia/Shanghai",
+    # 这些事件类型穿透 quiet_hours（Notification = 真等输入；TimeoutSuspect = 疑挂；都是关键事件）
+    "passthrough_events": ["Notification", "TimeoutSuspect"],
+    # weekdays_only=True 时仅周一~周五生效，周末不静音
+    "weekdays_only": False,
+}
+
 DEFAULT_LIVENESS_PER_STATE_TIMEOUT = {
     # L09 — 按 last_event_kind 分状态设阈值，避免「长 tool 执行」误判 hang
     # enabled=False 时退化为旧逻辑（timeout_minutes 一刀切）
@@ -104,6 +119,16 @@ DEFAULTS: dict[str, Any] = {
     "notify_filter": DEFAULT_NOTIFY_FILTER,
     "muted": False,
     "snooze_until": "",
+    # L14：per-session 静音字典（按 session_id 索引）。dashboard 卡片右上 🔕 按钮维护。
+    # 结构：{ "<sid>": {"until": <unix_ts | None>, "scope": "all" | "stop_only",
+    #                   "muted_at": <unix_ts>, "muted_at_iso": "<...>", "label": "<...>"} }
+    # - until=None 表示永久静音（直到用户手动解除）
+    # - scope=all：拒推该 sid 的所有事件（Stop / Notification / TimeoutSuspect 一律 drop）
+    # - scope=stop_only：只静 Stop / SubagentStop，Notification / TimeoutSuspect 仍推
+    # 过期项由 notify_filter._session_mute_check 命中时清理，进程启动时 prune_expired_session_mutes
+    "session_mutes": {},
+    # L15：全局夜间不打扰
+    "quiet_hours": DEFAULT_QUIET_HOURS,
     "display": {
         "show_first_prompt": True,
         "show_last_assistant": True,
@@ -185,6 +210,89 @@ def save(patch: dict[str, Any]) -> dict[str, Any]:
         tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=2), "utf-8")
         os.replace(tmp, CONFIG_PATH)
         return merged
+
+
+def _write_session_mutes(sm: dict[str, Any]) -> None:
+    """绕过 save 的深合并，对 session_mutes 字段用"整体替换"语义直接写盘。
+
+    必要：因为 save() 对 dict 做深 merge（用于 notify_policy 等部分更新），
+    导致 pop 一个 key 后 merge 会从 disk 把它合回来。session_mutes 需要 set/del 语义。
+    """
+    raw = _read_raw()
+    raw["session_mutes"] = sm
+    raw.pop("events_enabled", None)
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=2), "utf-8")
+    os.replace(tmp, CONFIG_PATH)
+
+
+def set_session_mute(
+    session_id: str,
+    *,
+    until: float | None,
+    scope: str = "all",
+    label: str = "user-set",
+) -> dict[str, Any]:
+    """L14：写一条 per-session 静音记录到 config.session_mutes[sid]。
+
+    - until=None 表示永久（直到用户手动解除）
+    - scope: "all"（默认，全部事件 drop）| "stop_only"（仅 Stop/SubagentStop drop）
+    返回写入的 entry。
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        raise ValueError("session_id required")
+    sc = (scope or "all").strip().lower()
+    if sc not in ("all", "stop_only"):
+        sc = "all"
+    import time as _t
+    from datetime import datetime, timezone, timedelta
+    now = _t.time()
+    sh_tz = timezone(timedelta(hours=8))
+    entry = {
+        "until": (None if until is None else float(until)),
+        "scope": sc,
+        "muted_at": now,
+        "muted_at_iso": datetime.fromtimestamp(now, sh_tz).strftime("%Y-%m-%d %H:%M:%S"),
+        "label": label or "user-set",
+    }
+    with _lock:
+        sm = dict(_read_raw().get("session_mutes") or {})
+        sm[sid] = entry
+        _write_session_mutes(sm)
+    return entry
+
+
+def clear_session_mute(session_id: str) -> bool:
+    """删除 session_mutes[sid]。返回是否实际删除（False=本来就不存在）。"""
+    sid = (session_id or "").strip()
+    if not sid:
+        return False
+    with _lock:
+        sm = dict(_read_raw().get("session_mutes") or {})
+        if sid not in sm:
+            return False
+        sm.pop(sid, None)
+        _write_session_mutes(sm)
+    return True
+
+
+def prune_expired_session_mutes() -> int:
+    """清理已过期 session_mutes 项（until <= now 且 until 非 None）。返回清理数量。"""
+    import time as _t
+    now = _t.time()
+    with _lock:
+        sm = dict(_read_raw().get("session_mutes") or {})
+        expired = [sid for sid, e in sm.items()
+                   if isinstance(e, dict)
+                   and e.get("until") is not None
+                   and float(e.get("until") or 0) <= now]
+        if not expired:
+            return 0
+        for sid in expired:
+            sm.pop(sid, None)
+        _write_session_mutes(sm)
+    return len(expired)
 
 
 def public_view(cfg: dict[str, Any]) -> dict[str, Any]:

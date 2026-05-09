@@ -1,7 +1,7 @@
 <!-- purpose: 设计教训记录 — 删除/否定一个设计前先写一段简要总结，避免后续重复犯错 -->
 
 创建时间: 2026-05-09 16:25:00
-更新时间: 2026-05-09 22:15:00
+更新时间: 2026-05-09 23:05:00
 
 # 设计教训
 
@@ -514,3 +514,108 @@ milestone 来源 = `clean_summary(last_assistant_message)`：先把整段 markdo
 - archive 老于 N 天的文件清理（避免 archive 自己也无限大）
 - dashboard 显示"已归档 X 个事件 / Y 个文件"meta（前端字段已具备查询能力，UI 待加）
 - 周期归档（不只启动）：当前是"启动时一次"，长跑实例需要再加一个 watcher loop 调用，但实测启动时跑过一次后 hot < threshold 概率高，按需再加
+
+---
+
+## L15 — quiet_hours 夜间不打扰：分钟空间判定 + 关键事件穿透白名单（已修）
+
+**修改时间**：2026-05-09
+
+**用户痛点**：晚上 23:00-08:00 用户在睡觉，被 SubagentStop / Stop / Heartbeat 推醒次数多到要把整个推送关掉。但「真等输入」（Notification）和「疑似 hang」（TimeoutSuspect）夜里也要叫醒 —— 这种事件错过损失更大。一刀切 mute 把婴儿和洗澡水一起倒掉。
+
+**替代方案（已实施）**：全局 `quiet_hours` 配置 + 事件类型白名单穿透。
+
+设计 spec：
+- 数据模型挂在 `cfg.quiet_hours`：`{enabled, start, end, tz, passthrough_events, weekdays_only}`
+- 判定层在 `notify_filter.should_notify()`，**位置：session_mute → quiet_hours → 既有 _stop/_notification_decision**（用户 per-session mute 优先于全局 quiet_hours，匹配「显式 > 隐式」）
+- 跨午夜采用「分钟空间」判定：把 (h, m) 映射到 cur=h*60+m、s/e 同理；`s < e` 走同日窗 `[s, e)`，`s > e` 走跨午夜窗 `cur >= s OR cur < e`，`s == e` 视为不静音（fail-safe）
+- tz 用 `zoneinfo.ZoneInfo(IANA)`；解析失败回退本地 `datetime.now()`，绝不抛异常
+- passthrough：默认 `["Notification","TimeoutSuspect"]`；用户可勾 `TestNotify` 测试
+- weekdays_only：用 `datetime.weekday() >= 5` 判周末跳过
+- drop reason 写 `quiet_hours_HH:MM`，dashboard trace modal 一眼能看出「夜里 02:30 被吞」
+- 配置不完整 / start 非法 / end 非法 / start==end → 安全默认**不静音**（避免静默吞事件让用户找不到推送）
+
+**验证**：`scripts/0509-2300-test-quiet-hours.py` 22 case pass：
+- 跨午夜（23:00-08:00）：02:30 / 23:30 / 07:00 在内，08:30 / 14:30 / 22:30 在外
+- 同日窗（午休 13:00-17:00）：14:30 在内，12:30 / 17:30 在外
+- 边界：23:00 入、08:00 出（半开区间 [s, e)）
+- passthrough：Notification / TimeoutSuspect 即使在 quiet 时段也通过
+- weekdays_only：周一静音，周六周日跳过
+- 配置不完整 / start==end → 不静音
+- 端到端 `should_notify(Stop @ 02:30)` → drop, reason=quiet_hours_02:30
+- 端到端实测：POST `/api/event` Stop → silence:12 → 12s 后过滤命中 `quiet_hours_21:17`（**真在 trace 里看到了**）
+
+**核心教训**：
+1. **「真等输入」和「疑似 hang」是不可降级事件** —— 设计 mute / 静音 / quiet_hours 时永远要留穿透白名单。一律 drop 等同于把可观测性整个关掉，用户会失去对 Claude 状态的感知。
+2. **跨午夜判定用「分钟空间」而非 hour 比较** —— `cur >= s OR cur < e` 一行处理跨午夜，比「if start.hour > end.hour 然后 if-else」分支干净一倍，且单元测试只需覆盖 cur 的多个时刻就够。
+3. **fail-safe 默认是「不静音」而非「按 default 静音」** —— 配置缺字段、字段非法、start==end，所有边界都返回 `(False, "")`。原则：**安静失败 > 静音吞事件**，因为用户对「没收到推送」的发现路径比「收到无用推送」长得多（数小时 vs 数秒）。
+4. **L15 reason 字段把当前时分写进去** —— `quiet_hours_02:30` 比 `quiet_hours_active` 信息量多一倍，trace UI 不需要额外字段就能让用户秒懂「哦凌晨被吞了」。
+5. **session_mute 与 quiet_hours 的顺序：显式 > 隐式** —— 用户对单个 session 显式 mute 是「我不要看这个」，quiet_hours 是「夜里别打扰我」。前者更确定 → 顺序在前；过期用户 mute 自动清理后再走 quiet_hours，不会漏判。
+6. **不新增 endpoint，复用 `/api/config`** —— 配置类字段一律走 `POST /api/config`，dashboard 配置 modal 直接读写整体 config 对象。新增 endpoint 会污染 API 表面，且无收益（quiet_hours 不是高频操作，无需独立路由 / 独立鉴权）。
+
+**未来留白（可做但本轮不做）**：
+- 多时段（如 12:30-13:30 午休 + 23:00-08:00 夜间）：当前只支持单时段，需要时把 quiet_hours 改成 list of windows 即可。
+- 假日日历：weekdays_only 仅按 weekday()，没接 PRC 节假日；接入 chinese_calendar 库可解决，但 99% 用户不需要。
+- per-session quiet_hours：当前是全局的；未来若用户想"项目 A 夜里也打扰、项目 B 才静"，需要把 quiet_hours 配置下沉到 session_mutes 旁边。当前设计够用。
+
+
+---
+
+## L14 — per-session 静音（已实施）
+
+**修改时间**：2026-05-09
+
+**用户痛点**：全局 mute（`muted=true` / `snooze_until`）粒度太粗。用户在调试 / 开会 / 专注时只想静音**某一个**会话（"这个 session 太吵了静 30 分钟，其它正常推"），但保留其它推送。
+
+**设计**：在 `config.session_mutes: dict[sid, entry]` 加 per-sid 静音表。
+```json
+"session_mutes": {
+  "<sid>": {
+    "until": 1778335000,    // unix ts；null = 永久
+    "scope": "all",          // "all" | "stop_only"
+    "muted_at": 1778334000,
+    "muted_at_iso": "2026-05-09 21:30:00",
+    "label": "user-set"
+  }
+}
+```
+
+**过滤规则**（在 `notify_filter.should_notify` 最前置，先于 quiet_hours / Stop / Notification 决策）：
+- 命中 session_mutes[sid] 且 (until is None OR now < until)：
+  - scope=all → drop（reason='session_muted_all'）
+  - scope=stop_only → 仅 Stop / SubagentStop drop；Notification / TimeoutSuspect 通过
+- until 已过期 → 视为未静音 + 命中时自动清理 entry
+- app 启动时调 `prune_expired_session_mutes()` 一次清理残留
+
+**API**：
+- `POST /api/sessions/{sid}/mute` body `{minutes: number|null, scope: "all"|"stop_only", label?}`
+  - minutes=null → 永久；minutes<=0 → 等价 unmute
+- `DELETE /api/sessions/{sid}/mute` 解除
+- 静音状态在 `/api/sessions` 每个 session 加 `mute_state: {muted, until, scope, remaining_seconds, muted_at_iso, label}`
+
+**Dashboard**：
+- 卡片右上 🔔 / 🔕 按钮（已静音 → 🔕 + 剩余分钟数）
+- 点击弹小菜单：5min / 30min / 60min / 永久 / 仅 Stop · 30min / 解除（已静音时显示）
+- 静音中卡片整体淡灰（opacity 0.7 + 角标 🔕）
+- 30s 整体重渲染时基于 mute_state.until 实时算剩余分钟（不依赖后端固定 remaining_seconds）
+
+**为什么不复用全局 snooze_until**：
+1. snooze 是全局开关，session 级需求是"互不影响"——必须用按 sid 索引的 dict 结构
+2. snooze_until 是 ISO 字符串（前端传值），session_mutes.until 是 unix ts（后端比较高频，避免每次 parse_iso）
+3. scope=stop_only 是 session 级独有需求（全局 snooze 没有"只静某类事件"的语义）
+
+**为什么 set/clear/prune 绕过 save() 走 _write_session_mutes**：
+- `save(patch)` 用 `_merge` 深合并 dict，对 `notify_policy / display / llm` 这种"部分更新"是对的
+- 但 session_mutes 是 set/del 语义：删一个 key 后 save 会把 disk 上旧 entry 又 merge 回来
+- 所以单独走 `_read_raw + 整体替换 session_mutes 字段 + 写回` 路径
+
+**核心教训**：
+1. **粒度从粗到细要新增字段，别 overload 旧字段**——`muted` (bool) → `snooze_until` (ts) → `session_mutes` (dict)，每一档语义不同。把 session 静音强行塞进 snooze_until 会污染语义（"这是全局还是某 sid 的？"），以及前端老逻辑（snooze badge）会失灵。
+2. **过滤检查的顺序是设计成本最低的扩展点**——`_session_mute_check` 加在 should_notify 最前置，`_quiet_hours_check` 紧跟其后，互不耦合。每加一个静音维度（用户级 / session 级 / 时段级 / 项目级 / ...）都是一个 helper + 一个 cfg key + 在 should_notify 前置插一行，零回归。
+3. **timer-based 过期清理"懒清理 + 启动一次"够用**——不需要后台 task / 调度器。命中过期项时清理（写错忽略不影响过滤），启动时全表扫一次清掉残留。session_mutes 写入频率 << session 数（单 session 一天最多手动几次），lazy strategy 永远不会堆积。
+4. **silence:N 路径要确保过滤前置点也起作用**——Stop 走 silence:12，12s 后 _wait_and_send 内部仍调 should_notify → 触发 mute_check → drop。`scheduled` trace 是中间态（policy 层），`drop session_muted_all` 是最终态（filter 层），两条都写 decision_log，dashboard 能看到完整链路。
+
+**未来留白**：
+- 多 sid 批量静音（"静音所有 idle session"）：当前需循环 N 次 API；接 `POST /api/sessions/mute-batch` 解决
+- 静音时段策略（"工作日 23:00 后自动静音此 sid"）：需把 session_mutes.entry 升级到含 schedule 字段；目前不做
+- 静音模板（"标记此 sid 为日常调试，永远静音 Stop"）：alias.tags 字段可承载，本轮不做

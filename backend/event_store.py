@@ -385,6 +385,47 @@ def _derive_next_action(status: str, waiting_for: str, last_action: str) -> str:
     return ""
 
 
+def _derive_mute_state(cfg: dict[str, Any], sid: str, now: float) -> dict[str, Any]:
+    """L14：计算单 session 的 mute_state，注入 list_sessions 输出。
+
+    返回 { muted: bool, until: ts | None, scope: str, label: str | None,
+           remaining_seconds: int | None, muted_at_iso: str | None }
+    过期项视为 not muted，但不在此处清理（让 notify_filter 走标准清理路径）。
+    """
+    try:
+        sm = (cfg.get("session_mutes") or {})
+        entry = sm.get(sid)
+        if not isinstance(entry, dict):
+            return {"muted": False, "until": None, "scope": "all"}
+        until = entry.get("until")
+        # 过期判定
+        if until is not None:
+            try:
+                if float(until) <= now:
+                    return {"muted": False, "until": None, "scope": "all"}
+            except Exception:
+                return {"muted": False, "until": None, "scope": "all"}
+        scope = (entry.get("scope") or "all").strip().lower()
+        if scope not in ("all", "stop_only"):
+            scope = "all"
+        remaining = None
+        if until is not None:
+            try:
+                remaining = max(0, int(float(until) - now))
+            except Exception:
+                remaining = None
+        return {
+            "muted": True,
+            "until": (None if until is None else float(until)),
+            "scope": scope,
+            "label": entry.get("label") or "",
+            "remaining_seconds": remaining,
+            "muted_at_iso": entry.get("muted_at_iso") or "",
+        }
+    except Exception:
+        return {"muted": False, "until": None, "scope": "all"}
+
+
 def _color_token(session_id: str) -> int:
     if not session_id:
         return 0
@@ -595,6 +636,8 @@ def list_sessions(active_window_minutes: int = 30,
             s["recent_decisions"] = decision_log.recent_for(s["session_id"], limit=5)
         except Exception:
             s["recent_decisions"] = []
+        # L14：注入 per-session mute_state（dashboard 卡片右上 🔕 按钮用）
+        s["mute_state"] = _derive_mute_state(_cfg, s["session_id"], now)
         # 清理累积内部字段
         for k in ("_last_pretool_raw", "_last_notification_msg", "_last_notification_unix",
                   "_last_stop_assistant", "_last_stop_unix",

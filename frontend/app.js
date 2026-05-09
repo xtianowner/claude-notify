@@ -129,10 +129,18 @@ function renderSessions() {
   $sessions.querySelectorAll(".session-item").forEach(el => {
     el.addEventListener("click", (e) => {
       // 内部按钮自己处理
-      if (e.target.closest(".alias-edit, .btn-focus, .push-trace")) return;
+      if (e.target.closest(".alias-edit, .btn-focus, .push-trace, .btn-mute")) return;
       // 阻止冒泡到 document（document 监听 outside-click 关闭抽屉，会与本逻辑冲突）
       e.stopPropagation();
       openDrawer(el.dataset.sid);
+    });
+  });
+  // L14：mute 按钮 → 弹小菜单
+  $sessions.querySelectorAll(".btn-mute").forEach(el => {
+    el.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const sid = el.dataset.sid;
+      if (sid) openMuteMenu(sid, el);
     });
   });
   $sessions.querySelectorAll(".push-trace").forEach(el => {
@@ -252,6 +260,9 @@ function sessionCardHTML(s) {
   const hasTty = !!(s.tty && String(s.tty).trim());
   const focusBtnHtml = `<button class="btn-focus" data-sid="${escapeHtml(sid)}" type="button" ${hasTty ? "" : "disabled"} title="${hasTty ? "在终端中打开（切到对应 tab）" : "该 session 还没记录到 tty（再触发一次 hook 即可）"}" aria-label="打开终端">→ 终端</button>`;
 
+  // L14：per-session 静音按钮
+  const muteBtnHtml = renderMuteButton(s);
+
   const metaLeftBits = [s.cwd_short, s.permission_mode, s.effort_level]
     .filter(Boolean).map(escapeHtml).join(" · ");
   const heartbeatBit = s.last_heartbeat_ts
@@ -265,15 +276,23 @@ function sessionCardHTML(s) {
   // L12：推送决策 trace（最近 5 条），灰字 11px，点击展开 modal 看完整 50 条
   const traceHtml = renderTraceLine(s);
 
+  // L14：muted session 整体淡灰
+  const muted = !!(s.mute_state && s.mute_state.muted);
+  const mutedCls = muted ? " muted" : "";
+  const mutedBadge = muted
+    ? `<span class="mute-corner-badge" title="此会话已静音">${s.mute_state.scope === "stop_only" ? "🔕 仅 Stop" : "🔕"}</span>`
+    : "";
+
   return `
-    <div class="session-item${statusCls}" data-sid="${escapeHtml(sid)}" tabindex="0" role="button" aria-label="${escapeHtml(name)}">
+    <div class="session-item${statusCls}${mutedCls}" data-sid="${escapeHtml(sid)}" tabindex="0" role="button" aria-label="${escapeHtml(name)}">
       <div class="item-head-l">
         ${dotHtml}
         <span class="name" title="${escapeHtml(sid)}">${name}</span>
         <button class="alias-edit" data-sid="${escapeHtml(sid)}" type="button" title="起别名/备注" aria-label="起别名">✎</button>
         <span class="${statusBadgeClass(status)}">${escapeHtml(statusLabel(status))}</span>
+        ${mutedBadge}
       </div>
-      <div class="item-actions">${focusBtnHtml}</div>
+      <div class="item-actions">${muteBtnHtml}${focusBtnHtml}</div>
       ${summaryHtml}
       <div class="item-meta">
         <span class="meta-left" title="${escapeHtml(s.cwd || "")}">${metaLeftBits || "—"}</span>
@@ -282,6 +301,37 @@ function sessionCardHTML(s) {
       ${traceHtml}
     </div>
   `;
+}
+
+// L14：mute 按钮（已静音 → 🔕 + 剩余分钟；未静音 → 灰色 🔔）
+function renderMuteButton(s) {
+  const sid = s.session_id || "";
+  const ms = s.mute_state || {};
+  const muted = !!ms.muted;
+  if (muted) {
+    let label = "🔕";
+    if (ms.until == null) {
+      label += " 永久";
+    } else {
+      // 用 until 实时算剩余（30s 重渲染会刷新）；不依赖后端固定 remaining_seconds
+      const rem = Math.max(0, Math.round((ms.until * 1000 - Date.now()) / 60000));
+      label += ` ${rem}m`;
+    }
+    const scopeLabel = ms.scope === "stop_only" ? "（仅 Stop）" : "";
+    const titleParts = [`已静音${scopeLabel}`];
+    if (ms.until != null) {
+      const d = new Date(ms.until * 1000);
+      if (!Number.isNaN(d.getTime())) {
+        const pad = (n) => String(n).padStart(2, "0");
+        titleParts.push(`至 ${pad(d.getHours())}:${pad(d.getMinutes())}`);
+      }
+    } else {
+      titleParts.push("永久（直到手动解除）");
+    }
+    titleParts.push("点击修改 / 解除");
+    return `<button class="btn-mute is-muted" data-sid="${escapeHtml(sid)}" type="button" title="${escapeHtml(titleParts.join(" · "))}" aria-label="静音设置">${escapeHtml(label)}</button>`;
+  }
+  return `<button class="btn-mute" data-sid="${escapeHtml(sid)}" type="button" title="静音此会话" aria-label="静音此会话">🔔</button>`;
 }
 
 // L12：推送决策 trace 渲染（卡片底部一行灰字）
@@ -589,6 +639,106 @@ async function onFocusTerminal(sessionId) {
   }
 }
 
+// L14：per-session 静音弹小菜单
+let muteMenuEl = null;
+let muteMenuSid = null;
+
+function closeMuteMenu() {
+  if (muteMenuEl && muteMenuEl.parentNode) {
+    muteMenuEl.parentNode.removeChild(muteMenuEl);
+  }
+  muteMenuEl = null;
+  muteMenuSid = null;
+}
+
+function openMuteMenu(sessionId, anchorEl) {
+  // 重复点击同一按钮关菜单；点其它按钮关旧的开新的
+  if (muteMenuEl && muteMenuSid === sessionId) {
+    closeMuteMenu();
+    return;
+  }
+  closeMuteMenu();
+  muteMenuSid = sessionId;
+  const s = state.sessions.find(x => x.session_id === sessionId);
+  const isMuted = !!(s && s.mute_state && s.mute_state.muted);
+
+  const menu = document.createElement("div");
+  menu.className = "mute-menu";
+  menu.setAttribute("role", "menu");
+  // 标题
+  const heading = document.createElement("div");
+  heading.className = "mute-menu-title";
+  heading.textContent = isMuted ? "改静音 / 解除" : "静音此会话";
+  menu.appendChild(heading);
+
+  const items = [
+    { label: "5 分钟",  minutes: 5,    scope: "all" },
+    { label: "30 分钟", minutes: 30,   scope: "all" },
+    { label: "60 分钟", minutes: 60,   scope: "all" },
+    { label: "永久",    minutes: null, scope: "all" },
+    { label: "仅 Stop · 30 分钟", minutes: 30, scope: "stop_only" },
+  ];
+  items.forEach(it => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "mute-menu-item";
+    b.textContent = it.label;
+    b.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      closeMuteMenu();
+      await applyMute(sessionId, it.minutes, it.scope);
+    });
+    menu.appendChild(b);
+  });
+  if (isMuted) {
+    const sep = document.createElement("div");
+    sep.className = "mute-menu-sep";
+    menu.appendChild(sep);
+    const off = document.createElement("button");
+    off.type = "button";
+    off.className = "mute-menu-item mute-menu-off";
+    off.textContent = "解除静音";
+    off.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      closeMuteMenu();
+      await applyUnmute(sessionId);
+    });
+    menu.appendChild(off);
+  }
+
+  // 定位：相对 anchorEl 下方
+  const r = anchorEl.getBoundingClientRect();
+  menu.style.position = "fixed";
+  menu.style.top = `${Math.round(r.bottom + 4)}px`;
+  menu.style.left = `${Math.round(r.left)}px`;
+  menu.style.zIndex = "1000";
+  document.body.appendChild(menu);
+  muteMenuEl = menu;
+}
+
+async function applyMute(sessionId, minutes, scope) {
+  try {
+    await api.muteSession(sessionId, { minutes, scope });
+    const text = (minutes == null)
+      ? "已永久静音"
+      : `已静音 ${minutes} 分钟${scope === "stop_only" ? "（仅 Stop）" : ""}`;
+    showToast(text, "ok");
+    await loadSessions();
+  } catch (e) {
+    showToast(`静音失败：${e.message}`, "err");
+  }
+}
+
+async function applyUnmute(sessionId) {
+  try {
+    await api.unmuteSession(sessionId);
+    showToast("已解除静音", "ok");
+    await loadSessions();
+  } catch (e) {
+    showToast(`解除失败：${e.message}`, "err");
+  }
+}
+
 function onEditAlias(sessionId) {
   const s = state.sessions.find(x => x.session_id === sessionId);
   aliasEditingSid = sessionId;
@@ -737,6 +887,18 @@ function fillConfigForm(cfg) {
     }
   });
 
+  // L15：quiet_hours
+  const qh = cfg.quiet_hours || {};
+  if (f.elements["qh_enabled"]) f.elements["qh_enabled"].checked = !!qh.enabled;
+  if (f.elements["qh_start"]) f.elements["qh_start"].value = qh.start || "23:00";
+  if (f.elements["qh_end"]) f.elements["qh_end"].value = qh.end || "08:00";
+  if (f.elements["qh_tz"]) f.elements["qh_tz"].value = qh.tz || "Asia/Shanghai";
+  const passSet = new Set(Array.isArray(qh.passthrough_events) ? qh.passthrough_events : ["Notification", "TimeoutSuspect"]);
+  if (f.elements["qh_pass_notification"]) f.elements["qh_pass_notification"].checked = passSet.has("Notification");
+  if (f.elements["qh_pass_timeout"]) f.elements["qh_pass_timeout"].checked = passSet.has("TimeoutSuspect");
+  if (f.elements["qh_pass_test"]) f.elements["qh_pass_test"].checked = passSet.has("TestNotify");
+  if (f.elements["qh_weekdays_only"]) f.elements["qh_weekdays_only"].checked = !!qh.weekdays_only;
+
   const disp = cfg.display || {};
   f.elements["display_show_first_prompt"].checked = disp.show_first_prompt !== false;
   f.elements["display_show_last_assistant"].checked = disp.show_last_assistant !== false;
@@ -793,11 +955,27 @@ function readConfigForm() {
   });
   // 保留现有 snooze_until（不在表单里编辑，由免打扰按钮维护）
   const snooze_until = (state.config && state.config.snooze_until) || "";
+
+  // L15：quiet_hours
+  const passthrough_events = [];
+  if (f.elements["qh_pass_notification"] && f.elements["qh_pass_notification"].checked) passthrough_events.push("Notification");
+  if (f.elements["qh_pass_timeout"] && f.elements["qh_pass_timeout"].checked) passthrough_events.push("TimeoutSuspect");
+  if (f.elements["qh_pass_test"] && f.elements["qh_pass_test"].checked) passthrough_events.push("TestNotify");
+  const quiet_hours = {
+    enabled: f.elements["qh_enabled"] ? f.elements["qh_enabled"].checked : false,
+    start: (f.elements["qh_start"] && f.elements["qh_start"].value) || "23:00",
+    end: (f.elements["qh_end"] && f.elements["qh_end"].value) || "08:00",
+    tz: (f.elements["qh_tz"] && f.elements["qh_tz"].value.trim()) || "Asia/Shanghai",
+    passthrough_events,
+    weekdays_only: f.elements["qh_weekdays_only"] ? f.elements["qh_weekdays_only"].checked : false,
+  };
+
   return {
     feishu_webhook: f.elements["feishu_webhook"].value.trim(),
     timeout_minutes: parseInt(f.elements["timeout_minutes"].value, 10) || 5,
     dead_threshold_minutes: parseInt(f.elements["dead_threshold_minutes"].value, 10) || 30,
     notify_policy: np,
+    quiet_hours,
     display: {
       show_first_prompt: f.elements["display_show_first_prompt"].checked,
       show_last_assistant: f.elements["display_show_last_assistant"].checked,
@@ -1163,6 +1341,12 @@ document.addEventListener("click", (e) => {
       closeMoreMenu();
     }
   }
+  // L14：mute 弹层 outside click 关闭
+  if (muteMenuEl) {
+    if (!muteMenuEl.contains(e.target) && !e.target.closest(".btn-mute")) {
+      closeMuteMenu();
+    }
+  }
   // 抽屉打开时点空白关闭：排除抽屉本身、modal、卡片（卡片自己已 stopPropagation 切换 session）
   if (!$drawer.classList.contains("hidden")) {
     const t = e.target;
@@ -1213,6 +1397,7 @@ $drawerMetaBody.addEventListener("click", async (e) => {
 // Esc 关闭抽屉 / 弹窗 / 菜单
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
+  if (muteMenuEl) { closeMuteMenu(); return; }
   if (!$snoozeMenu.classList.contains("hidden")) {
     $snoozeMenu.classList.add("hidden"); return;
   }

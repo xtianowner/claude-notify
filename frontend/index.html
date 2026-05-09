@@ -141,6 +141,40 @@
           会话死亡阈值（分钟）—— transcript 多久没动判 dead
           <input type="number" name="dead_threshold_minutes" min="5" step="5" />
         </label>
+        <fieldset id="qh-fieldset">
+          <legend>免打扰时段（夜间不打扰）</legend>
+          <p class="muted small">
+            指定时段内吞掉 Stop / SubagentStop / Heartbeat 等非关键事件。
+            真等输入（Notification）和疑挂（TimeoutSuspect）默认穿透，仍会推。
+          </p>
+          <label class="row">
+            <input type="checkbox" name="qh_enabled" /> 启用免打扰时段
+          </label>
+          <div class="qh-row">
+            <label class="qh-time">
+              开始
+              <input type="time" name="qh_start" value="23:00" />
+            </label>
+            <label class="qh-time">
+              结束
+              <input type="time" name="qh_end" value="08:00" />
+            </label>
+            <label class="qh-tz">
+              时区
+              <input type="text" name="qh_tz" placeholder="Asia/Shanghai" />
+            </label>
+          </div>
+          <p class="muted small">跨午夜（如 23:00 → 08:00）会自动处理。</p>
+          <fieldset class="qh-pass">
+            <legend>关键事件穿透</legend>
+            <label class="row"><input type="checkbox" name="qh_pass_notification" /> Notification（真等输入）</label>
+            <label class="row"><input type="checkbox" name="qh_pass_timeout" /> TimeoutSuspect（疑似 hang）</label>
+            <label class="row"><input type="checkbox" name="qh_pass_test" /> TestNotify（测试推送）</label>
+          </fieldset>
+          <label class="row">
+            <input type="checkbox" name="qh_weekdays_only" /> 仅工作日（周一~周五）生效
+          </label>
+        </fieldset>
         <fieldset id="np-fieldset">
           <legend>推送策略</legend>
           <!-- 由 JS 动态填充 6 行结构化控件 -->

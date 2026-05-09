@@ -3,13 +3,15 @@
 # modules
 
 创建时间: 2026-05-08 20:29:45
-更新时间: 2026-05-09 22:15:00
+更新时间: 2026-05-09 23:05:00
 
 ## backend.config
 - 输入：磁盘 `data/config.json`，运行时 patch dict
 - 输出：合并后的配置 dict / 脱敏 public 视图
 - 依赖：标准库
 - 复用入口：`from backend import config; config.load() / config.save(patch) / config.public_view(cfg)`
+- L14 per-session 静音：`set_session_mute(sid, until, scope, label)` / `clear_session_mute(sid)` / `prune_expired_session_mutes()`
+  - 内部用 `_write_session_mutes` 绕过 save() 的深合并（dict set/del 语义需要整体替换）
 
 ## backend.event_store
 - 输入：`append_event(evt)` / 磁盘 `data/events.jsonl`（hot）+ `data/archive/*.jsonl.gz`（冷归档，L13）
@@ -74,6 +76,18 @@
 - 配置：`notify_policy: {EventName: "immediate" | "silence:N" | "off"}`
 - 复用入口：`await notify_policy.get_dispatcher().submit(evt)`
 - L12：每个推 / 不推决策点（`policy_off` / `silence-scheduled` / `merged` / `merged_all_filtered`）调 `_trace(...)` 写 `decision_log`
+
+## backend.notify_filter
+- 职责：should_notify 入口，做"哪些事件该推 / 该吞"的纯计算判定（不调 LLM）
+- 调用方：notify_policy.submit / _wait_and_send 在 immediate / silence-then 路径前都调一次
+- 前置过滤链（按顺序，命中即 return False + 写 decision_log）：
+  1. **L14 `_session_mute_check`**：命中 `config.session_mutes[sid]` 且未过期 → drop
+     - scope=all → `session_muted_all`；scope=stop_only → 仅 Stop/SubagentStop 算 `session_muted_stop_only`
+     - 命中过期项时调 `cfg.clear_session_mute(sid)` best-effort 清理
+  2. **L15 `_quiet_hours_check`**：命中全局静音时段 → drop（passthrough 白名单除外）
+  3. 事件类型分发：always_true / always_false / Notification dedupe（L05/L08）/ Stop 复合判别（L11）
+- 配置入口：`notify_filter` 字段 + `session_mutes` 字段 + `quiet_hours` 字段
+- 复用入口：`notify_filter.should_notify(evt, summary, cfg, log_trace=True) -> (ok, reason)`
 
 ## backend.decision_log（v3 新增，L12）
 - 职责：推送决策 trace 落盘，让 dashboard 能看到"为什么这条推了 / 没推"

@@ -13,9 +13,14 @@
 """
 from __future__ import annotations
 import time
+from datetime import datetime
 from typing import Any
 
 from . import decision_log
+
+# L15：quiet_hours 默认放行的事件白名单（即使时段命中也照推）。
+# 用户视角：「真等输入 / 疑挂」是关键事件，再急也得叫醒；其它（Stop / SubagentStop / Heartbeat）夜里吞掉。
+DEFAULT_QUIET_HOURS_PASSTHROUGH = ("Notification", "TimeoutSuspect", "TestNotify")
 
 # v3 spec §4.4 默认黑词表（短纯应答，不构成"任务回合结束"）
 # L11：黑词检测改为「整句严格相等」（norm in blacklist），不再做子串匹配，
@@ -93,6 +98,41 @@ def should_notify(
     """
     ev_type = (evt.get("event") or "").strip()
     sid = evt.get("session_id") or ""
+
+    # L14：per-session 静音 —— 前置于所有其它过滤
+    sm_drop, sm_reason = _session_mute_check(sid, ev_type, cfg or {})
+    if sm_drop:
+        ok, reason = False, sm_reason
+        if log_trace and sid:
+            try:
+                decision_log.append(
+                    session_id=sid,
+                    event_type=ev_type,
+                    decision="drop",
+                    reason=reason,
+                    policy="filter",
+                )
+            except Exception:
+                pass
+        return ok, reason
+
+    # L15：全局 quiet_hours —— 顺序在 session_mute 之后、_stop/_notification 决策之前
+    qh_drop, qh_reason = _quiet_hours_check(ev_type, cfg or {})
+    if qh_drop:
+        ok, reason = False, qh_reason
+        if log_trace and sid:
+            try:
+                decision_log.append(
+                    session_id=sid,
+                    event_type=ev_type,
+                    decision="drop",
+                    reason=reason,
+                    policy="filter",
+                )
+            except Exception:
+                pass
+        return ok, reason
+
     if ev_type in _ALWAYS_TRUE:
         ok, reason = True, f"always_true:{ev_type}"
     elif ev_type in _ALWAYS_FALSE:
@@ -237,6 +277,142 @@ def _stop_decision(
             return True, f"stop_gap_after_notif={gap_min:.1f}min"
 
     return False, "stop_low_signal"
+
+
+# L14：per-session 静音范围，决定 stop_only 时哪些事件该被吞
+_STOP_LIKE_EVENTS = {"Stop", "SubagentStop"}
+
+
+def _session_mute_check(
+    sid: str,
+    ev_type: str,
+    cfg: dict[str, Any],
+) -> tuple[bool, str]:
+    """判定该 session 是否被用户手动静音（前置于 _stop_decision / _notification_decision）。
+
+    返回 (drop, reason)。drop=True → 上层立即 return False 并写 decision_log。
+    drop=False 时 reason 不使用。
+
+    规则：
+    - 命中 session_mutes[sid] 且 (until is None 或 now < until)：
+      - scope=all → 一律 drop（reason='session_muted_all'）
+      - scope=stop_only → 仅 Stop / SubagentStop drop；Notification / TimeoutSuspect 通过
+    - 命中且 until 已过期 → 异步清理（best-effort），返回 not-muted
+    """
+    if not sid:
+        return False, ""
+    sm = (cfg.get("session_mutes") or {})
+    entry = sm.get(sid)
+    if not isinstance(entry, dict):
+        return False, ""
+    until = entry.get("until")
+    if until is not None:
+        try:
+            if float(until) <= time.time():
+                # 过期：best-effort 清理（写错不阻塞过滤）
+                try:
+                    from . import config as _cfg_mod
+                    _cfg_mod.clear_session_mute(sid)
+                except Exception:
+                    pass
+                return False, ""
+        except Exception:
+            return False, ""
+    scope = (entry.get("scope") or "all").strip().lower()
+    if scope == "stop_only":
+        if ev_type in _STOP_LIKE_EVENTS:
+            return True, "session_muted_stop_only"
+        return False, ""
+    # 默认 scope=all
+    return True, "session_muted_all"
+
+
+def _parse_hhmm(s: str) -> tuple[int, int] | None:
+    """解析 'HH:MM' → (hour, minute)。非法返回 None。"""
+    if not s or ":" not in s:
+        return None
+    try:
+        h_str, m_str = s.strip().split(":", 1)
+        h = int(h_str)
+        m = int(m_str)
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return h, m
+    except Exception:
+        return None
+    return None
+
+
+def _now_in_tz(tz_str: str) -> datetime:
+    """按 IANA tz 字符串取当前时间。tz 非法 / zoneinfo 不可用 → 回退本地 datetime.now()。"""
+    if tz_str:
+        try:
+            from zoneinfo import ZoneInfo  # py 3.9+
+            return datetime.now(ZoneInfo(tz_str))
+        except Exception:
+            pass
+    return datetime.now()
+
+
+def _in_quiet_window(now_h: int, now_m: int, start_h: int, start_m: int,
+                     end_h: int, end_m: int) -> bool:
+    """判定 (now_h, now_m) 是否在 [start, end) 时段内。
+
+    跨午夜（start > end）时按 "start..24:00 ∪ 00:00..end" 处理。
+    边界约定：start 时刻视为已进入 quiet；end 时刻视为已离开（半开区间 [start, end)）。
+    start == end → 视为「不静音」（用户配反了，安全 default）。
+    """
+    cur = now_h * 60 + now_m
+    s = start_h * 60 + start_m
+    e = end_h * 60 + end_m
+    if s == e:
+        return False
+    if s < e:
+        # 同日窗口（如 13:00 → 17:00）
+        return s <= cur < e
+    # 跨午夜窗口（如 23:00 → 08:00）
+    return cur >= s or cur < e
+
+
+def _quiet_hours_check(ev_type: str, cfg: dict[str, Any]) -> tuple[bool, str]:
+    """L15：全局夜间不打扰判定。
+
+    返回 (drop, reason)。drop=True → 上层立即 return False 并写 decision_log。
+
+    规则：
+    - enabled=False → 不静音（drop=False）
+    - 当前时间不在 [start, end) 内 → 不静音
+    - weekdays_only=True 且当前是周末 → 不静音
+    - 事件在 passthrough_events 列表内 → 不静音（关键事件穿透）
+    - 否则 → drop=True，reason='quiet_hours_HH:MM'（HH:MM 即当前时分，dashboard 看 trace 秒懂）
+    """
+    qh = cfg.get("quiet_hours") or {}
+    if not qh.get("enabled"):
+        return False, ""
+    start = _parse_hhmm(qh.get("start") or "")
+    end = _parse_hhmm(qh.get("end") or "")
+    if not start or not end:
+        # 配置不完整 → 安全默认：不静音（避免静默吞事件让用户看不到）
+        return False, ""
+
+    tz_str = (qh.get("tz") or "").strip()
+    now = _now_in_tz(tz_str)
+
+    if qh.get("weekdays_only"):
+        # weekday(): Mon=0 .. Sun=6 → 5/6 为周末
+        if now.weekday() >= 5:
+            return False, ""
+
+    if not _in_quiet_window(now.hour, now.minute, start[0], start[1], end[0], end[1]):
+        return False, ""
+
+    # 当前在 quiet 时段内 —— 检查 passthrough
+    passthrough = qh.get("passthrough_events")
+    if not isinstance(passthrough, (list, tuple)):
+        passthrough = list(DEFAULT_QUIET_HOURS_PASSTHROUGH)
+    if ev_type in set(passthrough):
+        return False, ""
+
+    return True, f"quiet_hours_{now.hour:02d}:{now.minute:02d}"
 
 
 def _is_blacklisted(text: str, blacklist: set[str]) -> bool:
