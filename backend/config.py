@@ -205,15 +205,55 @@ def load() -> dict[str, Any]:
         return merged
 
 
+_SENTINEL = object()
+
+
+def _strip_defaults(value: Any, default: Any) -> Any:
+    """递归剪枝：value 与 default 相同的字段/子树返回 _SENTINEL（剪掉）。
+    用于 save() 时只持久化用户真正改动的字段，避免 DEFAULTS 后续变化被 config.json
+    里的"伪保存"旧 default 值锁死（教训 L17）。
+
+    - dict vs dict：逐字段递归；DEFAULTS 没有的字段一律保留（用户新加字段）
+    - 标量 / list：== 比较，相等返回 _SENTINEL，否则保留原值
+    """
+    if isinstance(value, dict) and isinstance(default, dict):
+        out = {}
+        for k, v in value.items():
+            d = default.get(k, _SENTINEL)
+            if d is _SENTINEL:
+                out[k] = v
+                continue
+            stripped = _strip_defaults(v, d)
+            if stripped is not _SENTINEL:
+                out[k] = stripped
+        return out if out else _SENTINEL
+    if value == default:
+        return _SENTINEL
+    return value
+
+
 def save(patch: dict[str, Any]) -> dict[str, Any]:
+    """持久化用户配置 patch 到 config.json，仅保留与 DEFAULTS 不同的字段（教训 L17）。
+
+    - 与 DEFAULTS 完全相等的字段不落盘 → 未来 DEFAULTS 改动老用户自动跟上
+    - 用户主动调成与 default 不同的值 → 序列化保留
+    - patch 显式覆盖前一次保存的字段 → 以本次为准（reverse merge into raw）
+    - 返回值是 full view（DEFAULTS merged）供前端立即渲染
+    """
     with _lock:
-        current = _merge(DEFAULTS, _read_raw())
-        merged = _merge(current, patch)
-        merged.pop("events_enabled", None)
+        existing_raw = _read_raw()
+        merged_raw = _merge(existing_raw, patch)
+        merged_raw.pop("events_enabled", None)
+        full_view = _merge(DEFAULTS, merged_raw)
+        full_view.pop("events_enabled", None)
+        # 反向剪枝：只保留与 DEFAULTS 不同的部分写入文件
+        to_persist = _strip_defaults(merged_raw, DEFAULTS)
+        if to_persist is _SENTINEL or not isinstance(to_persist, dict):
+            to_persist = {}
         tmp = CONFIG_PATH.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=2), "utf-8")
+        tmp.write_text(json.dumps(to_persist, ensure_ascii=False, indent=2), "utf-8")
         os.replace(tmp, CONFIG_PATH)
-        return merged
+        return full_view
 
 
 def _write_session_mutes(sm: dict[str, Any]) -> None:
