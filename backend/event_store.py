@@ -146,30 +146,31 @@ TERMINATING_EVENTS = {"SessionEnd", "SessionDead"}
 # v3：这些事件不改变 status —— 心跳/会话开始/工具前置不应该把 idle 状态翻回 running
 NON_STATUS_EVENTS = {"Heartbeat", "PreToolUse", "SessionStart"}
 
-# L20：dashboard status 派生时跳过 idle prompt Notification 副本。
-# Stop 推过后 60s Claude Code 自动 trigger 的 idle prompt 在用户视角是"同一回合的尾声"，
-# 不应让卡片状态从 idle(回合结束) 跳到 waiting(等输入)，否则用户感觉一次任务"变化两次"。
-# 与 notify_filter._notification_decision 的 dedup 判定保持一致（整句相等 + 距离 Stop < N min）。
+# L20/L21：dashboard status 派生时跳过 idle prompt Notification 副本。
+# L21 升级：「严格 1 次任务 1 次状态变化」—— 只要看到过 Stop（last_stop_unix>0），
+# 后续 idle prompt 一律不更新 last_event，直到 session 又触发新一次 Stop。
+# 与 notify_filter._notification_decision 的 dedup 判定保持一致。
 _IDLE_PROMPT_FILLER_PHRASES = {
     "claude is waiting for your input",
     "claude code needs your attention",
     "press to continue",
     "press enter",
 }
-_IDLE_PROMPT_DEDUP_WINDOW_MIN = 3.0
 
 
 def _is_idle_prompt_dup(evt: dict[str, Any], last_stop_unix: float) -> bool:
-    """事件是否是 Stop 后副本的 idle prompt（不应改变 dashboard 状态）。"""
+    """事件是否是 Stop 后副本的 idle prompt（不应改变 dashboard 状态）。
+
+    L21：last_stop_unix > 0 + msg is filler → 一律视为副本（永久 dedup until next Stop）。
+    每次新 Stop 来时 last_stop_unix 会被刷新到新 ts → 自动开启下一回合的 dedup 窗口。
+    真权限请求带后缀的不命中 filler 整句相等 → False，正常更新 status。
+    """
     if (evt.get("event") or "") != "Notification":
         return False
-    msg = (evt.get("message") or "").strip().lower()
-    if msg not in _IDLE_PROMPT_FILLER_PHRASES:
-        return False  # 真权限请求 / 自定义文本 → 正常算 last_event
     if last_stop_unix <= 0:
-        return False  # 没推过 Stop 视为新提醒，正常更新
-    gap_min = (parse_iso(evt.get("ts", "")) - last_stop_unix) / 60.0
-    return 0 <= gap_min < _IDLE_PROMPT_DEDUP_WINDOW_MIN
+        return False  # 没看到过 Stop → 第一条 idle prompt 视为真等输入，正常更新
+    msg = (evt.get("message") or "").strip().lower()
+    return msg in _IDLE_PROMPT_FILLER_PHRASES
 
 
 def derive_status(last_event: str) -> str:

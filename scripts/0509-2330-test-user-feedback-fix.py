@@ -9,25 +9,36 @@ import time
 from backend.notify_filter import _stop_decision, _notification_decision, DEFAULT_FILTER_CFG
 
 
-def test_notification_within_3min_dropped_idle_prompt():
-    """L18：Stop 后 3min 内的 'waiting for your input' 是 idle 副本，应吞（避免重复打扰）"""
+def test_l21_idle_prompt_dropped_until_next_task():
+    """L21：默认配置 dedup_until_next_stop=True，Stop 推过的 idle prompt 永远吞"""
     cfg = {"notify_filter": dict(DEFAULT_FILTER_CFG)}
-    summary = {"last_stop_pushed_unix": time.time() - 60}  # 60s 前推过 Stop
+    # 60s 前推过 Stop
+    summary = {"last_stop_pushed_unix": time.time() - 60}
     evt = {"event": "Notification", "message": "Claude is waiting for your input"}
     ok, reason = _notification_decision(evt, summary, cfg)
-    assert not ok, f"60s idle prompt 应吞，实际推送 reason={reason}"
-    assert "notif_dup_idle_prompt" in reason
-    print(f"  PASS Stop+60s idle prompt → drop  ({reason})")
+    assert not ok and reason == "notif_dup_until_next_task", f"60s 应吞 reason={reason}"
+    # 30 分钟后（远超旧 3min 阈值）也应吞
+    summary30 = {"last_stop_pushed_unix": time.time() - 1800}
+    ok30, r30 = _notification_decision(evt, summary30, cfg)
+    assert not ok30 and r30 == "notif_dup_until_next_task", f"30min 也应吞 reason={r30}"
+    print(f"  PASS Stop+60s idle → drop ({reason}); Stop+30min idle → drop ({r30})")
 
 
-def test_notification_after_3min_pushes_long_idle():
-    """L18：Stop 后 3min+ 视为用户长时间没动作，再提醒一次"""
-    cfg = {"notify_filter": dict(DEFAULT_FILTER_CFG)}
-    summary = {"last_stop_pushed_unix": time.time() - 200}  # 3.3min 前
+def test_l21_legacy_window_mode_when_disabled():
+    """L21：用户关闭严格模式（dedup_until_next_stop=False）→ 退回 3min 窗口"""
+    cfg_filter = dict(DEFAULT_FILTER_CFG)
+    cfg_filter["notif_dedup_until_next_stop"] = False
+    cfg = {"notify_filter": cfg_filter}
+    # 窗口内吞
+    summary60 = {"last_stop_pushed_unix": time.time() - 60}
     evt = {"event": "Notification", "message": "Claude is waiting for your input"}
-    ok, reason = _notification_decision(evt, summary, cfg)
-    assert ok, f"3min+ 后应推，实际拒推 reason={reason}"
-    print(f"  PASS Stop+200s long-idle → push  ({reason})")
+    ok60, r60 = _notification_decision(evt, summary60, cfg)
+    assert not ok60 and "notif_dup_idle_prompt" in r60
+    # 窗口外推
+    summary200 = {"last_stop_pushed_unix": time.time() - 200}
+    ok200, r200 = _notification_decision(evt, summary200, cfg)
+    assert ok200, f"3min+ 应推 reason={r200}"
+    print(f"  PASS legacy window: 60s→drop({r60}), 200s→push({r200})")
 
 
 def test_real_permission_notification_always_passes():
@@ -42,15 +53,17 @@ def test_real_permission_notification_always_passes():
 
 
 def test_l19_two_idle_prompt_variants_both_dropped():
-    """L19：Claude Code 两种 idle prompt message 都应被吞"""
+    """L19：Claude Code 两种 idle prompt message 都应被吞（L21 改为永久 dedup）"""
     cfg = {"notify_filter": dict(DEFAULT_FILTER_CFG)}
     summary = {"last_stop_pushed_unix": time.time() - 60}
     for msg in ("Claude is waiting for your input", "Claude Code needs your attention"):
         evt = {"event": "Notification", "message": msg}
         ok, reason = _notification_decision(evt, summary, cfg)
         assert not ok, f"{msg!r} 应被吞，实际推送 reason={reason}"
-        assert "notif_dup_idle_prompt" in reason
-    print(f"  PASS L19 两种 idle prompt 均 drop")
+        # L21 默认走 notif_dup_until_next_task；L18/L19 旧名 notif_dup_idle_prompt 仅在
+        # notif_dedup_until_next_stop=False 时出现
+        assert reason == "notif_dup_until_next_task"
+    print(f"  PASS L19 两种 idle prompt 均 drop（L21 严格模式）")
 
 
 def test_short_stop_with_enough_assistant_msg_pushes():
@@ -103,21 +116,21 @@ def test_user_real_scenario_replay():
     ok2, r2 = _stop_decision(evt2, summary2, cfg)
     assert ok2, f"用户测试问题 Stop 应推 reason={r2}"
 
-    # 3. Stop 后 60s, Claude Code 触发 "waiting for your input" Notification
-    #    L18：Stop 已推 = 用户已知，60s idle prompt 是副本，应吞
+    # 3. Stop 后 60s, Claude Code 触发 idle prompt
+    #    L21：永久 dedup until next Stop
     summary3 = {"last_stop_pushed_unix": time.time() - 60}
     evt3 = {"event": "Notification", "message": "Claude is waiting for your input"}
     ok3, r3 = _notification_decision(evt3, summary3, cfg)
-    assert not ok3, f"60s idle prompt 应吞 reason={r3}"
+    assert not ok3, f"idle prompt 应吞 reason={r3}"
 
     print(f"  PASS 用户实测链：Stop1 push({r1}) → Stop2 push({r2}) → idle Notif drop({r3})")
 
 
 def main():
-    print("L16+L18+L19 用户反馈修复验证")
+    print("L16+L18+L19+L21 用户反馈修复验证（含 L21 严格 1 次模式）")
     print("=" * 60)
-    test_notification_within_3min_dropped_idle_prompt()
-    test_notification_after_3min_pushes_long_idle()
+    test_l21_idle_prompt_dropped_until_next_task()
+    test_l21_legacy_window_mode_when_disabled()
     test_real_permission_notification_always_passes()
     test_l19_two_idle_prompt_variants_both_dropped()
     test_short_stop_with_enough_assistant_msg_pushes()

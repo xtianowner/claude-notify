@@ -47,11 +47,12 @@ DEFAULT_NOTIFY_FILTER = {
     #   strict → 都 20，仅推有内容回合
     # 非 normal 时 sensitivity 覆盖 stop_min_*_chars 字段值。
     "stop_sensitivity": "normal",
-    # 跨事件 dedupe（教训 L05/L16/L18）：Stop 推过后 N 分钟内，同 sid 的 Notification
-    # 若 message 命中 filler_phrases 则吞，避免"任务完成"和"等输入"重复打扰用户。
-    # L16 错误地改成 0.5min，是因为当时 stop_low_signal bug 让 Stop 也漏推，误以为
-    # Notification 是用户唯一信号源。L18 修复 stop_low_signal 后恢复 3min：Stop 已推
-    # 等于用户已知，3min 内的 idle prompt 是冗余；3min+ 视为用户长时间没动作再提醒。
+    # 跨事件 dedupe（教训 L05/L16/L18/L21）：
+    # L21 用户选择「严格 1 次任务 1 次推送」：只要 Stop 推过，所有同 sid 后续 idle prompt
+    # Notification 一律吞，直到下一次 Stop 推送（= 下一个新任务完成）才允许再推。
+    # `notif_dedup_until_next_stop=True`（默认）→ 永久 dedup，忽略 suppress_min 时间窗
+    # `notif_dedup_until_next_stop=False` → 退回到时间窗模式，由 suppress_min 控制
+    "notif_dedup_until_next_stop": True,
     "notif_suppress_after_stop_min": 3,
     # L19：Claude Code 实际有 2 种 idle prompt 文本，旧 default 只覆盖了一种导致漏吞。
     # 完整列表（每条 strip+lower 后整句相等才算 filler，避免误吞带后缀的真权限请求）：

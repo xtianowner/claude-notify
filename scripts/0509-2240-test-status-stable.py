@@ -38,12 +38,12 @@ def test_real_permission_request_not_dup():
     print("  PASS 'needs your attention - Bash...' (suffix) → is_idle_dup=False")
 
 
-def test_long_idle_after_3min_not_dup():
-    """3min+ 后视为长时间等待提醒，不算副本"""
+def test_long_idle_still_dup_under_l21():
+    """L21：严格 1 次 —— 长时间 idle 也是同任务副本，仍算 dup（dashboard 不切状态）"""
     last_stop_unix = parse_iso("2026-05-09T22:14:13+08:00")
     evt = make_evt("Notification", "2026-05-09T22:18:30+08:00", "Claude is waiting for your input")
-    assert not _is_idle_prompt_dup(evt, last_stop_unix), "4min+ idle 视为新提醒"
-    print("  PASS Stop+4min idle → is_idle_dup=False（视为新提醒）")
+    assert _is_idle_prompt_dup(evt, last_stop_unix), "L21 永久 dedup until next Stop"
+    print("  PASS Stop+4min idle → is_idle_dup=True（L21 严格模式）")
 
 
 def test_no_prior_stop_not_dup():
@@ -66,7 +66,7 @@ def main():
     test_idle_prompt_after_stop_marked_dup()
     test_second_idle_variant_also_marked_dup()
     test_real_permission_request_not_dup()
-    test_long_idle_after_3min_not_dup()
+    test_long_idle_still_dup_under_l21()
     test_no_prior_stop_not_dup()
     test_non_notification_not_dup()
     print("=" * 60)

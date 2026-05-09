@@ -187,16 +187,19 @@ def _notification_decision(
                       (fcfg.get("notif_filler_phrases") or DEFAULT_FILLER_PHRASES) if p]
 
     last_stop_unix = float(summary.get("last_stop_pushed_unix") or 0)
-    if last_stop_unix > 0 and suppress_min > 0:
-        gap_min = (time.time() - last_stop_unix) / 60.0
-        if gap_min < suppress_min:
-            msg = (evt.get("message") or "").strip().lower()
-            # L19：从子串匹配改为整句相等。否则 Claude Code 真权限请求
-            # "Claude Code needs your attention - Bash needs approval"
-            # 也会因含 "needs your attention" 被误吞。
-            is_filler = (not msg) or msg in filler_phrases
-            if is_filler:
-                return False, f"notif_dup_idle_prompt({gap_min:.1f}min<{suppress_min}min)"
+    dedup_until_next = bool(fcfg.get("notif_dedup_until_next_stop", True))
+    if last_stop_unix > 0:
+        msg = (evt.get("message") or "").strip().lower()
+        # L19：整句相等匹配，避免误吞带后缀的真权限请求
+        is_filler = (not msg) or msg in filler_phrases
+        if is_filler:
+            if dedup_until_next:
+                # L21：严格 1 次 —— 只要 Stop 推过，idle prompt 永远吞，直到下次 Stop 推送
+                return False, "notif_dup_until_next_task"
+            if suppress_min > 0:
+                gap_min = (time.time() - last_stop_unix) / 60.0
+                if gap_min < suppress_min:
+                    return False, f"notif_dup_idle_prompt({gap_min:.1f}min<{suppress_min}min)"
     return True, "notification_kept"
 
 
