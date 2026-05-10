@@ -14,8 +14,14 @@
       <input id="search" type="search" placeholder="搜索别名 / 任务 / cwd / session…" autocomplete="off" />
     </div>
 
-    <!-- 右侧操作组：状态汇总 / 免打扰 / 更多 -->
+    <!-- 右侧操作组：视图切换 / 状态汇总 / 免打扰 / 更多 -->
     <div class="topbar-actions">
+      <!-- 视图模式切换（list / grouped），偏好持久化在 localStorage -->
+      <div id="view-toggle" class="view-toggle" role="tablist" aria-label="视图模式">
+        <button id="view-list" class="view-toggle-btn is-active" type="button" role="tab" aria-selected="true" data-mode="list" title="平坦列表（默认）">列表</button>
+        <button id="view-grouped" class="view-toggle-btn" type="button" role="tab" aria-selected="false" data-mode="grouped" title="按 cwd 项目分组">按项目</button>
+      </div>
+
       <!-- 状态汇总徽（点击展开 chip 行） -->
       <button id="summary-pill" class="summary-pill is-empty" type="button" aria-expanded="false" aria-controls="status-filter">
         <span id="summary-text" class="summary-text">全部 0</span>

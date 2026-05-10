@@ -76,7 +76,13 @@ def assert_format_text_structure(text: str, ev: str = "Stop") -> None:
     """飞书文本基本结构断言：≥ 4 行；含 emoji + status；含分隔线。"""
     lines = text.split("\n")
     assert len(lines) >= 4, f"{ev} 飞书文本应 ≥ 4 行，实际 {len(lines)}: {lines!r}"
-    assert lines[0].startswith("✅") or lines[0].startswith("🤝"), f"L1 应有 emoji，实际 {lines[0]!r}"
+    # L23：L1 可能以 [项目名] 前缀开头（multi-session 区分），emoji 在前缀之后
+    l1_core = lines[0]
+    if l1_core.startswith("["):
+        rb = l1_core.find("] ")
+        if rb >= 0:
+            l1_core = l1_core[rb + 2:]
+    assert l1_core.startswith("✅") or l1_core.startswith("🤝"), f"L1 应有 emoji，实际 {lines[0]!r}"
     assert " · 任务完成" in lines[0] or " · 子 agent 完成" in lines[0], f"L1 应含状态，实际 {lines[0]!r}"
     assert any("─" in ln for ln in lines), f"应含分隔线，实际 {text!r}"
 

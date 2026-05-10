@@ -1,7 +1,7 @@
 <!-- purpose: 设计教训记录 — 删除/否定一个设计前先写一段简要总结，避免后续重复犯错 -->
 
 创建时间: 2026-05-09 16:25:00
-更新时间: 2026-05-09 23:05:00
+更新时间: 2026-05-10 08:41:48
 
 # 设计教训
 
@@ -619,3 +619,143 @@ milestone 来源 = `clean_summary(last_assistant_message)`：先把整段 markdo
 - 多 sid 批量静音（"静音所有 idle session"）：当前需循环 N 次 API；接 `POST /api/sessions/mute-batch` 解决
 - 静音时段策略（"工作日 23:00 后自动静音此 sid"）：需把 session_mutes.entry 升级到含 schedule 字段；目前不做
 - 静音模板（"标记此 sid 为日常调试，永远静音 Stop"）：alias.tags 字段可承载，本轮不做
+
+---
+
+## L25 — Dashboard 按项目（cwd_short）分组视图（已实施）
+
+**修改时间**：2026-05-10
+
+**用户痛点**：同时跑 5+ Claude Code 终端在不同项目下（claude-notify / ragSystem / etl / 临时 tmp 测试），dashboard 平坦列表把所有 session 卡片混在一起。直接结果：
+- "项目 A 现在 2 个 running / 1 个等输入" → 要肉眼数
+- "哪个项目活动最多 / 最久没动" → 没有总览
+- 切到关心的项目要 Ctrl+F 搜 cwd → 多此一举
+
+**设计**：在 topbar 加一个 segmented control（pill toggle，"列表 / 按项目"），选择 grouped 模式后按 `cwd_short` 分桶，每组一个可折叠的 group header。
+
+**布局**：
+```
+▼ 00-Tian-Project/claude-notify   5 · 🟡1 🟢2 ⚪2
+   ├── [现有卡片 a]
+   ├── [现有卡片 b]
+   ...
+
+▶ 00-Tian-Project/ragSystem       1 · 🟢1
+   └── (折叠中，0 卡片可见)
+```
+
+**组渲染要素**：
+- 折叠箭头（▶ collapsed / ▼ expanded）
+- cwd_short（mono font, 中间截断 60 字符内）
+- 总数 `5`（带左右竖线分隔，tabular-nums）
+- 状态汇总 chip（仅显示 count > 0 的状态）：waiting=🟡 / suspect=🟠 / running=🟢 / idle=⚪ / ended=⚫ / dead=🔴
+
+**排序**：组之间 = 组内最紧急 status weight（与卡片排序权重一致），并列按组内最新 last_event_ts 倒序。组内 = 沿用现有平坦排序（不重写 — 与 L23 二级排序联动）。
+
+**持久化**：localStorage 记两个 key：
+- `cn.viewMode`: "list" | "grouped"，默认 list（保持向后兼容 — 老用户刷新后体验不变）
+- `cn.collapsedGroups`: JSON array of cwd_short，per-cwd 折叠态独立记忆
+
+**实现核心**：
+1. `renderSessions()` 不动既有 sort + filter 链路；只在 innerHTML 那一句分支：`viewMode === "grouped" ? renderGroupedHTML(visible) : visible.map(sessionCardHTML)`
+2. 卡片本身的 HTML / 事件绑定 / 抽屉打开等 0 改动 — 卡片仍由 sessionCardHTML 渲染，header 只是包了一层 section。后续 click handler 通过 `$sessions.querySelectorAll(".session-item")` 仍能拿到所有卡片（descendants）。
+3. 组 header 的 click handler 通过独立的 `bindGroupHeaderEvents()` 绑定，它不与卡片 click 冲突（不同 selector），事件 stopPropagation 避免冒泡到 document outside-click。
+
+**为什么不复用 status filter 而非新加 viewMode**：
+1. status filter 和 cwd 分组语义不同 —— 一个是"过滤"、一个是"展示"。多 cwd 用户关心的是"看清各项目分布"（不是要隐藏其它），不能用过滤代替。
+2. localStorage 偏好是"我喜欢哪种视图"，不是"我现在想看什么" —— 跨刷新粘性自然不同。
+
+**为什么默认 list 不默认 grouped**：
+1. 老用户预期不变（避免 surprise change）
+2. 单项目用户用 list 信息密度更高（grouped 多一行 header 浪费）
+3. 5+ 项目用户主动切到 grouped + localStorage 记住，第一次切换后零成本
+
+**核心教训**：
+1. **视图模式扩展点要在 render 层而非 data 层** —— sort 是数据层、filter 是数据层、分组是展示层。把分组写到 sort/filter 里会污染原有逻辑（`if grouped...` 散落各处）；写在 render 入口的一个分支，只额外加一个 helper 文件量级，零回归到原 list view。
+2. **共享原子（卡片）跨视图复用** —— group view 的核心是"外面包一层 group header + body"，不是"重新渲染卡片"。坚持调 `sessionCardHTML` 既保证两种视图卡片视觉一致，又让后续卡片改动（mute / trace / alias）零额外维护。
+3. **localStorage 的 try/catch 包裹 + 默认 fallback 是必须的** —— 私密浏览模式 / 配额满 / iframe sandbox 都会让 localStorage 抛异常。每个 read/write 都要包，并提供"读失败 → 用默认值"的兜底，不能让一个偏好读失败就阻塞 UI 启动。
+4. **状态 emoji 在前端是装饰、在源码是 const map** —— 不要每次组装时硬编码 emoji 字面量，用一个 STATUS_EMOJI map 集中维护。后续状态扩展 / 改图标只改一处。
+
+**未来留白**：
+- 多级分组（先按 cwd 再按 status）：当前一级；如用户反馈 5+ 项目 + 每项目又 5+ session 时会需要
+- 组内排序独立选项："按等待时长 / 按最近活动 / 按 alias"：当前组内沿用全局 sort 一致；够用
+- 拖拽重排序 / 自定义组顺序：复杂度暴涨，且 sort by status weight 对"哪个最紧急"已经够直观，不做
+- 组的批量操作（"展开所有 / 折叠所有 / 静音整组"）：手动逐个折叠在 5-10 项目数量下不是 pain；20+ 项目时再加
+
+---
+
+## L23 — 多 session 飞书堆叠场景：消息列表预览看不出归属（已修）
+
+**修改时间**：2026-05-10
+
+**痛点**：
+用户同时开 5+ 个 Claude Code 终端跑不同项目（claude-notify / ragSystem / etl / ...）。多 session 推送堆积时，飞书消息列表所有头部都长得一样：
+
+```
+✅ hello, 回复收到 · 任务完成
+✅ 修 loader · 任务完成
+🔔 等你确认 · 等你确认
+```
+
+只看预览根本分不清哪条对应哪个项目，必须点开每条才能看 L7 的 `cwd_short`。多 session 越多，定位成本越高。
+
+**为什么 L7 cwd 行不够**：
+飞书 / 钉钉 / Slack 这类消息列表预览**只截取首行**做缩略显示。L7 在第 7 行，永远不会出现在预览里。要让用户从消息列表"扫一眼就识别"，关键信息必须挤进 L1。
+
+**为什么不在 L1 末尾加 cwd**：
+L1 已有 `emoji + focus + status` 三段（视觉权重最高）。在末尾追加项目名会被截断（飞书 PC 端单行约 30 字符）。**前置**才稳定可见——预览总是从头展示。
+
+**实现**：
+`backend/feishu.py:_extract_project_label(evt, summary)` 取首个非空：
+1. `summary.alias` —— 用户显式 dashboard 起的别名（最权威）
+2. `cwd` 末段（path.split('/')[-1]）—— 最贴近"项目仓库名"
+3. `cwd_short` 全文 fallback
+4. 都没有 → 空串，**不**渲染空 `[]`
+
+L1 模板：`[claude-notify] ✅ hello · 任务完成`（项目名加在 emoji 之前，用 `[]` 包裹，与正文视觉切分）。
+
+**核心教训**：
+1. **信息架构要看通讯渠道的"渲染边界"**——飞书消息列表预览只展示首行。L1 是"全局唯一展示位"，L2-L7 是"详情展开位"。多 session 区分是预览级需求，必须挤进 L1，不能放详情。
+2. **加前缀不加后缀**——预览从头截，前置 100% 可见，后置可能被吃掉。
+3. **聚合标识符要分层**：alias > cwd-tail > cwd-short > 空。alias 是用户主动表达的语义（最高优先），cwd-tail 是机器派生的稳定标识（次高），cwd-short 是 fallback。空时不要硬塞占位符（不要出现 `[]` 空括号——那是噪音）。
+
+**未来留白**：
+- 项目级颜色 emoji（`🟦 [claude-notify]`）：飞书消息列表 emoji 比纯文本更显眼，但需要 alias → emoji 的映射表，本轮不做
+- 多事件 combined 卡片要不要每个事件都标项目：当前 combined 只标主事件项目，earlier 列表不区分。多 session combined 场景较稀有（同一 silence 窗口内不同 session 的事件合并很少触发），暂不做。
+
+---
+
+## L24 — dashboard 同 status 内排序"等最久的 vs 最近活动的"语义冲突（已修）
+
+**修改时间**：2026-05-10
+
+**痛点**：
+dashboard 卡片排序原来是 `status_weight 一级 + last_event_ts 倒序二级`。**所有 status 都用同一个二级**——倒序（最近事件往前）。问题：
+
+```
+waiting (等了 12 分钟) ←—— 用户最该看到的
+waiting (刚 30 秒前 push)
+waiting (刚 1 分钟前 push)
+waiting (5 分钟前)
+```
+
+二级是倒序的，所以"刚 push 的"挤掉"等了 12 分钟没人理"的卡片到最下面。用户痛点是"我有个 session 等了很久没人理"，但视觉上反而看到的是"刚刚才 push 的"。
+
+**为什么 running 还是要倒序**：
+running 状态用户关心"刚刚 Claude 干了啥"——最新事件是 fresh signal。运行中的 session 不存在"等最久"的语义。
+
+**实现**：
+`frontend/app.js:renderSessions()` 排序二级 key 按 status 切换：
+- `waiting / suspect / idle` → `last_event_ts` **升序**（老的往前）
+- `running / ended / dead` → `last_event_ts` **降序**（新的往前）
+
+10 行代码改动：定义 `STALE_FIRST = new Set(["waiting","suspect","idle"])`，比较函数末尾按集合判定方向。
+
+**核心教训**：
+1. **"按时间排"在不同 status 下语义不同**——idle/waiting 的时间是"等了多久"（越大越紧急），running 的时间是"最近活跃度"（越大越值得关注）。同一字段、同一比较方向，覆盖不了两种语义。
+2. **二级 key 不要写死方向**——按 status 分支选择升/降序是最低成本的扩展点。后面如果新增"按 token 用量"等三级 key，只需在比较函数末尾追加。
+3. **测试要覆盖混合 status**——单测只测同 status 内的方向不够，必须有"waiting 老 + running 新 + idle 老"混合排序的断言，确保一级权重 dominate 二级方向。
+
+**未来留白**：
+- ended / dead 是否也按"退出时刻倒序"足够：用户对已退出 session 的关注度本就低，目前用 last_event_ts 降序 OK
+- 多 status 内是否要再加"按 alias 字典序"三级 key：当前用户没反馈，暂不做

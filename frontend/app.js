@@ -6,6 +6,34 @@ import {
   colorDot, colorDotValue, displayName, truncate,
 } from "./format.js";
 
+// ───────────── localStorage 偏好 ─────────────
+// L24（Round 6·B）：viewMode + collapsedGroups 持久化在浏览器
+const LS_VIEW_MODE = "cn.viewMode";          // "list" | "grouped"
+const LS_COLLAPSED = "cn.collapsedGroups";   // JSON array of cwd_short
+
+function loadViewMode() {
+  try {
+    const v = localStorage.getItem(LS_VIEW_MODE);
+    return (v === "grouped" || v === "list") ? v : "list";
+  } catch { return "list"; }
+}
+function saveViewMode(v) {
+  try { localStorage.setItem(LS_VIEW_MODE, v); } catch { /* ignore */ }
+}
+function loadCollapsedGroups() {
+  try {
+    const raw = localStorage.getItem(LS_COLLAPSED);
+    if (!raw) return new Set();
+    const arr = JSON.parse(raw);
+    return new Set(Array.isArray(arr) ? arr : []);
+  } catch { return new Set(); }
+}
+function saveCollapsedGroups(set) {
+  try {
+    localStorage.setItem(LS_COLLAPSED, JSON.stringify(Array.from(set)));
+  } catch { /* ignore */ }
+}
+
 // ───────────── 状态 ─────────────
 const state = {
   sessions: [],
@@ -17,6 +45,8 @@ const state = {
     text: "",
     statuses: new Set(["running", "waiting", "suspect", "idle"]),
   },
+  viewMode: loadViewMode(),                   // L24：列表 / 按项目
+  collapsedGroups: loadCollapsedGroups(),     // L24：折叠的 cwd_short 集合
 };
 
 // status 排序权重：值越小越靠前
@@ -107,13 +137,19 @@ function passesFilter(s) {
 }
 
 function renderSessions() {
+  // 排序：一级 = STATUS_WEIGHT；二级 = 同 status 内按"等待时长"或"最近活动"
+  // 二级语义随 status 切换：
+  //   waiting / suspect / idle  → 按 last_event_ts 升序（等最久的往前，定位"等了 10 分钟没人理"）
+  //   running / ended / dead    → 按 last_event_ts 降序（最近活动/最近退出的往前）
+  const STALE_FIRST = new Set(["waiting", "suspect", "idle"]);
   const all = (state.sessions || []).slice().sort((a, b) => {
     const wa = statusWeight(a.status);
     const wb = statusWeight(b.status);
     if (wa !== wb) return wa - wb;
     const ta = new Date(a.last_event_ts || 0).getTime();
     const tb = new Date(b.last_event_ts || 0).getTime();
-    return tb - ta;
+    // 同 status：waiting/suspect/idle 等最久的往前；其它按最新事件往前
+    return STALE_FIRST.has(a.status) ? (ta - tb) : (tb - ta);
   });
   const visible = all.filter(passesFilter);
   if (visible.length === 0) {
@@ -125,7 +161,13 @@ function renderSessions() {
     renderSummaryPill();
     return;
   }
-  $sessions.innerHTML = visible.map(sessionCardHTML).join("");
+  // L24：grouped 视图按 cwd_short 分桶；list 视图保持平坦
+  if (state.viewMode === "grouped") {
+    $sessions.innerHTML = renderGroupedHTML(visible);
+    bindGroupHeaderEvents();
+  } else {
+    $sessions.innerHTML = visible.map(sessionCardHTML).join("");
+  }
   $sessions.querySelectorAll(".session-item").forEach(el => {
     el.addEventListener("click", (e) => {
       // 内部按钮自己处理
@@ -176,6 +218,125 @@ function renderSessions() {
   renderSummaryPill();
   // 若 URL hash 命中，应用高亮
   applyHashHighlight();
+}
+
+// ───────────── L24：按项目（cwd_short）分组视图 ─────────────
+// 状态 → emoji 映射（与 user-guide 一致）
+const STATUS_EMOJI = {
+  waiting: "🟡",
+  suspect: "🟠",
+  running: "🟢",
+  idle:    "⚪",
+  ended:   "⚫",
+  dead:    "🔴",
+};
+// 组的状态优先级 = 组内最紧急 status 的 weight（与 STATUS_WEIGHT 保持一致）
+function groupMinWeight(sessions) {
+  let m = 99;
+  for (const s of sessions) {
+    const w = statusWeight(s.status);
+    if (w < m) m = w;
+  }
+  return m;
+}
+// 长 cwd 中间截断：保留头尾，中间打省略号
+function truncateMid(s, max) {
+  if (!s) return "";
+  if (s.length <= max) return s;
+  const keep = max - 1;          // 1 char for ellipsis
+  const head = Math.ceil(keep * 0.45);
+  const tail = keep - head;
+  return s.slice(0, head) + "…" + s.slice(s.length - tail);
+}
+
+function renderGroupedHTML(visible) {
+  // 按 cwd_short 分桶（空 cwd_short 归 "(未知 cwd)"）
+  const buckets = new Map();
+  for (const s of visible) {
+    const key = (s.cwd_short || "").trim() || "(未知 cwd)";
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(s);
+  }
+  // 组排序：按组内最紧急 status weight；并列 → 按组内最新 last_event_ts 倒序
+  const groups = Array.from(buckets.entries()).map(([cwd, sessions]) => ({
+    cwd,
+    sessions,
+    weight: groupMinWeight(sessions),
+    latestTs: sessions.reduce((acc, s) => {
+      const t = new Date(s.last_event_ts || 0).getTime();
+      return t > acc ? t : acc;
+    }, 0),
+  }));
+  groups.sort((a, b) => {
+    if (a.weight !== b.weight) return a.weight - b.weight;
+    return b.latestTs - a.latestTs;
+  });
+  return groups.map(renderGroupHTML).join("");
+}
+
+function renderGroupHTML(g) {
+  const collapsed = state.collapsedGroups.has(g.cwd);
+  const cwdShown = truncateMid(g.cwd, 60);
+  // 状态计数
+  const counts = { waiting: 0, suspect: 0, running: 0, idle: 0, ended: 0, dead: 0 };
+  for (const s of g.sessions) {
+    if (counts[s.status] !== undefined) counts[s.status] += 1;
+  }
+  const order = ["waiting", "suspect", "running", "idle", "ended", "dead"];
+  const summaryChips = order
+    .filter(k => counts[k] > 0)
+    .map(k => `<span class="summary-chip s-${k}" title="${escapeHtml(statusLabel(k))} ${counts[k]}">${STATUS_EMOJI[k]} ${counts[k]}</span>`)
+    .join("");
+  const total = g.sessions.length;
+  const cwdAttr = escapeHtml(g.cwd);
+  const caret = collapsed ? "▶" : "▼";
+  const cls = `session-group${collapsed ? " is-collapsed" : ""}`;
+
+  // 组内卡片：调用现有 sessionCardHTML（不改卡片本身）
+  const cards = g.sessions.map(sessionCardHTML).join("");
+
+  return `
+    <section class="${cls}" data-cwd="${cwdAttr}">
+      <button class="session-group-header" type="button" data-cwd="${cwdAttr}" aria-expanded="${collapsed ? "false" : "true"}" title="${cwdAttr}">
+        <span class="group-caret" aria-hidden="true">${caret}</span>
+        <span class="group-cwd">${escapeHtml(cwdShown)}</span>
+        <span class="group-count">${total}</span>
+        <span class="session-group-summary">${summaryChips}</span>
+      </button>
+      <div class="session-group-body">${cards}</div>
+    </section>
+  `;
+}
+
+function bindGroupHeaderEvents() {
+  $sessions.querySelectorAll(".session-group-header").forEach(el => {
+    el.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const cwd = el.dataset.cwd;
+      if (cwd != null) toggleGroup(cwd);
+    });
+  });
+}
+
+function toggleGroup(cwd) {
+  if (state.collapsedGroups.has(cwd)) state.collapsedGroups.delete(cwd);
+  else state.collapsedGroups.add(cwd);
+  saveCollapsedGroups(state.collapsedGroups);
+  renderSessions();
+}
+
+function setViewMode(mode) {
+  if (mode !== "list" && mode !== "grouped") return;
+  if (state.viewMode === mode) return;
+  state.viewMode = mode;
+  saveViewMode(mode);
+  // 更新 toggle UI
+  document.querySelectorAll(".view-toggle-btn").forEach(b => {
+    const active = b.dataset.mode === mode;
+    b.classList.toggle("is-active", active);
+    b.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  renderSessions();
 }
 
 function updateDocTitle() {
@@ -1301,6 +1462,15 @@ $snoozeMenu.addEventListener("click", async (e) => {
   await applySnooze(kind);
 });
 
+// L24：视图模式切换（list / grouped）
+document.querySelectorAll(".view-toggle-btn").forEach(btn => {
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const mode = btn.dataset.mode;
+    if (mode) setViewMode(mode);
+  });
+});
+
 // 状态汇总徽：点击展开/折叠 chip 行
 $summaryPill.addEventListener("click", (e) => {
   e.stopPropagation();
@@ -1463,6 +1633,12 @@ setInterval(renderSnoozeBadge, 60 * 1000);
 // 启动
 (async function main() {
   setWsStatus("connecting");
+  // L24：把 toggle UI 同步到 state.viewMode（从 localStorage 加载来的）
+  document.querySelectorAll(".view-toggle-btn").forEach(b => {
+    const active = b.dataset.mode === state.viewMode;
+    b.classList.toggle("is-active", active);
+    b.setAttribute("aria-selected", active ? "true" : "false");
+  });
   await Promise.all([loadSessions(), loadConfig()]);
   // 处理 URL hash #s=<session_id>
   const m = (window.location.hash || "").match(/s=([^&]+)/);

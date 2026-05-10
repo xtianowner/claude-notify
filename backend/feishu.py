@@ -60,6 +60,36 @@ def _shorten_cwd(cwd: str) -> str:
     return ".../" + "/".join(parts[-2:])
 
 
+def _extract_project_label(evt: dict[str, Any], summary: dict[str, Any] | None) -> str:
+    """提取"项目名"用作飞书 L1 行前置标签，便于多 session 场景一眼区分归属。
+
+    优先级（取首个非空）：
+      1. summary.alias —— 用户在 dashboard 显式起的别名（最权威）
+      2. cwd 末段 —— path.split('/')[-1]，最贴近"项目仓库名"
+      3. cwd_short 全文（fallback，如 ~/foo/bar）
+      4. 都没有 → 返回空串（调用方据此决定是否加 [] 包裹）
+
+    长度上限 18 字符（视觉密度），超长以 … 截断。
+    """
+    sm = summary or {}
+    # 1) alias：必须用户显式设置（不是 cwd 派生的 display_name）
+    alias = (sm.get("alias") or "").strip()
+    if alias:
+        return _truncate(alias, 18)
+    # 2) cwd 末段
+    cwd = evt.get("cwd") or sm.get("cwd") or ""
+    if cwd:
+        import os
+        parts = [p for p in cwd.split(os.sep) if p]
+        if parts:
+            return _truncate(parts[-1], 18)
+    # 3) cwd_short fallback
+    cwd_short = (evt.get("cwd_short") or sm.get("cwd_short") or "").strip()
+    if cwd_short:
+        return _truncate(cwd_short, 18)
+    return ""
+
+
 def _format_hms(ts: str) -> str:
     """ISO 8601 → 'HH:MM:SS'（上海时区）；失败返回空串。"""
     try:
@@ -108,11 +138,14 @@ def _format_text(evt: dict[str, Any], summary: dict[str, Any] | None, cfg: dict[
     age_seconds = int(sm.get("age_seconds") or 0)
     age_min = max(1, age_seconds // 60)
 
-    # L1：BLUF —— emoji + focus + 状态
+    # L1：BLUF —— [项目名] emoji + focus + 状态
+    # 项目名前置（在 emoji 之前），便于飞书消息列表预览一眼分清多 session 归属
+    project_label = _extract_project_label(evt, summary)
+    prefix = f"[{project_label}] " if project_label else ""
     if focus:
-        lines = [f"{emoji} {focus} · {status}"]
+        lines = [f"{prefix}{emoji} {focus} · {status}"]
     else:
-        lines = [f"{emoji} {status}"]
+        lines = [f"{prefix}{emoji} {status}"]
 
     # L2 + L3：核心信息 + 下一步（按事件类型）
     if ev == "Notification":
