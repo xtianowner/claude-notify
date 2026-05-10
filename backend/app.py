@@ -465,6 +465,46 @@ async def test_notify():
     return result
 
 
+# Round 9 (L27)：首次接入引导用的健康检查。0 sessions 时前端渲染检查清单卡。
+@app.get("/api/health/setup")
+def health_setup():
+    cfg = cfg_mod.load()
+    settings_path = Path.home() / ".claude" / "settings.json"
+    expected = ["Notification", "Stop", "SubagentStop", "PreToolUse"]
+    detected: list[str] = []
+    settings_exists = settings_path.exists()
+    if settings_exists:
+        try:
+            data = json.loads(settings_path.read_text("utf-8"))
+            hooks_root = (data.get("hooks") or {}) if isinstance(data, dict) else {}
+            for ev in expected:
+                arr = hooks_root.get(ev) or []
+                if not isinstance(arr, list):
+                    continue
+                for matcher in arr:
+                    inner = (matcher or {}).get("hooks") or []
+                    if any("hook-notify.py" in ((h or {}).get("command") or "") for h in inner):
+                        detected.append(ev)
+                        break
+        except Exception:
+            log.exception("health_setup: settings.json parse failed")
+    # 至少 3/4 算装好（用户可能选择性启用）；全无 = 没装
+    hooks_registered = len(detected) >= 3
+    webhook_configured = bool((cfg.get("feishu_webhook") or "").strip())
+    try:
+        sessions = event_store.list_sessions(active_window_minutes=60) or []
+    except Exception:
+        sessions = []
+    return {
+        "hooks_registered": hooks_registered,
+        "hooks_detected": detected,
+        "hooks_expected": expected,
+        "settings_exists": settings_exists,
+        "webhook_configured": webhook_configured,
+        "session_count": len(sessions),
+    }
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()

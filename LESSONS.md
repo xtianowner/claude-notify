@@ -1,7 +1,7 @@
 <!-- purpose: 设计教训记录 — 删除/否定一个设计前先写一段简要总结，避免后续重复犯错 -->
 
 创建时间: 2026-05-09 16:25:00
-更新时间: 2026-05-10 08:51:14
+更新时间: 2026-05-10 10:55:00
 
 # 设计教训
 
@@ -831,3 +831,41 @@ _REMINDER_REASON_RE = re.compile(r"^notif_idle_reminder_(\d+)_at_([\d.]+)min$")
 - reminder 第 3 次之后用户配 `[5, 10, 15]` 时第 3 次也用 🚨：当前 ridx >= 2 都用 🚨。如果用户希望第 3 次更醒目（如 ⛔），改 emoji 表即可，本轮不做。
 - 徽章是否带"距今超时多少"语义（当前是"已等"，待提取的是 timeout_seconds 还差多久）：复杂度暴涨，且既有 TimeoutSuspect 事件已经覆盖临界场景，不做。
 - waiting 状态本身就有 status badge 高亮（粗体 + 黄边 + dot），紧急度徽再叠加是否过载：不过载——状态 badge 是"分类标签"，紧急度徽是"程度数字"，且 waiting 卡片用户看的就是它们，多 1 个 22px 高 pill 不构成视觉负担。
+
+## L27 — 首次接入空状态：用户看不到该做什么（已修）
+
+**修改时间**：2026-05-10
+
+**原设计**：dashboard 在没有 session 时只显示一行灰字 `暂无会话。等待第一个 hook 事件…`。
+
+**为什么不行（PM/用户视角）**：
+1. 用户首次启动 backend、打开 dashboard → 看到这行字，不知道接下来该做什么。
+2. 关键步骤其实有 3 个：① `python3 scripts/install-hooks.py` 把 hook 写进 `~/.claude/settings.json` ② 在配置面板填飞书 webhook ③ 在任意 Claude Code 终端发起一句话触发事件。
+3. 三步都漏了不会有任何反馈——用户最终会以为工具坏了。
+4. 已配置 webhook 但还没装 hook 是最隐蔽的失败模式：用户以为"按钮亮了就是 ok"，但实际事件根本不会到 backend。
+
+**替代方案（已实施）**：首次接入引导卡 + 后端检查 endpoint
+- 后端 `GET /api/health/setup`：
+  - `hooks_registered`：扫 `~/.claude/settings.json`，看 4 个事件 hook 中有 ≥3 个含 `hook-notify.py` 字符串
+  - `webhook_configured`：cfg.feishu_webhook 非空
+  - `session_count`：当前活跃 session 数（避免有 session 时还显示引导卡）
+- 前端 `renderSetupChecklist()`：
+  - 仅在 `state.sessions.length === 0` 且无 filter 时显示
+  - 3 项 ✓/✗ 列表 + 缺啥提示啥（hook 未装提示具体命令；webhook 未配提示按钮 → 直开配置）
+  - "重新检查"按钮调 `loadSetupHealth()` 即时刷新（避免等 60s 定时刷）
+- 配置保存后 invalidate `state.setupHealth = null`，下次空状态出现重新拉
+- P2-4 联动：`$btnConfig.disabled = true` 直到 `loadConfig()` 完成；防"配置加载中…"卡顿感
+- 配置面板 LLM 区块加 1 行 muted 文案：「可选。关闭时走启发式摘要（基于关键词），仍能用」——避免用户误以为"必填"
+
+**核心教训**：
+1. **空状态是新用户的第一面**——空状态不是"暂时无数据"的占位，是首次接入的引导界面。一行灰字 = 0 信息密度，浪费首次成功率最大杠杆。
+2. **检查清单 ≠ 教程**——不要塞长说明，只列 3 项必要步骤 + 每项的"是否完成"信号 + 未完成时具体下一步。用户能扫读、能照做。
+3. **hooks_registered 用阈值而非全等**——用户可能只装了部分 hook（比如不要 PreToolUse 心跳）。`>= 3/4` 的容错比 `== 4` 更现实。
+4. **invalidate 不删除**——`state.setupHealth = null` 让下次空状态重新拉，比"立即调用 loadSetupHealth + 渲染"更省：用户可能保存配置后不会回到空状态（例如 session 立刻进来），那次拉是浪费。
+5. **后端检测优于前端推断**——webhook 是否配好后端有，但 hook 是否装在 `~/.claude/settings.json` 前端无权限读。把检测逻辑放后端 endpoint 是必要的，不是过度工程。
+
+**未来留白**：
+- 探测到 settings.json JSON 解析失败时是否更激烈提示：当前 catch + log + 走 false 分支。**不做**——用户看到 `hook 未注册` + 装 hook 命令已经够引导了，深度诊断属运维。
+- 是否在 dashboard 顶 banner 持续显示"webhook 未配置"警示：**不做**——空状态已覆盖首次场景；非首次（已有 session）但 webhook 删了，更可能是用户主动操作，不应再唠叨。
+- session_count > 0 但 hook 实际丢了（用户误删 settings）：当前不触发引导卡。**不做主动检测**——session_count > 0 就说明事件还在进，相当于功能在工作。
+- "等待第一个 hook 事件"项永远显示 ✗（除非 session_count > 0，那时整个卡都不显示）。这个 UX 上看着像永远第三步未完成，但只要前两步完成 + 用户去触发事件，下一次刷新就整张卡消失，体验上不构成"任务永远做不完"。

@@ -399,6 +399,93 @@ main {
   text-align: center;
 }
 
+/* L27 首次接入引导卡（仅在 0 sessions 且无 filter 时显示） */
+.setup-card {
+  background: var(--c-surface);
+  border: var(--bd-1);
+  border-radius: var(--r-md);
+  padding: var(--sp-5) var(--sp-4);
+  max-width: 640px;
+  margin: var(--sp-5) auto;
+  box-shadow: var(--sh-1);
+}
+.setup-header {
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-medium);
+  color: var(--c-fg);
+  margin-bottom: var(--sp-4);
+}
+.setup-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+.setup-item {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  gap: var(--sp-3);
+  align-items: start;
+  padding: var(--sp-3);
+  border-radius: var(--r-sm);
+  background: var(--c-subtle);
+}
+.setup-item.ok { background: var(--c-ok-soft); }
+.setup-mark {
+  font-size: var(--fs-lg);
+  line-height: 1;
+  text-align: center;
+  font-weight: var(--fw-bold);
+}
+.setup-item.ok .setup-mark { color: var(--c-ok-solid); }
+.setup-item.todo .setup-mark { color: var(--c-waiting-solid); }
+.setup-text { min-width: 0; }
+.setup-title {
+  font-size: var(--fs-md);
+  font-weight: var(--fw-medium);
+  color: var(--c-fg);
+}
+.setup-help {
+  font-size: var(--fs-sm);
+  color: var(--c-fg-soft);
+  margin-top: 2px;
+}
+.setup-help code {
+  background: var(--c-bg);
+  border: var(--bd-hair);
+  border-radius: var(--r-sm);
+  padding: 1px 5px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+}
+.setup-action {
+  align-self: center;
+  background: var(--c-accent);
+  color: white;
+  border: none;
+  border-radius: var(--r-sm);
+  padding: 4px 10px;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.setup-action:hover { filter: brightness(1.05); }
+.setup-action:disabled { opacity: 0.6; cursor: default; }
+.setup-foot {
+  margin-top: var(--sp-4);
+  font-size: var(--fs-xs);
+  color: var(--c-fg-muted);
+  text-align: center;
+}
+.setup-foot code {
+  background: var(--c-subtle);
+  padding: 1px 5px;
+  border-radius: var(--r-sm);
+  font-family: var(--font-mono);
+}
+
 /* ───────── Session Item (list view, rework) ───────── */
 .session-item {
   position: relative;

@@ -47,6 +47,7 @@ const state = {
   },
   viewMode: loadViewMode(),                   // L24：列表 / 按项目
   collapsedGroups: loadCollapsedGroups(),     // L24：折叠的 cwd_short 集合
+  setupHealth: null,                          // L27：仅在 0 sessions 时拉一次，作首次接入引导
 };
 
 // status 排序权重：值越小越靠前
@@ -153,10 +154,18 @@ function renderSessions() {
   });
   const visible = all.filter(passesFilter);
   if (visible.length === 0) {
-    const hint = state.filter.text || state.filter.statuses.size < 6
-      ? `无匹配会话（${all.length} 个被过滤掉）`
-      : "暂无会话。等待第一个 hook 事件…";
-    $sessions.innerHTML = `<p class="empty">${escapeHtml(hint)}</p>`;
+    // 过滤后空 ≠ 真无 session：被过滤的还在 all 里
+    const filteredAway = state.filter.text || state.filter.statuses.size < 6;
+    if (filteredAway) {
+      $sessions.innerHTML = `<p class="empty">${escapeHtml(`无匹配会话（${all.length} 个被过滤掉）`)}</p>`;
+    } else if (all.length === 0) {
+      // L27：真没 session → 渲染首次接入检查清单（health 还没拉就先拉一次）
+      $sessions.innerHTML = renderSetupChecklist();
+      bindSetupChecklistEvents();
+      if (state.setupHealth === null) loadSetupHealth();
+    } else {
+      $sessions.innerHTML = `<p class="empty">${escapeHtml("暂无会话。等待第一个 hook 事件…")}</p>`;
+    }
     updateDocTitle();
     renderSummaryPill();
     return;
@@ -1206,6 +1215,87 @@ function readConfigForm() {
   };
 }
 
+// ───────────── L27 首次接入引导 ─────────────
+// 仅在 0 sessions 时显示。包含 3 项检查：hook 注册 / webhook 配置 / 等待事件。
+function renderSetupChecklist() {
+  const h = state.setupHealth;
+  if (h === null) {
+    return `<p class="empty">检查接入状态中…</p>`;
+  }
+  const hookOk = !!h.hooks_registered;
+  const webhookOk = !!h.webhook_configured;
+  const items = [
+    {
+      ok: hookOk,
+      title: "Hook 已注册到 Claude Code",
+      help: hookOk
+        ? `已检测到 ${(h.hooks_detected || []).length} / ${(h.hooks_expected || []).length} 个事件 hook`
+        : "未检测到 hook。请在终端执行：<code>python3 scripts/install-hooks.py</code>",
+      action: hookOk ? "" : "重新检查",
+      kind: "recheck",
+    },
+    {
+      ok: webhookOk,
+      title: "飞书 webhook 已配置",
+      help: webhookOk
+        ? "已配置（推送将走该 webhook）"
+        : "未配置。点右下方按钮打开配置面板，粘贴飞书机器人 webhook URL",
+      action: webhookOk ? "" : "去配置",
+      kind: "open-config",
+    },
+    {
+      ok: false,
+      title: "等待第一个 hook 事件",
+      help: "切到任何 Claude Code 终端，发一句话或触发任意工具调用，dashboard 会自动出现该 session",
+      action: "",
+      kind: "",
+    },
+  ];
+  const lis = items.map((it, idx) => `
+    <li class="setup-item ${it.ok ? "ok" : "todo"}">
+      <span class="setup-mark" aria-hidden="true">${it.ok ? "✓" : (idx === items.length - 1 ? "…" : "✗")}</span>
+      <div class="setup-text">
+        <div class="setup-title">${escapeHtml(it.title)}</div>
+        <div class="setup-help">${it.help}</div>
+      </div>
+      ${it.action ? `<button class="setup-action" data-action="${escapeHtml(it.kind)}">${escapeHtml(it.action)}</button>` : ""}
+    </li>
+  `).join("");
+  return `
+    <div class="setup-card">
+      <div class="setup-header">首次接入检查</div>
+      <ul class="setup-list">${lis}</ul>
+      <div class="setup-foot">完成上述步骤后，dashboard 会自动显示 session。详细说明见 <code>docs/user-guide.md</code>。</div>
+    </div>
+  `;
+}
+
+function bindSetupChecklistEvents() {
+  $sessions.querySelectorAll(".setup-action").forEach(btn => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const kind = btn.dataset.action;
+      if (kind === "open-config") {
+        openConfigModal();
+      } else if (kind === "recheck") {
+        btn.disabled = true;
+        btn.textContent = "检查中…";
+        await loadSetupHealth();
+      }
+    });
+  });
+}
+
+async function loadSetupHealth() {
+  try {
+    state.setupHealth = await api.getSetupHealth();
+  } catch (e) {
+    state.setupHealth = { hooks_registered: false, webhook_configured: false, session_count: 0 };
+  }
+  // 仅当当前还是空状态时重新渲染（避免把已加载的卡片覆盖）
+  if ((state.sessions || []).length === 0) renderSessions();
+}
+
 // ───────────── 数据加载 ─────────────
 async function loadSessions() {
   try {
@@ -1218,11 +1308,16 @@ async function loadSessions() {
 }
 
 async function loadConfig() {
+  // P2-4：加载期间禁用配置按钮，避免用户极快点开看到"配置加载中…"
+  $btnConfig.disabled = true;
+  $btnConfig.title = "配置加载中…";
   try {
     state.config = await api.getConfig();
   } catch (e) {
     state.config = null;
   }
+  $btnConfig.disabled = state.config == null;
+  $btnConfig.title = state.config ? "" : "配置加载失败，刷新页面重试";
   renderWebhookBadge();
   renderSnoozeBadge();
 }
@@ -1450,6 +1545,7 @@ $configForm.addEventListener("submit", async (e) => {
     const cfg = readConfigForm();
     const saved = await api.saveConfig(cfg);
     state.config = saved || cfg;
+    state.setupHealth = null;  // L27：webhook 可能变了，让首次接入卡下次空状态出现时重新检测
     renderWebhookBadge();
     renderSnoozeBadge();
     $configMsg.textContent = "已保存。";

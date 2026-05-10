@@ -3,9 +3,23 @@
 # claude-notify 用户使用指南
 
 创建时间: 2026-05-09 22:53:31
-更新时间: 2026-05-10 08:51:14
+更新时间: 2026-05-10 10:55:00
 
 claude-notify 监控你本机的 Claude Code 所有 session，把"任务完成 / 等输入 / 疑似挂起"等关键时刻同步到飞书和 dashboard。本文写给使用者，不讲实现细节。
+
+---
+
+## 〇、首次启动 30 秒上手
+
+启动 backend、打开 dashboard 后，如果 dashboard **还没有任何 session**，你会看到一张"首次接入检查"卡片。它会列三件事：
+
+1. **Hook 已注册到 Claude Code** —— 没装就在终端跑：`python3 scripts/install-hooks.py`
+2. **飞书 webhook 已配置** —— 没配就点卡片上的"去配置"按钮，粘贴你的飞书机器人 webhook URL
+3. **等待第一个 hook 事件** —— 切到任意 Claude Code 终端发一句话，dashboard 会自动出现该 session
+
+三步都做完后，卡片自动消失，session 列表开始填充。
+
+> 小贴士：如果你刚装完 hook，但卡片还显示 ✗，点卡片上的"重新检查"按钮即可。
 
 ---
 

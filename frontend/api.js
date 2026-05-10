@@ -24,6 +24,7 @@ export const api = {
   saveConfig: (cfg) =>
     jsonFetch("/api/config", { method: "POST", body: JSON.stringify(cfg) }),
   testNotify: () => jsonFetch("/api/test-notify", { method: "POST" }),
+  getSetupHealth: () => jsonFetch("/api/health/setup"),
   setAlias: (sessionId, alias, note) =>
     jsonFetch(`/api/sessions/${encodeURIComponent(sessionId)}/alias`, {
       method: "POST",
