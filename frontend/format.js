@@ -15,6 +15,21 @@ export function relTime(tsStr) {
   return `${Math.floor(diff / 86400)} 天前`;
 }
 
+// L26（Round 7·A）：紧迫感时长 → 紧凑徽章文本
+//   ≥ 60min → "Xh"  / "Xh Ym"
+//   ≥  1min → "Xmin"
+//   else    → "<1min"
+// 输入：seconds（数字，已等待秒数）
+export function formatAge(seconds) {
+  const s = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (s < 60) return "<1min";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}min`;
+  const h = Math.floor(m / 60);
+  const rem = m % 60;
+  return rem > 0 ? `${h}h ${rem}min` : `${h}h`;
+}
+
 // 上海时间绝对时间（HH:MM 或 MM-DD HH:MM）
 export function absTimeShanghai(tsStr) {
   if (!tsStr) return "";

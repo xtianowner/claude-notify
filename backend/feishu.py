@@ -118,9 +118,33 @@ def _format_text(evt: dict[str, Any], summary: dict[str, Any] | None, cfg: dict[
       task_topic 与 conclusion 重叠时只保留 conclusion。
     其它事件类型（Notification / TimeoutSuspect / SessionDead 等）保持单行核心信息。
     日期由飞书消息列表自带时间戳承担，正文只放 HH:MM:SS。
+
+    L26（Round 7·B）：Notification 事件的 emoji + 状态文本按 reminder_index 差异化：
+      - reminder_index = 1（首次 reminder, 5min 后） → 🔔 还在等你（X 分钟）
+      - reminder_index = 2（第 2 次 reminder, 10min 后） → 🚨 已等 X 分钟
+      - reminder_index 缺失或 0 → 真权限请求 → 🔔 等你确认（保持现状）
+    reminder_index 由 notify_policy 从 should_notify reason（"notif_idle_reminder_N_at_X.Xmin"）解析后注入 evt。
     """
     ev = evt.get("event") or "Event"
     emoji, status = EVENT_META.get(ev, ("📌", ev))
+
+    # L26: Notification 的 reminder 差异化
+    if ev == "Notification":
+        ridx = evt.get("reminder_index")
+        rgap = evt.get("reminder_gap_min")  # 已等多久（float, 分钟），可空
+        try:
+            ridx = int(ridx) if ridx is not None else 0
+        except Exception:
+            ridx = 0
+        if ridx == 1:
+            emoji = "🔔"
+            gap_txt = f"{int(round(float(rgap)))} 分钟" if rgap is not None else "片刻"
+            status = f"还在等你（{gap_txt}）"
+        elif ridx >= 2:
+            emoji = "🚨"
+            gap_txt = f"{int(round(float(rgap)))} 分钟" if rgap is not None else "更久"
+            status = f"已等 {gap_txt}"
+        # ridx == 0 → 保持 EVENT_META 默认（🔔 等你确认）
     sid = evt.get("session_id") or ""
     cwd = evt.get("cwd") or (summary or {}).get("cwd") or ""
     sm = summary or {}

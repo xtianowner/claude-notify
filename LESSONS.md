@@ -1,7 +1,7 @@
 <!-- purpose: 设计教训记录 — 删除/否定一个设计前先写一段简要总结，避免后续重复犯错 -->
 
 创建时间: 2026-05-09 16:25:00
-更新时间: 2026-05-10 08:41:48
+更新时间: 2026-05-10 08:51:14
 
 # 设计教训
 
@@ -759,3 +759,75 @@ running 状态用户关心"刚刚 Claude 干了啥"——最新事件是 fresh s
 **未来留白**：
 - ended / dead 是否也按"退出时刻倒序"足够：用户对已退出 session 的关注度本就低，目前用 last_event_ts 降序 OK
 - 多 status 内是否要再加"按 alias 字典序"三级 key：当前用户没反馈，暂不做
+
+---
+
+## L26 — 紧急度视觉徽 + 飞书 reminder 消息差异化（已实施）
+
+**修改时间**：2026-05-10
+
+**用户痛点**（Round 6 后剩的"最后一公里"）：
+1. dashboard 多张 idle 卡片视觉权重相同——5 张都是"⚪ 回合结束 · 30 分钟前"，看不出哪张"等了 30 秒"哪张"等了 8 分钟"。"距今 X 分钟前"埋在第 3 行 meta，扫读时不进眼。
+2. 飞书 reminder 第 1 次 / 第 2 次内容看起来完全一样：都是 `🔔 hello · 等你确认`。用户从消息列表预览看不出"这是首次提醒还是已经第 N 次了"，无法判断紧迫度，也没法把"已等多久"作为信号决定要不要立刻处理。
+
+**为什么不在 progress_state 里加"X 分钟"**：
+progress_state（"刚完成" / "已歇" / ...）是状态分类，"等了多久"是程度连续值。混在一个字段会丢掉其中一个维度。徽章独立呈现"程度"，不污染既有状态语义。
+
+**为什么不直接放大 status badge**：
+status badge（🟡 等输入 / ⚪ 回合结束）是分类徽，不能因为时长不同就变颜色——会扭曲"状态"本身的视觉编码。用独立的紧急度徽以"⏱ 颜色 + 时长文字"传达"程度"维度，与状态维度正交。
+
+**改动 1：dashboard 紧急度徽章**
+
+`frontend/app.js:urgencyBadge(status, ageSeconds)` + `frontend/styles.css:.urgency-badge`：
+
+| age | idle 档位 | waiting/suspect 档位（升一档） |
+|---|---|---|
+| < 2min | 不显示（避免噪音） | 不显示 |
+| 2-5min | hint 浅黄 | warn 橙色 |
+| 5-15min | warn 橙色 | critical 红色 |
+| ≥ 15min | critical 红色 | critical 红色（饱和） |
+
+仅 idle / waiting / suspect 三档 status 显示。running / ended / dead 不显示——running 时间是"刚活跃"不是"等了多久"，ended/dead 用户已经不关心。
+
+徽章位置：`item-actions` 容器内、🔔 静音按钮左侧。`formatAge(s)` 输出 `<1min` / `Xmin` / `Xh Ym`。
+
+**改动 2：飞书 Notification reminder 模板差异化**
+
+按 reminder_index 分支：
+
+```
+ridx == 0（真权限请求 / notification_kept）  → [proj] 🔔 task · 等你确认       ← 保持现状
+ridx == 1（首次 reminder, 5min 阈值）          → [proj] 🔔 task · 还在等你（5 分钟）
+ridx >= 2（第 2 次及之后, 10min/15min/...）   → [proj] 🚨 task · 已等 10 分钟
+```
+
+emoji 从 🔔 → 🚨 升级是**视觉优先级跳档**——飞书消息列表预览里 🚨 比 🔔 更扎眼，让"第 2 次还没回应"的紧迫感不需要点开就传达到位。
+
+**reminder_index 怎么从 should_notify reason 流到 evt**：
+
+`notify_filter._idle_reminder_decision` 已经返回形如 `"notif_idle_reminder_1_at_5.0min"` 的 reason 字符串（含数字 + gap 分钟数）。
+`notify_policy.submit` 的 Notification 分支在 `should_notify` 返回 ok 后、调 `feishu.send_event` 前，用正则 `_REMINDER_REASON_RE` 解析：
+
+```python
+_REMINDER_REASON_RE = re.compile(r"^notif_idle_reminder_(\d+)_at_([\d.]+)min$")
+```
+
+解析成功 → 把 `reminder_index` 与 `reminder_gap_min` 注入 evt 副本（不改原 evt）。
+`feishu._format_text` 在 ev == "Notification" 时优先读 evt 里这两个字段；缺失/0 → 走原模板。
+
+**为什么用 evt 注入而不是新参数**：
+1. 顺路兼容 `send_events_combined`（合并卡片复用 `_format_text`，不用改第 2 个调用点）
+2. evt dict 是本来就在数据流里的载体，新增字段不破坏 send_event 接口签名
+3. 原 evt 不被修改（dict spread 复制），其它消费者不受影响
+
+**核心教训**：
+1. **状态徽 vs 紧急度徽的维度正交**——分类（什么状态）与程度（多紧迫）是两个独立维度，必须分两个视觉元素表达。把"等了多久"挤进 status badge 颜色会丢掉"状态"的清晰分类。
+2. **决策 reason 字符串本身就是结构化数据源**——`should_notify` 返回的 reason 不只是给 trace 看的字符串，而是带语义的标签。policy 层用正则解析它来驱动下游模板分支，避免改 should_notify 签名加新返回字段，也让 reminder_index 这个语义只在一个地方派生（filter 内部计数 → reason 字符串），其它消费者解析即可。
+3. **emoji 跳档是低成本传达"严重性升级"的手段**——同消息渠道内重复推送的"第 2 次和后续"必须视觉上区别于"首次"，否则用户会盲化。🔔 → 🚨 是 IM 通用语义。颜色 / 字号 / 文本结构都加上，多通道冗余增强识别。
+4. **age_seconds 已是 session.age_seconds 的现成字段**——前端徽章 0 后端改动；30s 自动刷新已存在的 `setInterval(renderSessions, 30 * 1000)` 自然带动徽档位变化，无需独立 timer。
+
+**未来留白**：
+- 紧急度徽是否影响 dashboard 排序：当前不影响（排序只看 status_weight + last_event_ts）。如用户反馈"老 idle 应该比新 idle 排前"，那是 L24 同 status 二级排序的扩展，不属于徽章本身职能。
+- reminder 第 3 次之后用户配 `[5, 10, 15]` 时第 3 次也用 🚨：当前 ridx >= 2 都用 🚨。如果用户希望第 3 次更醒目（如 ⛔），改 emoji 表即可，本轮不做。
+- 徽章是否带"距今超时多少"语义（当前是"已等"，待提取的是 timeout_seconds 还差多久）：复杂度暴涨，且既有 TimeoutSuspect 事件已经覆盖临界场景，不做。
+- waiting 状态本身就有 status badge 高亮（粗体 + 黄边 + dot），紧急度徽再叠加是否过载：不过载——状态 badge 是"分类标签"，紧急度徽是"程度数字"，且 waiting 卡片用户看的就是它们，多 1 个 22px 高 pill 不构成视觉负担。

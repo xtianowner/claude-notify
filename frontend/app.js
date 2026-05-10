@@ -3,7 +3,7 @@ import { api, connectWS } from "./api.js";
 import {
   relTime, absTimeShanghai, fullTimeShanghai,
   statusBadgeClass, statusLabel, eventBadgeClass,
-  colorDot, colorDotValue, displayName, truncate,
+  colorDot, colorDotValue, displayName, truncate, formatAge,
 } from "./format.js";
 
 // ───────────── localStorage 偏好 ─────────────
@@ -346,6 +346,42 @@ function updateDocTitle() {
   document.title = n > 0 ? `(${n}) claude-notify` : "claude-notify";
 }
 
+// L26（Round 7·A）：紧急度徽章。多 session 场景下让"等了多久"在视觉上立刻可读。
+// 阈值（age in minutes）：
+//   < 2min        → 不显示（避免噪音；正常回合刚结束的"喘息时间"）
+//   2  ~ 5min     → hint    （浅黄）
+//   5  ~ 15min    → warn    （橙色）
+//   ≥ 15min       → critical（红色）
+// status=waiting/suspect 在同一时长档上"再加深一档"——因为它们比 idle 更紧迫
+// （waiting 已经卡在权限请求 / suspect 已经超过 timeout）。
+// 仅 idle/waiting/suspect 三种 status 显示；其它（running/ended/dead）无意义。
+function urgencyBadge(status, ageSeconds) {
+  if (!["idle", "waiting", "suspect"].includes(status)) return "";
+  const sec = Math.max(0, Math.floor(Number(ageSeconds) || 0));
+  if (sec < 120) return "";  // < 2min 不显示
+
+  // 基础档位
+  let level;
+  if (sec < 300)        level = 0; // 2-5min: hint
+  else if (sec < 900)   level = 1; // 5-15min: warn
+  else                  level = 2; // ≥ 15min: critical
+
+  // waiting / suspect 升一档（饱和到 critical 不再升）
+  if (status === "waiting" || status === "suspect") {
+    level = Math.min(2, level + 1);
+  }
+
+  const cls = level === 0 ? "urgency-hint"
+            : level === 1 ? "urgency-warn"
+            : "urgency-critical";
+  const text = formatAge(sec);
+  const titleStatus = status === "waiting" ? "等输入"
+                    : status === "suspect" ? "疑挂起"
+                    : "回合结束";
+  const title = `${titleStatus} 已 ${text}（${sec} 秒前最近事件）`;
+  return `<span class="urgency-badge ${cls}" title="${escapeHtml(title)}">⏱ ${escapeHtml(text)}</span>`;
+}
+
 function sessionCardHTML(s) {
   // List view（v4 rework）：每行一个 session
   //   行 1：[●] [名字] [✎ hover 出现] [状态徽] ………………… [→ 终端]
@@ -424,6 +460,9 @@ function sessionCardHTML(s) {
   // L14：per-session 静音按钮
   const muteBtnHtml = renderMuteButton(s);
 
+  // L26（Round 7·A）：紧急度徽章（仅 idle/waiting/suspect 且 age ≥ 2min）
+  const urgencyHtml = urgencyBadge(status, s.age_seconds);
+
   const metaLeftBits = [s.cwd_short, s.permission_mode, s.effort_level]
     .filter(Boolean).map(escapeHtml).join(" · ");
   const heartbeatBit = s.last_heartbeat_ts
@@ -453,7 +492,7 @@ function sessionCardHTML(s) {
         <span class="${statusBadgeClass(status)}">${escapeHtml(statusLabel(status))}</span>
         ${mutedBadge}
       </div>
-      <div class="item-actions">${muteBtnHtml}${focusBtnHtml}</div>
+      <div class="item-actions">${urgencyHtml}${muteBtnHtml}${focusBtnHtml}</div>
       ${summaryHtml}
       <div class="item-meta">
         <span class="meta-left" title="${escapeHtml(s.cwd || "")}">${metaLeftBits || "—"}</span>

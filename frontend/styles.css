@@ -1502,3 +1502,40 @@ main {
   margin: 4px 0;
   background: rgba(0, 0, 0, 0.08);
 }
+
+/* ───────────── L26 (Round 7·A): 紧急度徽章 ───────────── */
+/* 思路：放在 item-actions 区，与静音按钮同行；视觉权重比 status-badge 弱
+   （状态徽是分类，紧急度是程度），但比 mute 强（直接传达"该看了"）。 */
+.urgency-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  border: 1px solid transparent;
+  user-select: none;
+}
+/* 浅黄：温和提醒（2-5min idle / 0-2min waiting+1 升不到这） */
+.urgency-badge.urgency-hint {
+  background: rgba(255, 196, 0, 0.10);
+  color: #8a6800;
+  border-color: rgba(255, 196, 0, 0.28);
+}
+/* 橙色：明显警告（5-15min idle / 2-5min waiting） */
+.urgency-badge.urgency-warn {
+  background: rgba(255, 130, 0, 0.14);
+  color: #a04500;
+  border-color: rgba(255, 130, 0, 0.35);
+}
+/* 红色：critical（≥15min idle / ≥5min waiting / ≥5min suspect） */
+.urgency-badge.urgency-critical {
+  background: rgba(220, 50, 50, 0.14);
+  color: #a01515;
+  border-color: rgba(220, 50, 50, 0.40);
+  font-weight: 700;
+}

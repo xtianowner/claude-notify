@@ -17,10 +17,27 @@
 from __future__ import annotations
 import asyncio
 import logging
+import re
 import time
 from typing import Any
 
 from . import config as cfg_mod, decision_log, feishu, notify_filter
+
+# L26（Round 7·B）：从 notify_filter 返回的 push reason 里解析 reminder_index 与 gap。
+# 形如 "notif_idle_reminder_1_at_5.0min" → (1, 5.0)；非 reminder 模式 → (0, None)。
+_REMINDER_REASON_RE = re.compile(r"^notif_idle_reminder_(\d+)_at_([\d.]+)min$")
+
+
+def _parse_reminder_reason(reason: str) -> tuple[int, float | None]:
+    if not reason:
+        return 0, None
+    m = _REMINDER_REASON_RE.match(reason.strip())
+    if not m:
+        return 0, None
+    try:
+        return int(m.group(1)), float(m.group(2))
+    except Exception:
+        return 0, None
 
 log = logging.getLogger("claude-notify.notify")
 
@@ -72,6 +89,11 @@ class NotifyDispatcher:
             ok, reason = notify_filter.should_notify(evt, summary, cfg)
             if not ok:
                 return {"ok": False, "reason": f"filtered:{reason}"}
+            # L26（Round 7·B）：从 reason 解析 reminder_index → 让 feishu 模板差异化
+            # 第 1 次："还在等你（5min）"；第 2 次："已等 10min"；真权限请求保持现状。
+            ridx, rgap = _parse_reminder_reason(reason)
+            if ridx > 0:
+                evt = {**evt, "reminder_index": ridx, "reminder_gap_min": rgap}
             return await feishu.send_event(evt)
 
         if policy == "immediate":
