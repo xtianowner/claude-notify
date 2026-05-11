@@ -5,6 +5,7 @@ import {
   statusBadgeClass, statusLabel, eventBadgeClass,
   colorDot, colorDotValue, displayName, truncate, formatAge,
 } from "./format.js";
+import { initNotes, onNotesEvent as onNotesWS } from "./notes.js";
 
 // ───────────── localStorage 偏好 ─────────────
 // L24（Round 6·B）：viewMode + collapsedGroups 持久化在浏览器
@@ -1435,6 +1436,7 @@ function onHashChange() {
 // ───────────── WS ─────────────
 function onWsEnvelope(env) {
   if (!env || typeof env !== "object") return;
+  if (env.type === "notes_updated") { onNotesWS(env); return; }
   if (env.type === "event") {
     const evt = env.event;
     const summary = env.session;
@@ -1781,5 +1783,7 @@ setInterval(renderSnoozeBadge, 60 * 1000);
     openDrawer(decodeURIComponent(m[1]));
     applyHashHighlight();
   }
+  // Round 10：记事本（独立模块，不阻塞 sessions 渲染）
+  initNotes({ api, toast: showToast });
   connectWS({ onEvent: onWsEnvelope, onStatus: setWsStatus });
 })();

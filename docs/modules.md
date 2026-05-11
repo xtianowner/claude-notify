@@ -3,7 +3,7 @@
 # modules
 
 创建时间: 2026-05-08 20:29:45
-更新时间: 2026-05-09 23:05:00
+更新时间: 2026-05-11 10:30:00
 
 ## backend.config
 - 输入：磁盘 `data/config.json`，运行时 patch dict
@@ -104,9 +104,32 @@
 - 依赖：backend.config（DATA_DIR）+ 标准库 fcntl
 - 落盘开销：每条记录 ~120 字节；50 sessions × 50 条 = 25 KB 上限
 
+## backend.notes（v10 新增，L28/L29/L31）
+- 职责：全局单 markdown 笔记的持久化 + 大小校验 + 跨进程/跨线程并发安全
+- 文件位置：`data/notes.md`（不存在则惰性创建，单文件 LFS-friendly，git 可直接追踪）
+- 输入：
+  - `read() -> {content: str, size: int, updated_at: float}`
+  - `write(content: str, source: str = "api") -> {size, updated_at}`，超过 `MAX_SIZE_BYTES` 抛 `NotesOversizeError`
+- 输出：
+  - REST `GET /api/notes` → `{content, size, updated_at}`
+  - REST `PUT /api/notes` body `{content: str}`（≤ 256KB，超限返回 413）
+  - WS broadcast `{type: "notes_updated", source, size, updated_at}`（写入成功后由 app 层广播）
+- 大小上限：`MAX_SIZE_BYTES = 256 * 1024`（约 6 万字 markdown）
+- 并发：`fcntl.flock(LOCK_EX)`（跨进程）+ `threading.RLock`（同进程多请求）双锁；写采用 `O_WRONLY | O_CREAT | O_TRUNC` 整体覆盖；last-write-wins，无 version 字段（L31）
+- 错误：
+  - `NotesOversizeError`：超限抛出，app 层 catch 后返回 413 `{detail: "notes exceeds 256KB"}`
+  - I/O 异常：app 层返回 500，前端状态行显示错误，本地编辑不丢
+- 依赖：标准库 fcntl + threading + os.path + 模块顶 `NOTES_PATH` 解析自 `backend.config.DATA_DIR`
+- 复用入口：
+  - `from backend.notes import read, write, NOTES_PATH, MAX_SIZE_BYTES, NotesOversizeError`
+- 前端配套模块：`frontend/notes.js`
+  - 导出 `initNotes()` / `setCollapsed(bool)` / `onNotesEvent(payload)`（接收 WS notes_updated）
+  - 800ms debounce autosave，textarea 未聚焦+未 dirty 时接收 WS 静默同步，聚焦/dirty 时静默忽略 WS（L31 接收侧自保护）
+  - 折叠态用 localStorage（`notes.collapsed`）持久化，正文不进 localStorage（L28 内容 vs UI 偏好分层）
+
 ## backend.app
 - 入口：`python -m backend.app`（uvicorn 127.0.0.1:8787）
-- 路由：见 `docs/plan/0508-2029-design.md §3.2`
+- 路由：见 `docs/plan/0508-2029-design.md §3.2`；v10 新增 `GET /api/notes` / `PUT /api/notes`，PUT 成功后 `await ws_hub.broadcast({"type": "notes_updated", ...})`
 - 依赖：fastapi + uvicorn + 上述 4 个模块
 
 ## scripts.hook-notify

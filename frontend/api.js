@@ -45,6 +45,13 @@ export const api = {
     jsonFetch(`/api/sessions/${encodeURIComponent(sessionId)}/mute`, {
       method: "DELETE",
     }),
+  // Round 10: 记事本（单文件 markdown，SSOT 在后端）
+  getNotes: () => jsonFetch("/api/notes"),
+  putNotes: (content) =>
+    jsonFetch("/api/notes", {
+      method: "PUT",
+      body: JSON.stringify({ content }),
+    }),
 };
 
 // WebSocket：自动 5s 重连，回调收到完整 envelope

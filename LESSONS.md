@@ -1,7 +1,7 @@
 <!-- purpose: 设计教训记录 — 删除/否定一个设计前先写一段简要总结，避免后续重复犯错 -->
 
 创建时间: 2026-05-09 16:25:00
-更新时间: 2026-05-10 10:55:00
+更新时间: 2026-05-11 10:30:00
 
 # 设计教训
 
@@ -869,3 +869,108 @@ _REMINDER_REASON_RE = re.compile(r"^notif_idle_reminder_(\d+)_at_([\d.]+)min$")
 - 是否在 dashboard 顶 banner 持续显示"webhook 未配置"警示：**不做**——空状态已覆盖首次场景；非首次（已有 session）但 webhook 删了，更可能是用户主动操作，不应再唠叨。
 - session_count > 0 但 hook 实际丢了（用户误删 settings）：当前不触发引导卡。**不做主动检测**——session_count > 0 就说明事件还在进，相当于功能在工作。
 - "等待第一个 hook 事件"项永远显示 ✗（除非 session_count > 0，那时整个卡都不显示）。这个 UX 上看着像永远第三步未完成，但只要前两步完成 + 用户去触发事件，下一次刷新就整张卡消失，体验上不构成"任务永远做不完"。
+
+## L28 — notes 用后端单 markdown 文件而非 localStorage（已修）
+
+**修改时间**：2026-05-11
+
+**否定方案**：notes 正文存浏览器 localStorage（按 sid 或全局 key 都试过设想），后端不参与持久化。
+
+**为什么不行**：
+1. **换浏览器丢**——用户在 MBP Chrome 写的 notes，切到 Safari / 切到台式机 / 切到 incognito 全部没有，跟「跨 session 沉淀」的诉求直接冲突。
+2. **多窗口/隐身不同步**——同浏览器开两个 dashboard 标签，localStorage 写入不会跨标签实时通知（要听 `storage` 事件，且 incognito 完全隔离）；用户在 A 标签写完切到 B 标签看到旧数据，会以为"丢了"。
+3. **无法外部编辑**——markdown 文件天然适合 vim / Obsidian / VS Code 直接打开编辑，localStorage 串只能 devtools 里搬。
+4. **备份目录与 config/events 分裂**——`data/` 目录下已经统一存 `config.json` / `events.jsonl` / `aliases.json` 等，git 追踪 / rsync 备份一份就够；localStorage 要求用户额外导出，体验割裂。
+
+**替代方案（已实施）**：后端单 markdown 文件 `data/notes.md` + 2 个 REST endpoint + WS 广播。
+- `backend/notes.py`（119 行）：`read()` / `write(content, source)` / `NotesOversizeError`，fcntl.flock + threading.RLock 双锁
+- `backend/app.py` 新增 `GET /api/notes` / `PUT /api/notes`，写入成功后 `await ws_hub.broadcast({"type": "notes_updated", "source", "size", "updated_at"})`
+- 前端 `frontend/notes.js`（170 行）：textarea + 800ms debounce autosave + 状态行 + 折叠按钮 + 接收 WS 同步
+
+**保留的部分**：localStorage 仍承担「UI 偏好」语义——折叠态 / 滚动位置 / 未保存的 crash 草稿。这些是"显示侧瞬时状态"，不是"内容"，丢了不痛。
+
+**核心教训**：
+1. **持久化层选型按"内容 vs UI"分离**——内容（笔记正文 / 配置 / 事件）放后端文件；UI 偏好（折叠态 / 排序 / 滚动）放 localStorage。语义错位是大多数前端持久化 bug 的源头。
+2. **markdown 文件单文件优于数据库**——本工具的 notes 是单用户单条全局笔记，加 SQLite / 拆多文件都是过度工程；外部可直接编辑是 markdown 文件相对结构化存储的最大优势。
+
+---
+
+## L29 — 不做"每个 session 一份 note"（已确认）
+
+**修改时间**：2026-05-11
+
+**否定方案**：notes 按 session_id 分文件存 `data/notes/<sid>.md`，每张 session 卡有独立笔记区。
+
+**为什么不行**：
+1. **session 生命周期短**——一个 Claude Code session 通常 30 分钟到几小时就结束，但用户的笔记需求是「跨 session 沉淀」（待办、思路、调试线索、长期 TODO）；按 session 分文件会让笔记跟着 session 死。
+2. **大量空文件**——backend 在跑几天就有几百个 session id，每个都建一个 .md 文件大半是空；扫描 + 备份 + 列表都吃成本。
+3. **诉求错位**——用户原话是"主控板"，要的是全局视角；按 session 分笔记 = 又一个"按上下文找笔记"的检索负担，跟"主控板能一眼看到所有要紧事"反。
+4. **跨 session 链接成本**——想从 session A 的笔记跳到 session B 的笔记，要建跨文件链接 / 索引，单文件下只是滚动几行。
+
+**替代方案（已实施）**：全局单 markdown 笔记。
+
+**保留的部分**：后续 round 加的"卡片 📝 加引用"按钮（task #82）= **轻量反向链**——点 session 卡片的 📝 按钮，把该 session 的 `first_user_prompt` / `last_assistant_message` / cwd_short 摘要追加（append）到全局笔记末尾，作为「我当时是从这个 session 想到这点的」上下文。这保留了"按 session 触发笔记记录"的便捷，但落地到全局笔记里，不分裂。
+
+**核心教训**：
+1. **存储粒度按"读出频率"决定**——读多写少的全局视图，用单文件；读少写多的局部细节，可以拆。notes 是典型读多写少（用户每天看 N 次，但不会高频改动），单文件最优。
+2. **"按上下文分组"在工具内常常是反直觉的**——用户的工作记忆本来就是全局的，把工具强行按其内部结构（session_id）切片，加重了用户的认知负担。
+
+---
+
+## L30 — dashboard 不用三列固定 grid 布局（已确认）
+
+**修改时间**：2026-05-11
+
+**否定方案**：左 sessions（grid）+ 中 session drawer（详情）+ 右 notes 三列固定网格布局。
+
+**为什么不行**：
+1. **drawer 是瞬时态**——drawer 只在用户点开某 session 时出现、点关闭就消失。给一个"用户多数时间看不到"的元素留出永久列空间 = 大量空白。
+2. **13" 屏幕崩**——13" MBP 视口 1440×900；Chrome chrome 自身约 60px → 实际可用 ~1380。三列若各占 360/520/360，加 gap + padding 后 60-100px 留白也撑不下；开 devtools 横向再砍 ~400px 直接溢出。
+3. **drawer 现有的 overlay + box-shadow 是"detail-on-demand"模式**——改 column 意味着 drawer 不再悬浮、所有 overlay 动效（淡入淡出 / shadow scrim / ESC 关闭）都要重写为列宽变化或 slide-in；R6 的卡片排序 / R9 的引导卡 / R7 的紧急度徽都要重新对齐三列空间。
+
+**替代方案（已实施）**：sessions + notes 两列布局 + drawer 维持 overlay。
+- `.workspace` 用 `grid-template-columns: 1fr 360px`，gap 16px
+- drawer 维持 `position: fixed` + 右侧滑入 + `box-shadow` scrim，与新加的 notes panel 在不同 z-index 层
+- 中段断点 960-1199px：右列收窄到 300px；< 960px：notes 折叠到 sessions 下方（移动端 / drawer 80vw）
+
+**保留的部分**：sessions 列响应式可伸（1fr），notes 列固定（360px / 300px / 折叠）。"主内容自适应、次要内容固定"是 dashboard 布局通用模式。
+
+**核心教训**：
+1. **瞬时元素不占永久网格槽**——drawer / modal / toast 这类"按需出现"的元素，永远走 overlay 层；给它们留固定列空间 = 浪费 + 视觉空洞。
+2. **响应式约束从最窄屏开始算**——13" MBP 是国内开发常见配置；如果 1380px 撑不下三列，那 1440px 标称的"宽屏"也只是边缘可用，必然要在断点处妥协，不如开始就两列。
+3. **既有动效是布局决策的硬约束**——R6/R7/R9 的细节都基于"drawer 是 overlay"的前提；任何"改成 column"的方案隐式承担"重写 N 个既有交互"的成本，必须显式权衡。
+
+---
+
+## L31 — 单用户场景下 last-write-wins 可接受，不引入 version + conflict banner（已确认）
+
+**修改时间**：2026-05-11
+
+**否定方案**：进程内 version 计数器 + 前端 PUT 携带 base_version + 后端 if-match 不上则返回 409 + 前端 conflict banner UI（"远程有更新，重新加载？" / "保留本地" / "合并"）。
+
+**为什么不行**：
+1. **单用户多窗口编辑频率极低**——本工具是个人本机的 dashboard，能同时编辑同一份 notes 的场景只有"同一台机器开两个浏览器标签"或"两台机器都连同一个 backend"，且要"几乎同时键入"。日常占比 < 1%。
+2. **6 处协调成本**——version 锁要前端 baseVersion 状态 + dirty flag + 接收 WS 时判断是否 reload 还是 banner + 提交时携带 base_version + 后端 in-memory counter + 409 分支 + banner 三选项 UI。每处都是潜在 bug 点。
+3. **用户已明确"直接静默覆盖"**——R10 决策里用户原话是"直接覆盖，不要弹框"，工具应该尊重用户偏好而不是替用户决定"你不知道这会丢数据"。
+4. **冲突 UI 本身是打扰**——textarea 正在敲字时弹 banner 抢焦点是糟糕的 UX；如果 banner 不抢焦点，用户也大概率忽略，等于白做。
+
+**替代方案（已实施）**：last-write-wins + 前端接收侧自保护。
+- 后端写入是简单 `O_WRONLY | O_TRUNC`，无 version 字段；返回 `{size, updated_at}` 只是给前端展示用，不是 lock token
+- 前端收到 WS `notes_updated` 时：
+  - 如果 textarea **未聚焦** + **未 dirty** → 静默拉新内容覆盖（"对方写完了我同步显示"）
+  - 如果 textarea **聚焦中** 或 **有 dirty** → 静默忽略 WS（"我在敲字，不打扰我"），等下一次 autosave 自然覆盖远程
+
+**保留的部分**：
+- WS 广播 `source` 字段（区分"是不是我自己发的"，避免回环）
+- 状态行的"已保存 · X KB · HH:MM"显示，给用户可见反馈，间接帮助 catch 异常情况
+- 256KB 上限 + 413 错误体面降级（PUT 失败时本地内容不丢，状态行显示错误）
+
+**核心教训**：
+1. **冲突解决的成本要按"实际触发频率 × 触发后用户损失"算**——单用户工具的实际多窗口编辑碰撞概率 < 1%，且即使碰撞最多丢几秒键入；与之相对的实施成本是 6 个组件协调 + UI 闪烁。ROI 明显负。
+2. **"接收侧自保护"≠"冲突解决"**——前者只要"我在敲字时别覆盖我"就够了，是单方面的；后者要"两边都满意"，是双向协商。本场景只需要前者。
+3. **静默策略好过弹框策略**——文字编辑场景最贵的是"焦点 + 上下文"，任何抢焦点的 banner 都不该出现；用 toast / 状态行 muted 字提示足以。
+4. **version 是数据库语义不是文件语义**——markdown 文件本身没有 version 概念，强加 in-memory counter 会有"backend 重启 version 归零 / 前端 baseVersion 失效 → 误判冲突"的边角 bug。如果未来真的要做版本，应该走 git（文件天然支持），而不是自建 counter。
+
+**未来留白**：
+- 真出现多用户场景时再回头补乐观锁——届时 backend 不再是 single-process，需要的不只是 version 还有 etag / locking server，跟当前架构差距大，不预先抽象。
+- 是否给状态行加"远程刚被改过"的灰字提示（用户在 dirty 时收到 WS 时）：**留白**，先看真实使用反馈是否需要。

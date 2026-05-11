@@ -56,6 +56,10 @@
   /* Border */
   --bd-1: 1px solid var(--c-border);
   --bd-hair: 1px solid var(--c-hairline);
+
+  /* Notes panel widths (T4 接入用，本轮预留) */
+  --notes-width-md: 300px;
+  --notes-width-lg: 360px;
 }
 
 /* ───────── Base ───────── */
@@ -222,6 +226,9 @@ select:disabled {
   outline: none;
   box-shadow: 0 0 0 2px var(--c-focus-ring);
 }
+/* 文本/icon 切换：默认显示文字，中段断点切 icon */
+.view-toggle-btn .vt-text { display: inline; }
+.view-toggle-btn .vt-icon { display: none; font-size: var(--fs-md); line-height: 1; }
 
 /* 状态汇总徽 */
 .summary-pill {
@@ -505,6 +512,9 @@ main {
   box-shadow: var(--sh-1);
   cursor: pointer;
   transition: border-color 120ms ease-out;
+  /* container query：让卡片按"自身可用宽"决定布局，而非视口宽。
+     原因：notes-panel 接入后视口同样宽但卡片实际宽差 ~400px。 */
+  container-type: inline-size;
 }
 .session-item:hover {
   border-color: var(--c-fg-muted);
@@ -1458,19 +1468,9 @@ main {
   .sessions-list {
     max-width: 100%;
   }
-  .session-item {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-areas:
-      "head"
-      "summary"
-      "actions"
-      "meta";
-  }
-  .item-actions {
-    justify-content: flex-end;
-  }
+  /* .session-item 单列布局移到 @container query 内（按卡片自身宽决定，不按视口） */
   .item-head-l .alias-edit {
-    /* 移动端 hover 不可用，常驻可见 */
+    /* 移动端 hover 不可用，常驻可见（在 container query 内也强制一次保险） */
     opacity: 1;
   }
   .item-summary { -webkit-line-clamp: 3; }
@@ -1625,4 +1625,254 @@ main {
   color: #a01515;
   border-color: rgba(220, 50, 50, 0.40);
   font-weight: 700;
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   0511 Phase 2 响应式补强：中段断点 / container query / workspace grid
+   决策见 docs/ui/0511-1018-phase2-responsive-decisions.md
+   ════════════════════════════════════════════════════════════════════ */
+
+/* ───────── Workspace grid（含 notes-panel 时拆双栏，否则单列） ───────── */
+.workspace {
+  display: block;
+  width: 100%;
+}
+.workspace:has(.notes-panel) {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--sp-4);
+  max-width: 1100px;
+  margin: 0 auto;
+}
+@media (min-width: 960px) {
+  .workspace:has(.notes-panel) {
+    grid-template-columns: minmax(0, 1fr) var(--notes-width-md);
+  }
+  /* 让 sessions-list 在含 notes 的双栏下不再强制 max-width: 1100px 居中，
+     由 .workspace 控制总宽，sessions-list 占左栏全宽 */
+  .workspace:has(.notes-panel) .sessions-list {
+    max-width: none;
+    margin: 0;
+  }
+}
+@media (min-width: 1200px) {
+  .workspace:has(.notes-panel) {
+    grid-template-columns: minmax(0, 1fr) var(--notes-width-lg);
+  }
+}
+
+/* ───────── Container query：session-item 内部布局（按卡片自身宽） ─────────
+   宽度 ≤ 540 时切单列：head / summary / actions / meta / trace 全部独占一行。 */
+@container (max-width: 540px) {
+  .session-item {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "head"
+      "summary"
+      "actions"
+      "meta"
+      "trace";
+  }
+  .session-item .item-actions {
+    justify-content: flex-end;
+  }
+  .session-item .item-head-l .alias-edit {
+    opacity: 1;
+  }
+}
+
+/* ───────── 中段 720–959：topbar 紧凑化 + modal 中段过渡 ───────── */
+@media (min-width: 720px) and (max-width: 959px) {
+  /* view-toggle 切 icon-only，节省 ~ 60px */
+  .view-toggle-btn .vt-text { display: none; }
+  .view-toggle-btn .vt-icon { display: inline; }
+  .view-toggle-btn { padding: 0 var(--sp-2); }
+  /* topbar search 上限收紧，让出空间给右侧 action 组 */
+  .topbar-search { max-width: 320px; }
+  /* topbar 容器 gap 收紧 */
+  .topbar { gap: var(--sp-2); padding: 0 var(--sp-3); }
+  /* sessions-list 维持 100% 宽（即 main 的 padding 内宽） */
+  .sessions-list { max-width: 100%; }
+}
+
+/* ───────── 中段 481–800：modal 自适应 + np-row 维持两列 ───────── */
+@media (min-width: 481px) and (max-width: 800px) {
+  .modal-card {
+    width: min(calc(100vw - 32px), 520px);
+    max-width: calc(100vw - 32px);
+    padding: var(--sp-4);
+  }
+  /* np-row 在 720–800 段继续走两列（既有 720 块只覆盖 ≤ 720，本段补充 721–800） */
+  .np-row {
+    grid-template-columns: 1fr 1fr;
+    grid-template-areas:
+      "name name"
+      "mode sec";
+    row-gap: var(--sp-1);
+  }
+  .np-row .np-name { grid-area: name; }
+  .np-row select  { grid-area: mode; }
+  .np-row input[type="number"] { grid-area: sec; }
+  .np-row .np-unit { display: none; }
+}
+
+/* ───────── 721–960：drawer 限宽 80vw，避免占主区一半多 ─────────
+   覆盖既有 .drawer { width: 480px } 固定值。≤ 720 段已写 width:100%，本段从 721 起接管。 */
+@media (min-width: 721px) and (max-width: 960px) {
+  .drawer {
+    width: min(80vw, 480px);
+  }
+}
+
+/* ───────── ≥ 1200：modal 略大，sessions-list 维持 1100 max-width ───────── */
+@media (min-width: 1200px) {
+  .modal-card {
+    width: 520px;
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   0511 Round 10：记事本面板（notes-panel）
+   决策见 docs/ui/0511-1025-phase2-notes-decisions.md
+   设计：Data-Dense Dashboard 风格 + 复用既有 design tokens
+   ════════════════════════════════════════════════════════════════════ */
+
+.notes-panel {
+  display: flex;
+  flex-direction: column;
+  background: var(--c-surface);
+  border: var(--bd-1);
+  border-radius: var(--r-md);
+  overflow: hidden;
+  align-self: start;
+  min-height: 360px;
+}
+
+.notes-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 40px;
+  padding: 0 var(--sp-3);
+  border-bottom: var(--bd-hair);
+  background: var(--c-surface);
+}
+
+.notes-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  height: 28px;
+  padding: 0 var(--sp-2);
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-sm);
+  color: var(--c-fg);
+  cursor: pointer;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  line-height: 1;
+}
+.notes-toggle:hover {
+  background: var(--c-subtle);
+}
+.notes-toggle:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--c-focus-ring);
+}
+.notes-toggle .caret {
+  display: inline-block;
+  font-size: var(--fs-xs);
+  color: var(--c-fg-muted);
+  transition: transform 120ms ease;
+  transform: rotate(0deg);
+}
+.notes-panel.is-collapsed .notes-toggle .caret {
+  transform: rotate(-90deg);
+}
+.notes-toggle .notes-title {
+  letter-spacing: 0.01em;
+}
+
+.notes-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+  color: var(--c-fg-muted);
+}
+.notes-meta .sep {
+  display: inline-block;
+  padding: 0 var(--sp-1);
+  color: var(--c-hairline);
+}
+#notes-save-state {
+  color: var(--c-fg-muted);
+  transition: color 120ms ease;
+}
+#notes-save-state.is-saving { color: var(--c-waiting-solid); }
+#notes-save-state.is-error  { color: var(--c-suspect-solid); }
+#notes-save-state.is-saved  { color: var(--c-fg-muted); }
+
+.notes-body {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+#notes-textarea {
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 320px;
+  margin: 0;
+  padding: var(--sp-3);
+  border: 0;
+  outline: none;
+  resize: none;
+  background: transparent;
+  color: var(--c-fg);
+  font-family: var(--font-mono);
+  font-size: var(--fs-md);
+  line-height: var(--lh-base);
+  tab-size: 2;
+}
+#notes-textarea::placeholder {
+  color: var(--c-fg-muted);
+}
+#notes-textarea:focus-visible {
+  outline: none;
+}
+
+/* 折叠态：只剩 head bar，body 隐藏 */
+.notes-panel.is-collapsed {
+  min-height: 0;
+}
+.notes-panel.is-collapsed .notes-body {
+  display: none;
+}
+.notes-panel.is-collapsed .notes-head {
+  border-bottom: 0;
+}
+
+/* 窄屏：notes 堆叠到 sessions 下方，留出一点上间距 + 缩小最低高度 */
+@media (max-width: 720px) {
+  .notes-panel {
+    margin-top: var(--sp-4);
+    min-height: 200px;
+  }
+  #notes-textarea {
+    min-height: 200px;
+  }
+}
+
+/* reduce-motion：caret 不旋转动画（既有 @media 块里集中处理过其它，
+   这里独立加一条保证 notes 子件也守约） */
+@media (prefers-reduced-motion: reduce) {
+  .notes-toggle .caret {
+    transition: none;
+  }
+  #notes-save-state {
+    transition: none;
+  }
 }

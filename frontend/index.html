@@ -18,8 +18,8 @@
     <div class="topbar-actions">
       <!-- 视图模式切换（list / grouped），偏好持久化在 localStorage -->
       <div id="view-toggle" class="view-toggle" role="tablist" aria-label="视图模式">
-        <button id="view-list" class="view-toggle-btn is-active" type="button" role="tab" aria-selected="true" data-mode="list" title="平坦列表（默认）">列表</button>
-        <button id="view-grouped" class="view-toggle-btn" type="button" role="tab" aria-selected="false" data-mode="grouped" title="按 cwd 项目分组">按项目</button>
+        <button id="view-list" class="view-toggle-btn is-active" type="button" role="tab" aria-selected="true" data-mode="list" title="平坦列表（默认）"><span class="vt-text">列表</span><span class="vt-icon" aria-hidden="true">≡</span></button>
+        <button id="view-grouped" class="view-toggle-btn" type="button" role="tab" aria-selected="false" data-mode="grouped" title="按 cwd 项目分组"><span class="vt-text">按项目</span><span class="vt-icon" aria-hidden="true">▤</span></button>
       </div>
 
       <!-- 状态汇总徽（点击展开 chip 行） -->
@@ -73,9 +73,27 @@
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
   <main>
-    <section id="sessions" class="sessions-list">
-      <p class="empty">加载中…</p>
-    </section>
+    <div class="workspace">
+      <section id="sessions" class="sessions-list">
+        <p class="empty">加载中…</p>
+      </section>
+      <aside id="notes-panel" class="notes-panel" aria-label="记事本">
+        <div class="notes-head">
+          <button id="notes-toggle" class="notes-toggle" type="button" aria-expanded="true">
+            <span class="caret" aria-hidden="true">▾</span>
+            <span class="notes-title">记事本</span>
+          </button>
+          <span class="notes-meta muted small">
+            <span id="notes-save-state">已保存</span>
+            <span class="sep" aria-hidden="true">·</span>
+            <span id="notes-size">0 B</span>
+          </span>
+        </div>
+        <div class="notes-body">
+          <textarea id="notes-textarea" spellcheck="false" placeholder="随手记一些想法、调试线索、TODO… 800ms 后自动保存"></textarea>
+        </div>
+      </aside>
+    </div>
   </main>
 
   <!-- 抽屉：session 详情 + 事件流 -->

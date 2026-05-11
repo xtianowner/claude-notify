@@ -11,7 +11,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg_mod
-from . import aliases, decision_log, enrichments, event_store, feishu, liveness_watcher, notify_policy
+from . import aliases, decision_log, enrichments, event_store, feishu, liveness_watcher, notes, notify_policy
 from . import llm as llm_mod
 from . import transcript_reader
 
@@ -457,6 +457,59 @@ async def update_config(request: Request):
         patch["feishu_webhook"] = patch["feishu_webhook"].strip()
     saved = cfg_mod.save(patch)
     return cfg_mod.public_view(saved)
+
+
+@app.get("/api/notes")
+def get_notes():
+    """读 data/notes.md 全量。文件不存在 → 空字符串，不抛。"""
+    try:
+        content, size, updated_at = notes.read()
+        return {"content": content, "size": size, "updated_at": updated_at}
+    except Exception:
+        log.exception("notes.read failed")
+        return JSONResponse({"error": "internal"}, status_code=500)
+
+
+@app.put("/api/notes")
+async def put_notes(request: Request):
+    """全量覆盖写 data/notes.md。
+
+    错误码：
+      400  body 非 dict / content 非 str
+      413  超过 256 KB
+      500  其它内部错
+    成功后向所有 WS 客户端广播 {type: "notes_updated", source: "put", size, updated_at}。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body_must_be_object"}, status_code=400)
+    content = body.get("content")
+    if not isinstance(content, str):
+        return JSONResponse({"error": "content_must_be_string"}, status_code=400)
+    try:
+        size, updated_at = notes.write(content)
+    except notes.NotesOversizeError:
+        return JSONResponse(
+            {"error": "oversize", "max": notes.MAX_SIZE_BYTES},
+            status_code=413,
+        )
+    except Exception:
+        log.exception("notes.write failed")
+        return JSONResponse({"error": "internal"}, status_code=500)
+    # WS 广播（复用 hub.broadcast）
+    try:
+        await hub.broadcast({
+            "type": "notes_updated",
+            "source": "put",
+            "size": size,
+            "updated_at": updated_at,
+        })
+    except Exception:
+        log.exception("notes_updated broadcast failed")
+    return {"ok": True, "size": size, "updated_at": updated_at}
 
 
 @app.post("/api/test-notify")
