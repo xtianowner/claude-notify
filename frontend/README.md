@@ -28,7 +28,7 @@ frontend/
 前端是纯静态文件，靠后端 FastAPI 用 `StaticFiles` 挂在 `/` 下：
 
 ```bash
-cd /Users/tian/Documents/00-Tian/00-Tian-Project/claude-notify
+cd <repo>
 python -m backend.app
 # 浏览器打开 http://127.0.0.1:8787
 ```

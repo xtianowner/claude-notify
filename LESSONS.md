@@ -1130,3 +1130,84 @@ _REMINDER_REASON_RE = re.compile(r"^notif_idle_reminder_(\d+)_at_([\d.]+)min$")
 - 若未来发现"菜单徽 + 紧急徽并存视觉太挤"，可以让菜单徽**替换**紧急徽（同位置渲染，菜单优先）。当前两个徽是不同语义不重叠，先并存看用户反馈。
 - 若未来要在飞书消息也加菜单标识（如"📋 task · 等你选"），那时是消息模板分支的事，不需要回头改 status enum——继续走"派生字段进消息"的路径。
 - 是否给菜单徽加"已等 X 分钟"细节（类比紧急徽）：**留白**，先看用户实际使用反馈是否需要时长信息。
+
+---
+
+## L36 — liveness_watcher 对 inactive session 也必须跑 dead 判定（已修）
+
+**创建时间**：2026-05-11 13:10:00
+**触发场景**：dashboard 上看到一张"00-Tian-Project/claude-notify · ✎ 运行中 · 11:48 · 1 小时前 · 最近：11:48 ✗ policy_off"的卡片，但实际进程早死了，"→ 终端"按钮 disabled（tty 空）。无法清除。
+
+**根因（两层 bug 叠加）**：
+1. `derive_status("SessionStart")` 走 fall-through 默认 `return "running"`（event_store.py:176-187）——状态机里没有"刚启动还没干活"这个语义档位。
+2. `liveness_watcher.watch_loop` 在 `if not s.get("active"): continue`（旧 line 120）直接跳过所有 inactive session。R11 把 active_window 默认拉宽到 max(60, dead*2)=60min，但**没修对称的另一头**：超过 active_window 的 inactive ghost session（典型：SessionStart-only，age=69min）永远进不来 dead 判定。
+3. 结果：status 卡 "running"、active=False、watcher 不收，dashboard 上显示"运行中"且无法清除。
+
+**修复**：
+- `liveness_watcher.py:117-122` 重构：移除 `if not s.get("active"): continue` 顶层 skip。
+- **dead 判定提到 active 检查之前**：只要 `pid_dead_fast`（pid 死 + tx≥60s）或 `tx_only_slow`（tx ≥ dead_threshold）命中，无论 active 与否都标 dead。
+- **suspect 判定仍按 active skip**：避免对 inactive session 反复刷 TimeoutSuspect 噪音（这种 session 本来就 dormant，再报 suspect 没意义）。
+- `evt.raw.active` 记录原 active 标志，便于排查"为什么这次报"。
+- 单测：`scripts/0511-1310-test-r12-ghost-session.py`（4 PASS）：
+  - inactive + pid 死 + tx 不存在 → dead ✓
+  - inactive + pid 活 + tx 在 → 不发任何事件 ✓
+  - 已 push 过的 dead 幂等 ✓
+  - active + pid 死 → dead（R11 fast path 回归）✓
+
+**核心教训**：
+1. **状态机的 skip 条件要对称**——R11 修了"卡在 31min 的 active session 进不来 dead 判定"，但漏掉"超过 active_window 的 inactive session 也卡在 running 进不来 dead 判定"。状态机的每一个 skip 条件都要问"这个分支会不会让某类 session 永远到不了 terminal 状态"。
+2. **default 分支的语义要清楚**——`derive_status` 用 default `return "running"` 处理所有未匹配事件，看似稳健，但和 SessionStart 这种 "刚启动还啥都没干" 的场景叠加就成了 ghost。每个未匹配 case 都要主动选语义，而不是让"running"做 catch-all。
+3. **dead 判定 vs suspect 判定的优先级**——dead 是"事实结论"（pid 没了/transcript 没了），suspect 是"启发式猜测"（静默了一会）。事实判定不应被启发式判定的前置条件（active）所阻挡。把强信号（dead）排在弱信号（suspect）前面，是状态机的一般原则。
+
+**为什么不在 derive_status 里给 SessionStart 单独分支**：
+- 已考虑过，但状态机派生字段（`derive_status`）应该是**纯函数**，只看 `last_event` 字符串就出结果。要"SessionStart age > active_window → dead"必须看 age，已超出纯派生的边界。
+- 让 watcher 把 ghost 收为 dead，反而是把"时间敏感"的判断留给了对的层（watcher 本来就是按时间扫的）。
+
+**连带发现的二级 bug（同次修掉）**：
+- `_dead_msg(tx_age=float("inf"), ...)` 在 `int(tx_age // 60)` 抛 `ValueError: cannot convert float NaN to integer`。
+- 这个 bug 之前从未暴露——因为 R12 之前 inactive session 永远跑不到 dead 判定，自然走不到 `_dead_msg` 处理 inf 的分支。R12 一开后第一次重启 backend，log 里全是 ValueError 被 `except Exception` 吞掉，SessionDead 一条都发不出来。
+- 修法：`_dead_msg` 显式分支处理 `tx_age == float("inf")`（transcript 文件不存在）。返回"transcript 文件不存在"语义而不是数字分钟。
+- 教训：**`except Exception: log.exception` 是隐性 bug 沉淀池**——业务路径没跑通，但 traceback 只进了日志没冒泡到测试。靠 mock 跑测试时没炸（因为顶层 try 把 ValueError 吞了），靠真实重启 backend 才暴露。
+- 防回归：单独加 `TestDeadMsgInfHandling` 三个用例直接测 `_dead_msg(tx_age=inf)`，下次任何人改这个函数破坏 inf 处理会立刻被抓。
+
+**用户层面留白**：
+- 修复仅在 backend 重启后生效（live watcher 用新代码）。
+- 历史遗留的 ghost session（如 04910788）会在 backend 重启后 30s 内被批量标 dead。dashboard 卡片状态会从"运行中"变为"已歇"。已验证 04910788 在 13:08:07 被 watcher 标 dead，dashboard 列表中 `status=running & active=False` 的 ghost 数 0。
+
+
+## L37 — CSS container query：两条路都翻车，回退到 @media viewport（已修）
+
+**创建时间**：2026-05-11 14:00:00
+**更新时间**：2026-05-11 14:15:00（R13b 回滚 sessions-list 方案 + 改 @media）
+**触发场景**：用户给截图，窄视口下 session 卡片宽度异常窄（被压到 ~30% 宽，左半边空白）；卡片头部的 dot/name/✎/status-badge 和 actions 区的 → 终端按钮挤在同一行严重重叠（"→等输入"、"→运行中"、"② 2min 回合结束 → 终端" 互相叠字）。
+
+**根因**：
+- `.session-item { container-type: inline-size; }` 把卡片自己声明为 inline-size container，本意是让卡片"按自身可用宽切布局"。
+- 然后写了 `@container (max-width: 540px) { .session-item { grid-template-columns: minmax(0, 1fr); grid-template-areas: "head" "summary" "actions" "meta" "trace"; } }`，期望卡片宽 ≤ 540px 时变单列。
+- **但 `@container` 查的是 *ancestor* container，元素不是自己的 container**（CSS Containment 规范明文）。`.session-item` 的祖先（`.sessions-list` / `.workspace` / `main`）都没声明 container-type → query 找不到匹配的 container → 单列规则**永远不命中**。
+- 后果：窄视口下卡片依旧用桌面双列布局 `minmax(0, 1fr) auto`，head 列和 actions 列在 ~300px 宽空间里挤在同一行，子元素重叠出错。
+
+**修复尝试一（R13，失败）**：把 `container-type: inline-size` 从 `.session-item` 挪到 `.sessions-list`，期望 `@container` 查到 sessions-list 作为祖先 container。
+
+- **挪后新 bug**：sessions-list 是 workspace 的 grid item，而 CSS 规范规定 **"The auto inline-size of an inline-size containment box behaves as 0px"**。sessions-list 没有显式 width，作为 grid item `justify-self: stretch` 时其 used inline-size 仍可能被 containment 算法视作 0，max-width 1100 clamp 后等于 0+min(0, 1100)≈0。
+- 实测翻车：sessions-list 在视口 720-959 段实际渲染宽 ~50px，子卡片被压成窄柱，actions/meta/trace 飘到卡片外，比修前更糟。
+
+**修复尝试二（R13b，已修）**：放弃 container query，回退到 viewport-based `@media`：
+- 删 `.sessions-list` 上的 `container-type: inline-size`。
+- `@container (max-width: 540px)` 改为 `@media (max-width: 720px)`，触发条件用视口宽度而非容器宽度。
+- 阈值从 540 提到 720：实测 head-l 内 dot + name + status badge + menu badge 一行至少需 ~450px，actions 再加 70px → 双列布局需要卡片可用宽 ≥ 520px，对应视口 ≥ 720（main padding 扣 32-48px 后 ~ 670+）。
+
+**核心教训**：
+1. **container query 是 ancestor query，不是 self query**——元素自己设 `container-type` 只服务 descendants，不服务自己。要查"我自己的宽"必须由父容器声明 container-type。规范第一段"An element with a containment context is considered to be a containment context for all of its descendants, but not for itself"是关键。
+2. **inline-size containment 不能加在 layout-sensitive 容器上**——`contain: inline-size` 让 auto inline-size 视为 0；如果该元素是 grid/flex item 且依赖 stretch 取得自然宽度，containment 会和 stretch 算法打架，导致 width 塌缩。换句话说：container-type 适合加在"width 已经被显式决定（block + 父定宽）"的元素上，不适合加在"width 靠 stretch / fr / fit-content 间接决定"的元素上。
+3. **container query 的"按容器宽切布局"愿景，在常见 layout（grid/flex 嵌套）下经常无法干净实现**。没有"安全容器"可以放 container-type 时，承认局限，老老实实用 `@media` viewport。少一点酷炫但能 work 的方案胜过精致但坑爹的方案。
+
+**用户层面**：
+- 硬刷页面（cmd+shift+R）即生效，不需要重启 backend。
+- 视口 ≤ 720px 时 session 卡片单列（head / summary / actions / meta / trace 各一行）。
+- 视口 > 720px 时双列（head 与 actions 同行）。
+
+**响应式手测的盲点**：
+- task #80 标"响应式 6 档手测通过"但漏掉这个 bug。原因之一：当时 container query 写错（self-target），手测在 320/375/...视口都试过但 @container 静默失败，肉眼看不出"窄屏没切单列"——卡片在桌面布局下虽然挤但勉强能读，没人意识到那是"规则没生效"。
+- 教训：CSS silent failure 比 JS 难抓得多。响应式回归不能只靠肉眼，要在 devtools 把 @media/@container 触发的 class 写到一个明显的 indicator（如 body 加个标签 "narrow-mode"），手测时直接看 indicator 是否切换，而不是看视觉效果对不对。
+

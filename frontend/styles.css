@@ -398,6 +398,10 @@ main {
   gap: var(--sp-3);
   max-width: 1100px;
   margin: 0 auto;
+  /* R13b — 不要在这里加 container-type: inline-size。
+     spec 规定 inline-size containment 让元素的 auto inline-size 视为 0，
+     作为 grid item 时会引发 sessions-list 实际宽塌成 ~0，子卡片变窄柱。
+     窄屏单列规则改走 @media viewport（见文件末 @media max-width: 720px 段）。 */
 }
 .empty {
   color: var(--c-fg-muted);
@@ -512,9 +516,10 @@ main {
   box-shadow: var(--sh-1);
   cursor: pointer;
   transition: border-color 120ms ease-out;
-  /* container query：让卡片按"自身可用宽"决定布局，而非视口宽。
-     原因：notes-panel 接入后视口同样宽但卡片实际宽差 ~400px。 */
-  container-type: inline-size;
+  /* R13b — 不用 container query：原方案试过 container-type 放卡片自身（self
+     不算自己的 container，规则不命中）和放 .sessions-list（inline-size
+     containment 让 grid item width 塌缩），都翻车。窄屏单列规则改用 @media
+     viewport（见文件末 max-width: 720px 段）。 */
 }
 .session-item:hover {
   border-color: var(--c-fg-muted);
@@ -1661,9 +1666,11 @@ main {
   }
 }
 
-/* ───────── Container query：session-item 内部布局（按卡片自身宽） ─────────
-   宽度 ≤ 540 时切单列：head / summary / actions / meta / trace 全部独占一行。 */
-@container (max-width: 540px) {
+/* ───────── 窄视口 session-item 单列布局（@media viewport-based） ─────────
+   ≤ 720 时切单列：head / summary / actions / meta / trace 全部独占一行。
+   R13b：原本想用 @container 按卡片自身宽决定（更精准），但 self-target /
+   sessions-list inline-size 塌缩两条路都翻车，回退到 viewport 阈值。 */
+@media (max-width: 720px) {
   .session-item {
     grid-template-columns: minmax(0, 1fr);
     grid-template-areas:
@@ -1676,9 +1683,8 @@ main {
   .session-item .item-actions {
     justify-content: flex-end;
   }
-  .session-item .item-head-l .alias-edit {
-    opacity: 1;
-  }
+  /* alias-edit 在窄屏常驻可见的规则已在上方 @media (max-width: 720px) 块内
+     (.item-head-l .alias-edit { opacity: 1 })，本块不重复。 */
 }
 
 /* ───────── 中段 720–959：topbar 紧凑化 + modal 中段过渡 ───────── */
