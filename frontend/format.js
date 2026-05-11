@@ -134,3 +134,26 @@ export function truncate(s, n) {
   if (s.length <= n) return s;
   return s.slice(0, n - 1) + "…";
 }
+
+// L39: 卡片摘要里出现的 markdown 控制符（**bold** / *italic* / `code` / [text](url)
+// / # heading / - list / > quote）渲染前 strip 成纯文本。原因：卡片是简洁信息流
+// 不渲染富文本；backend last_assistant_message / last_action / next_action 等字段
+// 直接抄 transcript 原文，会出现裸的 ** 或 ` 标记，在 line-clamp 2 里非常突兀。
+// 不破坏内容语义（保留链接 anchor text、heading 内容、list item 文字）。
+export function stripMd(s) {
+  if (!s) return "";
+  return String(s)
+    .replace(/```[\s\S]*?```/g, " [代码] ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1$2")
+    .replace(/(^|[^_])_([^_\n]+)_/g, "$1$2")
+    .replace(/^#+\s+/gm, "")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/^>\s?/gm, "")
+    .replace(/^[-*+]\s+/gm, "")
+    .replace(/^\d+\.\s+/gm, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}

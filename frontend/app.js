@@ -3,7 +3,7 @@ import { api, connectWS } from "./api.js";
 import {
   relTime, absTimeShanghai, fullTimeShanghai,
   statusBadgeClass, statusLabel, eventBadgeClass,
-  colorDot, colorDotValue, displayName, truncate, formatAge,
+  colorDot, colorDotValue, displayName, truncate, formatAge, stripMd,
 } from "./format.js";
 import { initNotes, onNotesEvent as onNotesWS } from "./notes.js";
 
@@ -401,12 +401,14 @@ function sessionCardHTML(s) {
   //   ended/dead→ 已结束 · {last_milestone || '可归档'}
   //   空        → 刚启动 · 等你输入第一条 prompt
   const ps = s.progress_state || "";
-  const waitingFor = (s.waiting_for || "").trim();
-  const lastAction = (s.last_action || "").trim();
-  const lastMilestone = (s.last_milestone || "").trim();
-  const turnSummary = (s.turn_summary || "").trim();
-  const nextAction = (s.next_action || "").trim();
-  const lastMsg = (s.last_message || "").trim();
+  // L39：所有摘要字段渲染前 strip markdown 控制符（**bold** / `code` / [text](url) 等）。
+  // 原因：backend 直接抄 transcript 原文，会把裸的 ** 或 ` 暴露到卡片上。
+  const waitingFor = stripMd(s.waiting_for).trim();
+  const lastAction = stripMd(s.last_action).trim();
+  const lastMilestone = stripMd(s.last_milestone).trim();
+  const turnSummary = stripMd(s.turn_summary).trim();
+  const nextAction = stripMd(s.next_action).trim();
+  const lastMsg = stripMd(s.last_message).trim();
   const ageMin = Math.max(1, Math.floor((s.age_seconds || 0) / 60));
 
   let summary = "";
@@ -439,13 +441,13 @@ function sessionCardHTML(s) {
       summaryLabel = "上次";
       summary = milestone ? `${milestone} · 等你 resume` : "等你 resume";
     }
-    summaryRaw = s.last_assistant_message || milestone;
+    summaryRaw = stripMd(s.last_assistant_message) || milestone;
   } else if (s.status === "ended" || s.status === "dead") {
     summaryLabel = "已结束";
     summary = lastMilestone || turnSummary || "可归档";
-    summaryRaw = s.last_assistant_message || lastMilestone;
+    summaryRaw = stripMd(s.last_assistant_message) || lastMilestone;
   } else if (s.note) {
-    summaryLabel = "备注"; summary = s.note; summaryRaw = s.note;
+    summaryLabel = "备注"; summary = stripMd(s.note); summaryRaw = summary;
   } else {
     summaryLabel = "刚启动"; summary = "等你输入第一条 prompt";
   }
