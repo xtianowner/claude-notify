@@ -205,14 +205,23 @@ def _idle_reminder_decision(
     """L22：idle prompt 来时按 reminder 计数 + gap 阈值决定推/吞。
 
     规则：
-    - R11 Bug B：raw.menu_detected=True → bypass dup（菜单是真等输入，必须推）
+    - L40：raw.notification_type=="permission_prompt" → bypass dup（Claude Code 官方
+      信号：AskUserQuestion tool / 工具授权 / 等其它"等用户响应"场景，比文本菜单
+      识别更可靠，必须立即推）
+    - R11 Bug B：raw.menu_detected=True → bypass dup（菜单是真等输入，必须推；
+      由 hook-notify.py 读 transcript 末 20 行匹配 `❯ 数字.` / `Type something` 后 mark）
     - reminder_minutes 列表为空 → 严格 1 次模式（永远吞副本，等同 L21）
     - 已发 reminder 数 >= len(reminder_minutes) → 达到上限，吞
     - 未达上限 + gap >= reminder_minutes[count] → 推（mark_sent）
     - 未达上限但 gap 不够 → 吞（等下一次 idle prompt 来再判）
     """
+    raw = evt.get("raw") or {}
+    # L40：Claude Code 官方 notification_type 信号，bypass dup
+    # （覆盖 AskUserQuestion / 工具授权 / 未来新问询 tool —— 都是 permission_prompt）
+    if raw.get("notification_type") == "permission_prompt":
+        return True, "permission_prompt_bypass_dup"
     # R11 Bug B：菜单选择是真等输入，bypass dup 过滤
-    if (evt.get("raw") or {}).get("menu_detected") is True:
+    if raw.get("menu_detected") is True:
         return True, "menu_detected_bypass_dup"
 
     sid = (evt.get("session_id") or "").strip()

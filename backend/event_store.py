@@ -540,8 +540,12 @@ def list_sessions(active_window_minutes: int = 30,
         # L20：idle prompt Notification 副本不更新 last_event（dashboard status 保持回合结束）
         is_idle_dup = _is_idle_prompt_dup(evt, s.get("_last_stop_unix") or 0.0)
         # R11 hotfix：menu_detected=true 时强制不算 dup（菜单是真等输入，优先级高于 filler 拦截）
+        # L40：notification_type==permission_prompt 同理（覆盖 AskUserQuestion 等结构化问询）
         _evt_raw = evt.get("raw") or {}
-        if isinstance(_evt_raw, dict) and _evt_raw.get("menu_detected") is True:
+        if isinstance(_evt_raw, dict) and (
+            _evt_raw.get("menu_detected") is True
+            or _evt_raw.get("notification_type") == "permission_prompt"
+        ):
             is_idle_dup = False
         if ev_name and ev_name not in NON_STATUS_EVENTS and not is_idle_dup:
             s["last_event"] = ev_name
@@ -586,8 +590,13 @@ def list_sessions(active_window_minutes: int = 30,
             s["_last_notification_msg"] = evt.get("message") or ""
             s["_last_notification_unix"] = parse_iso(evt.get("ts", ""))
             # R11：菜单 prompt 探测（backend hook 在 raw.menu_detected 打标），冒泡到 session level
+            # L40：notification_type==permission_prompt 同样亮 🔥 徽（AskUserQuestion / 工具授权等）
             _raw = evt.get("raw") or {}
-            s["menu_detected"] = bool(isinstance(_raw, dict) and _raw.get("menu_detected"))
+            _is_menu_or_perm = isinstance(_raw, dict) and (
+                _raw.get("menu_detected") is True
+                or _raw.get("notification_type") == "permission_prompt"
+            )
+            s["menu_detected"] = bool(_is_menu_or_perm)
         if evt.get("event") == "Stop":
             s["_last_stop_assistant"] = evt.get("last_assistant_message") or ""
             s["_last_stop_unix"] = parse_iso(evt.get("ts", ""))
