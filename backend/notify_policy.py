@@ -19,9 +19,11 @@ import asyncio
 import logging
 import re
 import time
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from . import config as cfg_mod, decision_log, feishu, notify_filter
+
+PushListener = Callable[[dict[str, Any], str], Awaitable[None]]
 
 # L26（Round 7·B）：从 notify_filter 返回的 push reason 里解析 reminder_index 与 gap。
 # 形如 "notif_idle_reminder_1_at_5.0min" → (1, 5.0)；非 reminder 模式 → (0, None)。
@@ -60,6 +62,41 @@ class NotifyDispatcher:
         # 跨事件 dedupe（教训 L05）：Stop 推送成功的 unix ts，按 sid 索引。
         # Notification 入 submit 时注入到 summary，让 notify_filter 能感知"刚刚推过 Stop"。
         self._last_stop_pushed_at: dict[str, float] = {}
+        # L41 / R16：浏览器通知 listener，由 app.py 注入（hub.broadcast 包装）。
+        # 与 feishu 渠道独立 —— 即便 feishu 关掉，browser 仍能收到 push。
+        self._push_listener: PushListener | None = None
+
+    def set_push_listener(self, listener: PushListener | None) -> None:
+        self._push_listener = listener
+
+    @staticmethod
+    def _globally_silenced(cfg: dict[str, Any]) -> bool:
+        """muted / snooze_until 视为全局静音 → browser 也不该响。"""
+        if cfg.get("muted"):
+            return True
+        snooze = (cfg.get("snooze_until") or "").strip()
+        if snooze:
+            try:
+                from .event_store import parse_iso
+                return parse_iso(snooze) > time.time()
+            except Exception:
+                return False
+        return False
+
+    async def _emit_browser_push(self, evt: dict[str, Any], reason: str) -> None:
+        """通过 listener 广播一份 push_event 给 dashboard WS。
+        前端根据 push_channels.browser + Notification permission 决定是否弹 toast。"""
+        listener = self._push_listener
+        if listener is None:
+            return
+        cfg = cfg_mod.load()
+        if self._globally_silenced(cfg):
+            return
+        try:
+            await listener(evt, reason)
+        except Exception:
+            log.exception("push listener failed sid=%s",
+                          evt.get("session_id"))
 
     async def submit(self, evt: dict[str, Any]) -> dict[str, Any]:
         ev_type = evt.get("event") or ""
@@ -94,6 +131,7 @@ class NotifyDispatcher:
             ridx, rgap = _parse_reminder_reason(reason)
             if ridx > 0:
                 evt = {**evt, "reminder_index": ridx, "reminder_gap_min": rgap}
+            await self._emit_browser_push(evt, reason or "notification_kept")
             return await feishu.send_event(evt)
 
         if policy == "immediate":
@@ -101,6 +139,7 @@ class NotifyDispatcher:
             ok, reason = notify_filter.should_notify(evt, summary, cfg)
             if not ok:
                 return {"ok": False, "reason": f"filtered:{reason}"}
+            await self._emit_browser_push(evt, reason or "immediate")
             result = await feishu.send_event(evt)
             self._record_stop_push(ev_type, sid, result)
             return result
@@ -119,6 +158,7 @@ class NotifyDispatcher:
 
         # 兜底：立即推
         await self._cancel(sid)
+        await self._emit_browser_push(evt, "fallback_immediate")
         return await feishu.send_event(evt)
 
     async def _schedule_or_merge(self, sid: str, evt: dict[str, Any], delay: float) -> int:
@@ -157,6 +197,7 @@ class NotifyDispatcher:
                     if not ok:
                         log.info("silence-then filtered sid=%s reason=%s", sid, reason)
                         return
+                    await self._emit_browser_push(events[0], reason or "silence_fire")
                     result = await feishu.send_event(events[0])
                     self._record_stop_push(events[0].get("event") or "", sid, result)
                 else:
@@ -168,6 +209,8 @@ class NotifyDispatcher:
                         self._trace(sid, "Stop", "drop",
                                     f"merged_all_filtered(n={len(events)})", "silence")
                         return
+                    await self._emit_browser_push(
+                        passed[-1], f"silence_combined_{len(passed)}")
                     result = await feishu.send_events_combined(passed)
                     # 合并卡片若包含 Stop，也算 Stop 已推过
                     if any((e.get("event") or "") == "Stop" for e in passed):

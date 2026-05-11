@@ -45,6 +45,7 @@
 - 依赖：httpx
 - 复用入口：`await feishu.send_event(evt)` / `await feishu.send_test()`
 - 节流：SubagentStop 默认 30s 同 session 合并；Notification/Stop 不节流；Heartbeat 不推
+- **L41 / R16 渠道开关**：入口检查 `cfg.push_channels.feishu`，False 时直接 return `reason="channel_off"`（不发起 HTTP）。与浏览器渠道独立。
 
 ## backend.liveness_watcher（v2 替代 timeout_watcher，L09 升级到分状态阈值，L32 修 active_window 边缘 bug）
 - 输入：`watch_loop(callback, interval_seconds)` + 配置阈值
@@ -79,6 +80,7 @@
 - 配置：`notify_policy: {EventName: "immediate" | "silence:N" | "off"}`
 - 复用入口：`await notify_policy.get_dispatcher().submit(evt)`
 - L12：每个推 / 不推决策点（`policy_off` / `silence-scheduled` / `merged` / `merged_all_filtered`）调 `_trace(...)` 写 `decision_log`
+- **L41 / R16 push listener**：`set_push_listener(cb)` 由 `app.py:lifespan` 注入；dispatcher 5 个调 feishu 的位置前都先 `_emit_browser_push(evt, reason)` 给 WS 广播 `push_event`。listener 自带 `_globally_silenced(cfg)` 判断（muted / snooze_until 时不广播）。渠道解耦：feishu channel off 时仍广播给 browser，反之亦然。
 
 ## backend.notify_filter
 - 职责：should_notify 入口，做"哪些事件该推 / 该吞"的纯计算判定（不调 LLM）
@@ -153,8 +155,10 @@
 - 入口：`frontend/index.html`，由后端 StaticFiles 挂载
 - 模块：
   - `api.js` — REST + WebSocket 客户端
-  - `format.js` — 时间相对化、状态徽章颜色映射
+  - `format.js` — 时间相对化、状态徽章颜色映射；`stripMd` 卡片摘要清理 markdown 控制符
   - `app.js` — 主控制器（session 网格 / 抽屉 / 配置弹窗 / 测试按钮）
+  - `notes.js` — 记事本面板（L28/L29/L31）
+  - **`notify.js`（L41 / R16）— 浏览器桌面通知**：监听 WS `push_event` → 调 Notification API；顶部"启用桌面通知"条带管理 permission 授权；channel 开关跟随 `state.config.push_channels.browser`
   - `styles.css` — 单文件样式
 - L38（2026-05-11）：卡片底部 trace 行 + modal 已删除（开发者 debug 工具，对最终用户是噪音）。后端 `data/push_decisions.jsonl` 仍写，`/api/sessions/{sid}/decisions` 仍可 curl。
 - 不引入任何 npm 依赖

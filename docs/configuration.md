@@ -3,9 +3,34 @@
 # 配置参考
 
 创建时间: 2026-05-11 13:55:00
-更新时间: 2026-05-11 13:55:00
+更新时间: 2026-05-11 17:55:00
 
 > 所有配置存在 `data/config.json`。可直接编辑文件，也可在 dashboard 右上角 ⋯ → 配置面板里改（推荐）。改完后立即生效，不用重启 backend（绝大多数字段是热加载，少数标注「需要重启」）。
+
+---
+
+## 0. 推送渠道 `push_channels`（L41 / R16）
+
+两条独立渠道。可只开 browser 完全脱离飞书使用。
+
+| 字段 | 默认 | 取值/类型 | 含义 |
+|---|---|---|---|
+| `push_channels.feishu` | `true` | bool | 飞书 webhook 推送。`false` 时 `feishu.send_event` 直接 return `reason="channel_off"`，不发起 HTTP 请求。webhook URL 字段可保留（不会用）。 |
+| `push_channels.browser` | `true` | bool | 浏览器桌面通知（dashboard tab 打开 + 已授权时）。`false` 时前端忽略 push_event。 |
+
+**使用模式**：
+
+- **只飞书**：browser=false，feishu=true + 配 webhook。和原始行为一致。
+- **只浏览器**：feishu=false，browser=true。无需 webhook，dashboard 必须打开（tab 后台也行，OS toast 仍弹）。首次需点顶部"启用桌面通知"条带授权。
+- **两者并存**（默认）：飞书覆盖手机场景，浏览器覆盖坐在电脑前但 dashboard tab 在后台的场景。
+
+**何时不弹浏览器**：
+
+- `Notification.permission !== "granted"`：用户未授权 / 已 deny。
+- tab `visibilityState==="visible"` 且 `document.hasFocus()`：用户正盯着 dashboard 看，OS toast 是重复打扰。
+- 全局静音命中（`muted=true` / `snooze_until` 未到期）：browser **跟随**全局静音；这与 channel 开关是两个维度。
+
+**测试推送行为**：dashboard ⋯ → 测试推送 = 同时广播 push_event 给 WS（任何开关下）+ 试发飞书（按 channel.feishu 开关）。关掉飞书也能用这个验证浏览器通知。
 
 ---
 
@@ -17,6 +42,8 @@
 |---|---|---|---|
 | `feishu_webhook` | `""` | string | 飞书自定义机器人 webhook 完整 URL。空值 = 不推送（dashboard 仍可看事件）。改完立即生效。 |
 | `feishu_secret` | `""` | string | 飞书机器人启用「签名校验」时填入的 secret；机器人未开签名校验则留空。 |
+
+> 想完全关闭飞书：建议改 `push_channels.feishu=false`（语义清晰，保留 webhook 备用）；清空 `feishu_webhook` 也能达到相同效果但语义弱（reason 会是 `no_webhook`）。
 
 ---
 

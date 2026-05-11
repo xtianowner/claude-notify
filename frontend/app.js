@@ -1,5 +1,6 @@
 // 业务主入口。分层：api.js → 网络；format.js → 展示工具；app.js → 状态 + 渲染。
 import { api, connectWS } from "./api.js";
+import { onPushEvent as notifyOnPush, bindPermBar as notifyBindBar, updatePermBar as notifyUpdateBar } from "./notify.js";
 import {
   relTime, absTimeShanghai, fullTimeShanghai,
   statusBadgeClass, statusLabel, eventBadgeClass,
@@ -985,6 +986,10 @@ function parseNpString(raw) {
 
 function fillConfigForm(cfg) {
   const f = $configForm;
+  // L41 / R16：渠道开关
+  const ch = cfg.push_channels || {};
+  if (f.elements["channel_feishu"]) f.elements["channel_feishu"].checked = ch.feishu !== false;
+  if (f.elements["channel_browser"]) f.elements["channel_browser"].checked = ch.browser !== false;
   f.elements["feishu_webhook"].value = cfg.feishu_webhook || "";
   f.elements["timeout_minutes"].value = cfg.timeout_minutes ?? 5;
   f.elements["dead_threshold_minutes"].value = cfg.dead_threshold_minutes ?? 30;
@@ -1086,6 +1091,10 @@ function readConfigForm() {
   };
 
   return {
+    push_channels: {
+      feishu: f.elements["channel_feishu"] ? f.elements["channel_feishu"].checked : true,
+      browser: f.elements["channel_browser"] ? f.elements["channel_browser"].checked : true,
+    },
     feishu_webhook: f.elements["feishu_webhook"].value.trim(),
     timeout_minutes: parseInt(f.elements["timeout_minutes"].value, 10) || 5,
     dead_threshold_minutes: parseInt(f.elements["dead_threshold_minutes"].value, 10) || 30,
@@ -1342,6 +1351,11 @@ function onHashChange() {
 function onWsEnvelope(env) {
   if (!env || typeof env !== "object") return;
   if (env.type === "notes_updated") { onNotesWS(env); return; }
+  // L41 / R16：后端决定推送 → 弹浏览器桌面通知（飞书与否独立）
+  if (env.type === "push_event") {
+    notifyOnPush(env, () => state.config || {});
+    return;
+  }
   if (env.type === "event") {
     const evt = env.event;
     const summary = env.session;
@@ -1455,6 +1469,7 @@ $configForm.addEventListener("submit", async (e) => {
     state.setupHealth = null;  // L27：webhook 可能变了，让首次接入卡下次空状态出现时重新检测
     renderWebhookBadge();
     renderSnoozeBadge();
+    notifyUpdateBar(state.config || {});
     $configMsg.textContent = "已保存。";
     showToast("配置已保存", "ok");
     setTimeout(closeConfigModal, 600);
@@ -1681,5 +1696,8 @@ setInterval(renderSnoozeBadge, 60 * 1000);
   }
   // Round 10：记事本（独立模块，不阻塞 sessions 渲染）
   initNotes({ api, toast: showToast });
+  // L41 / R16：浏览器桌面通知授权条带
+  notifyBindBar(state.config || {});
+  notifyUpdateBar(state.config || {});
   connectWS({ onEvent: onWsEnvelope, onStatus: setWsStatus });
 })();

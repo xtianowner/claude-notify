@@ -60,6 +60,13 @@
     </div>
   </header>
 
+  <!-- 浏览器桌面通知授权提示条带（仅在用户未授权 + 渠道已开启时显示，点击触发 requestPermission） -->
+  <div id="notif-perm-bar" class="notif-perm-bar hidden" role="status">
+    <span class="notif-perm-text">开启桌面通知：tab 在后台也能弹提示，无需飞书。</span>
+    <button id="btn-notif-perm" type="button">启用</button>
+    <button id="btn-notif-perm-dismiss" type="button" class="btn-link" aria-label="关闭">×</button>
+  </div>
+
   <!-- 折叠的状态过滤 chip 行（默认 hidden，点 summary-pill 展开） -->
   <div id="status-filter" class="filter-chips hidden" role="group" aria-label="状态过滤">
     <label><input type="checkbox" value="running" checked /> running</label>
@@ -153,6 +160,14 @@
     <div class="modal-card" role="dialog" aria-modal="true" aria-label="配置">
       <h3>配置</h3>
       <form id="config-form">
+        <fieldset id="channels-fieldset">
+          <legend>推送渠道</legend>
+          <p class="muted small">
+            两者独立。可只开浏览器（无需飞书 webhook，dashboard 打开即可收通知）；也可两者都开互补。
+          </p>
+          <label class="row"><input type="checkbox" name="channel_feishu" /> 飞书 webhook 推送</label>
+          <label class="row"><input type="checkbox" name="channel_browser" /> 浏览器桌面通知（需 dashboard 已打开）</label>
+        </fieldset>
         <label>
           飞书 webhook URL
           <input type="password" name="feishu_webhook" autocomplete="off" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..." />

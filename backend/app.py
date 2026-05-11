@@ -77,6 +77,29 @@ async def _on_watcher_event(evt: dict[str, Any]):
     await notify_policy.get_dispatcher().submit(evt)
 
 
+async def _on_push_for_browser(evt: dict[str, Any], reason: str):
+    """notify_policy dispatcher 决定推送时调（飞书开关无关）。
+    给 dashboard 广播一条 push_event，前端按 push_channels.browser 决定是否弹 toast。"""
+    sid = evt.get("session_id") or ""
+    summary = _session_summary(sid) if sid else None
+    title = (summary or {}).get("alias") or sid[:8] if sid else "claude-notify"
+    body = (summary or {}).get("turn_summary") \
+        or (summary or {}).get("last_milestone") \
+        or (summary or {}).get("last_assistant_message") \
+        or evt.get("message") \
+        or ""
+    await hub.broadcast({
+        "type": "push_event",
+        "session_id": sid,
+        "event_type": evt.get("event") or "",
+        "reason": reason,
+        "title": title,
+        "body": (body or "")[:200],
+        "ts": evt.get("ts") or "",
+        "status": (summary or {}).get("status") or "",
+    })
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cfg = cfg_mod.load()
@@ -99,6 +122,9 @@ async def lifespan(app: FastAPI):
     except Exception:
         log.exception("startup prune session_mutes failed")
     task = asyncio.create_task(liveness_watcher.watch_loop(_on_watcher_event, interval_seconds=interval))
+    # L41 / R16：注入浏览器推送 listener，让 notify_policy 在每次决定 push 时
+    # 给 dashboard WS 广播一条 push_event。前端按 push_channels.browser 决定是否弹通知。
+    notify_policy.get_dispatcher().set_push_listener(_on_push_for_browser)
     log.info("claude-notify backend started; data=%s", cfg_mod.DATA_DIR)
     try:
         yield
@@ -514,6 +540,17 @@ async def put_notes(request: Request):
 
 @app.post("/api/test-notify")
 async def test_notify():
+    # L41 / R16：广播一份 push_event 给 dashboard（无视 feishu 开关），
+    # 让用户即便关掉飞书也能用 "测试推送" 验证浏览器通知。
+    await _on_push_for_browser(
+        {
+            "event": "TestNotify",
+            "session_id": "",
+            "ts": "",
+            "message": "测试推送（确认渠道工作）",
+        },
+        "test_notify",
+    )
     result = await feishu.send_test()
     return result
 

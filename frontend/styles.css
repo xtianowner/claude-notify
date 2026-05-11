@@ -1231,6 +1231,33 @@ main {
   font-size: var(--fs-xs);
 }
 
+/* ───────── 浏览器通知授权条带（L41 / R16） ───────── */
+.notif-perm-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-4);
+  background: var(--c-info-soft, #eef6ff);
+  border-bottom: 1px solid var(--c-border, #e0e7f0);
+  font-size: var(--fs-sm);
+}
+.notif-perm-bar.hidden { display: none; }
+.notif-perm-bar .notif-perm-text { flex: 1; color: var(--c-fg); }
+.notif-perm-bar button {
+  background: var(--c-fg);
+  color: var(--c-surface);
+  border: none;
+  padding: 4px 12px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  font-size: var(--fs-sm);
+}
+.notif-perm-bar .btn-link {
+  background: transparent;
+  color: var(--c-fg-muted);
+  padding: 2px 8px;
+}
+
 /* ───────── Toast ───────── */
 .toast {
   position: fixed;

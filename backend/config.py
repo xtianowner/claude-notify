@@ -123,7 +123,17 @@ DEFAULT_LIVENESS_PER_STATE_TIMEOUT = {
     "pretool_transcript_alive_seconds": 60,
 }
 
+DEFAULT_PUSH_CHANNELS = {
+    # L41 / R16：渠道开关。两者均默认开。
+    # - feishu：飞书 webhook 推送；关掉后 feishu.send_event 不发起 HTTP 请求
+    # - browser：浏览器桌面通知（dashboard 打开时）；关掉后前端不调 Notification API
+    # 两者独立，可只开 browser 完全脱离飞书使用。
+    "feishu": True,
+    "browser": True,
+}
+
 DEFAULTS: dict[str, Any] = {
+    "push_channels": DEFAULT_PUSH_CHANNELS,
     "feishu_webhook": "",
     "feishu_secret": "",
     "timeout_minutes": 5,

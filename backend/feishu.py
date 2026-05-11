@@ -309,6 +309,8 @@ async def send_events_combined(events: list[dict[str, Any]]) -> dict[str, Any]:
                 return {"ok": False, "reason": "snoozed", "until": snooze}
         except Exception:
             pass
+    if (cfg.get("push_channels") or {}).get("feishu") is False:
+        return {"ok": False, "reason": "channel_off"}
     webhook = (cfg.get("feishu_webhook") or "").strip()
     if not webhook:
         return {"ok": False, "reason": "no_webhook"}
@@ -367,6 +369,9 @@ async def send_event(evt: dict[str, Any]) -> dict[str, Any]:
                 return {"ok": False, "reason": "snoozed", "until": snooze}
         except Exception:
             pass
+    # L41 / R16：渠道开关。push_channels.feishu=False 时直接不发起飞书 HTTP 请求。
+    if (cfg.get("push_channels") or {}).get("feishu") is False:
+        return {"ok": False, "reason": "channel_off"}
     webhook = (cfg.get("feishu_webhook") or "").strip()
     if not webhook:
         return {"ok": False, "reason": "no_webhook"}
