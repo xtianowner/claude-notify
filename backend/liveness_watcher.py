@@ -117,8 +117,6 @@ async def watch_loop(on_event: OnEvent, interval_seconds: int = 30):
             for s in sessions:
                 if s["status"] in {"ended", "dead"}:
                     continue
-                if not s.get("active"):
-                    continue
 
                 last_evt_age = now - s["last_event_unix"]
                 tx_age = _transcript_age(s.get("transcript_path", ""))
@@ -127,6 +125,9 @@ async def watch_loop(on_event: OnEvent, interval_seconds: int = 30):
                 pid_alive = _pid_alive(s.get("claude_pid"))
 
                 # 1) SessionDead 判定
+                # R12 — dead 判定不再受 active 窗口约束：超过 active_window 的 inactive ghost session
+                # （典型场景：SessionStart-only，启动后秒退；或 active_window 之外仍 last_event=running）
+                # 必须能被 watcher 收掉，否则会在 dashboard 上永久显示「运行中」。
                 # Fast path：PID 死 + transcript 静默 ≥ 60 秒 → 立即标 dead（用户关 terminal 后 1-2 分钟即识别）
                 # Slow path：transcript 静默 ≥ dead_threshold_minutes（兜底，处理 PID 仍存在但失活的边缘场景）
                 pid_dead_fast = (not pid_alive) and tx_age >= 60
@@ -151,6 +152,7 @@ async def watch_loop(on_event: OnEvent, interval_seconds: int = 30):
                             "pid_alive": pid_alive,
                             "transcript_age_sec": int(tx_age) if tx_age != float("inf") else -1,
                             "last_event_age_sec": int(last_evt_age),
+                            "active": bool(s.get("active")),
                         },
                     }
                     event_store.append_event(evt)
@@ -161,6 +163,12 @@ async def watch_loop(on_event: OnEvent, interval_seconds: int = 30):
                     continue
 
                 # 2) TimeoutSuspect 判定（弱信号；可能在跑长任务）
+                # 注意：suspect 仍然只对 active session 报。inactive 又没命中 dead 的边缘场景
+                # （例如 transcript 仍在但 age 卡在 active_window 与 dead_threshold 之间）
+                # 让它停留在原 status，避免冒出无意义 suspect 噪音。
+                if not s.get("active"):
+                    continue
+
                 # L09 — 按 last_event_kind 选阈值：长 tool 执行 (PreToolUse) 给更宽容忍
                 last_kind = s.get("last_event_kind") or s.get("last_event") or ""
                 threshold_sec, bucket = _pick_timeout_seconds(
@@ -221,8 +229,15 @@ def _dead_reason(pid_alive: bool, tx_age: float, dead_threshold_min: int) -> str
 
 
 def _dead_msg(pid_alive: bool, tx_age: float, dead_threshold_min: int) -> str:
-    if not pid_alive and tx_age != float("inf") and tx_age >= dead_threshold_min * 60:
+    # R12：tx_age 可能为 float("inf")（transcript 文件不存在，典型场景 SessionStart-only ghost）
+    # int(inf // 60) 会抛 ValueError，必须独立成"transcript 不存在"语义分支
+    tx_missing = tx_age == float("inf")
+    if not pid_alive and tx_missing:
+        return "会话已结束（pid 不在 + transcript 文件不存在）"
+    if not pid_alive and tx_age >= dead_threshold_min * 60:
         return f"会话已结束（pid 不在 + transcript {int(tx_age // 60)} 分钟未更新）"
     if not pid_alive:
         return "会话已结束（pid 不在）"
+    if tx_missing:
+        return "会话疑似结束（transcript 文件不存在）"
     return f"会话疑似结束（transcript {int(tx_age // 60)} 分钟未更新）"
