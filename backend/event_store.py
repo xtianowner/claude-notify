@@ -539,6 +539,10 @@ def list_sessions(active_window_minutes: int = 30,
             s["last_event_kind"] = ev_name
         # L20：idle prompt Notification 副本不更新 last_event（dashboard status 保持回合结束）
         is_idle_dup = _is_idle_prompt_dup(evt, s.get("_last_stop_unix") or 0.0)
+        # R11 hotfix：menu_detected=true 时强制不算 dup（菜单是真等输入，优先级高于 filler 拦截）
+        _evt_raw = evt.get("raw") or {}
+        if isinstance(_evt_raw, dict) and _evt_raw.get("menu_detected") is True:
+            is_idle_dup = False
         if ev_name and ev_name not in NON_STATUS_EVENTS and not is_idle_dup:
             s["last_event"] = ev_name
         elif s.get("last_event") is None:

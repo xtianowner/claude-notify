@@ -158,7 +158,7 @@ def test_menu_detected_bypass():
 
 # ────────────────────── 类 4：_detect_menu_prompt 正则 ──────────────────────
 def test_menu_detection_regex():
-    print("\n[类4] _detect_menu_prompt 正则正确性（R11 主线：末 20 行整行子串匹配）")
+    print("\n[类4] _detect_menu_prompt 正则正确性")
     # 直接 import scripts/hook-notify.py 的 _detect_menu_prompt 不方便（路径含连字符）
     # → 用 importlib 加载
     import importlib.util
@@ -176,26 +176,27 @@ def test_menu_detection_regex():
         finally:
             Path(path).unlink(missing_ok=True)
 
-    # R11 主线版本：末 20 行整行子串匹配，不解析 JSONL，
-    # 直接对裸文本/JSONL escape 字串做 search
+    # R11 hotfix: 改为 JSONL-only schema（不再支持裸文本子串匹配，避免历史 assistant 误命中）
+    def _asst(text: str) -> str:
+        return json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}) + "\n"
 
-    # case 1：标准菜单（行首 ❯ 1.）
-    t("'❯ 1. xxx\\n  2. yyy' → True",
-      write_and_check("❯ 1. 选项A\n  2. 选项B\n") is True)
+    # case 1：标准菜单（行首 ❯ 1.）—— 包在 assistant message 里
+    t("assistant content '❯ 1. xxx\\n  2. yyy' → True",
+      write_and_check(_asst("❯ 1. 选项A\n  2. 选项B\n")) is True)
 
     # case 2：前缀空格的 ❯ 1.
-    t("'  ❯ 1. xxx' → True",
-      write_and_check("  ❯ 1. 选项A\n") is True)
+    t("assistant content '  ❯ 1. xxx' → True",
+      write_and_check(_asst("  ❯ 1. 选项A\n")) is True)
 
     # case 3：普通文本无菜单
-    t("普通文本无菜单 → False",
-      write_and_check("ordinary text\nno menu here\n") is False)
+    t("assistant content 普通文本 → False",
+      write_and_check(_asst("ordinary text\nno menu here\n")) is False)
 
     # case 4：Type something. 触发
-    t("'Type something.' 子串 → True",
-      write_and_check("some prompt\nType something.\n") is True)
+    t("assistant content 'Type something.' → True",
+      write_and_check(_asst("some prompt\nType something.\n")) is True)
 
-    # case 5：实际 JSONL 行格式（菜单嵌在 JSON content 里，escape 后仍能命中子串）
+    # case 5：实际 JSONL 行格式（菜单嵌在 JSON content 里）
     fake_jsonl = json.dumps({
         "type": "assistant",
         "message": {"content": [{"type": "text", "text": "请选择:\n❯ 1. 选项A\n  2. 选项B\n  3. Type something."}]},

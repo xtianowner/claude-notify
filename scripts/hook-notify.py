@@ -32,18 +32,38 @@ MENU_PROMPT_RE = re.compile(r"❯\s*\d+\.|Type something")
 
 
 def _detect_menu_prompt(transcript_path: str) -> bool:
-    """读 transcript 末 20 行整行子串匹配菜单 prompt（R11 主线版）。
+    """只看最后一条 assistant message 的 content 文本是否含菜单 prompt。
 
-    JSONL 的 escape 换行（"\\n"）原样保留即可——MENU_PROMPT_RE 不要求行首锚定，
-    `❯ 1.` / `Type something` 在 escape 字串里仍能命中。失败一律 False。
+    R11 hotfix：之前用末 20 行子串匹配，会把"历史 assistant 引用 / 讨论菜单"
+    误判为当前在菜单上。改为 reverse 遍历 JSONL，找到第一条 type=assistant 即返回。
+    失败一律 False（不阻塞主流程）。
     """
     if not transcript_path:
         return False
     try:
         with open(transcript_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()[-20:]
-        joined = "".join(lines)
-        return bool(MENU_PROMPT_RE.search(joined))
+            lines = f.readlines()
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if obj.get("type") != "assistant":
+                continue
+            msg = obj.get("message") or {}
+            content = msg.get("content")
+            text = ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                for blk in content:
+                    if isinstance(blk, dict) and blk.get("type") == "text":
+                        text += (blk.get("text") or "") + "\n"
+            return bool(MENU_PROMPT_RE.search(text))
+        return False
     except Exception:
         return False
 
