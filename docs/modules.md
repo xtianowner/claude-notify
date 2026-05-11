@@ -94,8 +94,8 @@
 - 配置入口：`notify_filter` 字段 + `session_mutes` 字段 + `quiet_hours` 字段
 - 复用入口：`notify_filter.should_notify(evt, summary, cfg, log_trace=True) -> (ok, reason)`
 
-## backend.decision_log（v3 新增，L12）
-- 职责：推送决策 trace 落盘，让 dashboard 能看到"为什么这条推了 / 没推"
+## backend.decision_log（v3 新增，L12；前端 UI 已下线 L38）
+- 职责：推送决策落盘，给开发者 debug 用（"为什么这条推了 / 没推"）
 - 输入：`append(session_id, event_type, decision, reason, policy, extra)`
 - 输出：环形 jsonl `data/push_decisions.jsonl`，按 sid trim 上限 50 条 / 文件累计 1000 行触发整体重写
 - 字段：`{ts, session_id, event, decision: "push"|"drop"|"scheduled"|"merged", reason, policy}`
@@ -104,8 +104,8 @@
   - `notify_policy.NotifyDispatcher._trace` helper（policy="off" / "silence:N" / "silence"）
 - 复用入口：
   - `decision_log.append(sid, ev_type, decision, reason, policy)` 写
-  - `decision_log.recent_for(sid, limit=5)` 给 list_sessions 注入用（最新在前）
-  - `decision_log.all_for(sid, limit=50)` 给 `/api/sessions/{sid}/decisions` endpoint 用
+  - `decision_log.all_for(sid, limit=50)` 给 `/api/sessions/{sid}/decisions` endpoint 用（dashboard 入口已删，但 endpoint 保留，可 curl）
+- L38（2026-05-11）：dashboard 卡片 trace 行 + modal 已删除（噪音）。`recent_for` 也不再被 list_sessions 注入，仅保留 `all_for` 给 endpoint。
 - 依赖：backend.config（DATA_DIR）+ 标准库 fcntl
 - 落盘开销：每条记录 ~120 字节；50 sessions × 50 条 = 25 KB 上限
 
@@ -152,11 +152,11 @@
 ## frontend (vanilla SPA)
 - 入口：`frontend/index.html`，由后端 StaticFiles 挂载
 - 模块：
-  - `api.js` — REST + WebSocket 客户端（含 L12 `listDecisions(sid)`）
+  - `api.js` — REST + WebSocket 客户端
   - `format.js` — 时间相对化、状态徽章颜色映射
-  - `app.js` — 主控制器（session 网格 / 抽屉 / 配置弹窗 / 测试按钮 / L12 trace 行 + modal）
-  - `styles.css` — 单文件样式（`.push-trace` / `.trace-row` 等）
-- 卡片底部 L12 trace 行：灰字 11px 显示最近 3 条决策，点击展开 modal 看 50 条
+  - `app.js` — 主控制器（session 网格 / 抽屉 / 配置弹窗 / 测试按钮）
+  - `styles.css` — 单文件样式
+- L38（2026-05-11）：卡片底部 trace 行 + modal 已删除（开发者 debug 工具，对最终用户是噪音）。后端 `data/push_decisions.jsonl` 仍写，`/api/sessions/{sid}/decisions` 仍可 curl。
 - 不引入任何 npm 依赖
 
 ## 复用判定

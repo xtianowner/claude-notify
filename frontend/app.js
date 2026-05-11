@@ -112,11 +112,6 @@ const $modalAlias     = $("modal-alias");
 const $aliasForm      = $("alias-form");
 const $aliasCancel    = $("alias-cancel");
 
-const $modalTrace     = $("modal-trace");
-const $traceSid       = $("trace-sid");
-const $traceBody      = $("trace-body");
-const $traceClose     = $("trace-close");
-
 const $btnSnooze      = $("btn-snooze");
 const $snoozeMenu     = $("snooze-menu");
 
@@ -181,7 +176,7 @@ function renderSessions() {
   $sessions.querySelectorAll(".session-item").forEach(el => {
     el.addEventListener("click", (e) => {
       // 内部按钮自己处理
-      if (e.target.closest(".alias-edit, .btn-focus, .push-trace, .btn-mute")) return;
+      if (e.target.closest(".alias-edit, .btn-focus, .btn-mute")) return;
       // 阻止冒泡到 document（document 监听 outside-click 关闭抽屉，会与本逻辑冲突）
       e.stopPropagation();
       openDrawer(el.dataset.sid);
@@ -193,13 +188,6 @@ function renderSessions() {
       e.stopPropagation();
       const sid = el.dataset.sid;
       if (sid) openMuteMenu(sid, el);
-    });
-  });
-  $sessions.querySelectorAll(".push-trace").forEach(el => {
-    el.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const sid = el.dataset.sid;
-      if (sid) openTraceModal(sid);
     });
   });
   $sessions.querySelectorAll(".alias-edit").forEach(el => {
@@ -478,18 +466,9 @@ function sessionCardHTML(s) {
     ? `<span class="urgency-badge urgency-menu" title="Claude 等你做选择">🔥 指令选择·待响应</span>`
     : "";
 
-  const metaLeftBits = [s.cwd_short, s.permission_mode, s.effort_level]
-    .filter(Boolean).map(escapeHtml).join(" · ");
-  const heartbeatBit = s.last_heartbeat_ts
-    ? ` · 心跳 ${escapeHtml(relTime(s.last_heartbeat_ts))}`
-    : "";
-  const absTime = absTimeShanghai(s.last_event_ts);
+  const metaLeftBits = escapeHtml(s.cwd_short || "");
   const fullTitle = fullTimeShanghai(s.last_event_ts);
-  // v3：上海绝对时间（HH:MM 同天 / MM-DD HH:MM 跨天）+ 相对时间，hover 完整
-  const metaRightBits = `<span title="${escapeHtml(fullTitle)}">${escapeHtml(absTime ? `${absTime} · ${relTime(s.last_event_ts)}` : relTime(s.last_event_ts))}</span>${heartbeatBit}`;
-
-  // L12：推送决策 trace（最近 5 条），灰字 11px，点击展开 modal 看完整 50 条
-  const traceHtml = renderTraceLine(s);
+  const metaRightBits = `<span title="${escapeHtml(fullTitle)}">${escapeHtml(relTime(s.last_event_ts))}</span>`;
 
   // L14：muted session 整体淡灰
   const muted = !!(s.mute_state && s.mute_state.muted);
@@ -514,7 +493,6 @@ function sessionCardHTML(s) {
         <span class="meta-left" title="${escapeHtml(s.cwd || "")}">${metaLeftBits || "—"}</span>
         <span class="meta-right">${metaRightBits}</span>
       </div>
-      ${traceHtml}
     </div>
   `;
 }
@@ -548,33 +526,6 @@ function renderMuteButton(s) {
     return `<button class="btn-mute is-muted" data-sid="${escapeHtml(sid)}" type="button" title="${escapeHtml(titleParts.join(" · "))}" aria-label="静音设置">${escapeHtml(label)}</button>`;
   }
   return `<button class="btn-mute" data-sid="${escapeHtml(sid)}" type="button" title="静音此会话" aria-label="静音此会话">🔔</button>`;
-}
-
-// L12：推送决策 trace 渲染（卡片底部一行灰字）
-function renderTraceLine(s) {
-  const list = Array.isArray(s.recent_decisions) ? s.recent_decisions : [];
-  if (list.length === 0) return "";
-  const sid = s.session_id || "";
-  // 取最新 3 条（list 已按 ts 倒序，最新在前）
-  const top = list.slice(0, 3);
-  const parts = top.map(rec => {
-    const t = formatTraceTime(rec.ts);
-    const mark = (rec.decision === "push") ? "✓"
-               : (rec.decision === "drop") ? "✗"
-               : (rec.decision === "scheduled" || rec.decision === "merged") ? "⌛" : "·";
-    const reason = String(rec.reason || rec.decision || "?").slice(0, 40);
-    return `<span class="trace-item" title="${escapeHtml(rec.event || "")} · ${escapeHtml(rec.reason || "")}">${escapeHtml(t)} ${escapeHtml(mark)} ${escapeHtml(reason)}</span>`;
-  }).join('<span class="trace-sep"> · </span>');
-  const more = (list.length > 3) ? ` <span class="trace-more">+${list.length - 3}</span>` : "";
-  return `<button class="push-trace" data-sid="${escapeHtml(sid)}" type="button" title="点击查看完整决策记录（最多 50 条）">最近：${parts}${more}</button>`;
-}
-
-function formatTraceTime(ts) {
-  if (!ts) return "—";
-  const d = new Date(ts * 1000);
-  if (Number.isNaN(d.getTime())) return "—";
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 function renderDrawerEvents() {
@@ -968,60 +919,6 @@ function onEditAlias(sessionId) {
 function closeAliasModal() {
   aliasEditingSid = null;
   $modalAlias.classList.add("hidden");
-}
-
-// L12：推送决策 trace modal
-async function openTraceModal(sessionId) {
-  if (!sessionId) return;
-  $traceSid.textContent = `· ${truncate(sessionId, 12)}`;
-  $traceBody.innerHTML = `<p class="empty">加载中…</p>`;
-  $modalTrace.classList.remove("hidden");
-  try {
-    const list = await api.listDecisions(sessionId, 50);
-    renderTraceModalBody(Array.isArray(list) ? list : []);
-  } catch (e) {
-    $traceBody.innerHTML = `<p class="empty">加载失败：${escapeHtml(e.message)}</p>`;
-  }
-}
-
-function closeTraceModal() {
-  $modalTrace.classList.add("hidden");
-}
-
-function renderTraceModalBody(list) {
-  if (!list.length) {
-    $traceBody.innerHTML = `<p class="empty">该 session 暂无决策记录。</p>`;
-    return;
-  }
-  const rows = list.map(rec => {
-    const dt = traceFullTime(rec.ts);
-    const decClass = rec.decision === "push" ? "trace-push"
-                   : rec.decision === "drop" ? "trace-drop"
-                   : "trace-other";
-    const mark = (rec.decision === "push") ? "✓"
-               : (rec.decision === "drop") ? "✗"
-               : (rec.decision === "scheduled") ? "⌛"
-               : (rec.decision === "merged") ? "⊕" : "·";
-    const policy = rec.policy ? ` <span class="trace-policy">${escapeHtml(rec.policy)}</span>` : "";
-    return `
-      <div class="trace-row ${decClass}">
-        <span class="trace-time">${escapeHtml(dt)}</span>
-        <span class="trace-event">${escapeHtml(rec.event || "?")}</span>
-        <span class="trace-mark">${escapeHtml(mark)} ${escapeHtml(rec.decision || "?")}</span>
-        <span class="trace-reason">${escapeHtml(rec.reason || "")}</span>
-        ${policy}
-      </div>
-    `;
-  }).join("");
-  $traceBody.innerHTML = rows;
-}
-
-function traceFullTime(ts) {
-  if (!ts) return "—";
-  const d = new Date(ts * 1000);
-  if (Number.isNaN(d.getTime())) return "—";
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
 // ───────────── 配置弹窗 ─────────────
@@ -1569,9 +1466,6 @@ $configForm.addEventListener("submit", async (e) => {
 $aliasCancel.addEventListener("click", closeAliasModal);
 $modalAlias.addEventListener("click", (e) => { if (e.target === $modalAlias) closeAliasModal(); });
 
-// L12：trace modal 绑定
-if ($traceClose) $traceClose.addEventListener("click", closeTraceModal);
-if ($modalTrace) $modalTrace.addEventListener("click", (e) => { if (e.target === $modalTrace) closeTraceModal(); });
 $aliasForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   if (!aliasEditingSid) { closeAliasModal(); return; }
@@ -1671,9 +1565,6 @@ document.addEventListener("click", (e) => {
   }
 });
 
-// L12：trace 模态框由其他位置触发（卡片底部按钮），点击外部关闭
-// （modal 已经处理了 backdrop click → closeTraceModal）
-
 // Meta 折叠
 $drawerMetaToggle.addEventListener("click", () => {
   const open = $drawerMeta.classList.toggle("open");
@@ -1719,9 +1610,6 @@ document.addEventListener("keydown", (e) => {
   }
   if (!$modalAlias.classList.contains("hidden")) {
     closeAliasModal(); return;
-  }
-  if ($modalTrace && !$modalTrace.classList.contains("hidden")) {
-    closeTraceModal(); return;
   }
   if (!$modal.classList.contains("hidden")) {
     closeConfigModal(); return;

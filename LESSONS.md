@@ -1204,10 +1204,45 @@ _REMINDER_REASON_RE = re.compile(r"^notif_idle_reminder_(\d+)_at_([\d.]+)min$")
 
 **用户层面**：
 - 硬刷页面（cmd+shift+R）即生效，不需要重启 backend。
-- 视口 ≤ 720px 时 session 卡片单列（head / summary / actions / meta / trace 各一行）。
+- 视口 ≤ 720px 时 session 卡片单列（head / summary / actions / meta 各一行）。
 - 视口 > 720px 时双列（head 与 actions 同行）。
 
 **响应式手测的盲点**：
 - task #80 标"响应式 6 档手测通过"但漏掉这个 bug。原因之一：当时 container query 写错（self-target），手测在 320/375/...视口都试过但 @container 静默失败，肉眼看不出"窄屏没切单列"——卡片在桌面布局下虽然挤但勉强能读，没人意识到那是"规则没生效"。
 - 教训：CSS silent failure 比 JS 难抓得多。响应式回归不能只靠肉眼，要在 devtools 把 @media/@container 触发的 class 写到一个明显的 indicator（如 body 加个标签 "narrow-mode"），手测时直接看 indicator 是否切换，而不是看视觉效果对不对。
+
+## L38 — trace UI 是开发者工具，不该长在最终用户视野里（已删）
+
+**背景**：v3 引入 `decision_log`（L12）记录每条飞书推送的"推/吞/scheduled" 决策与 reason，原本是为了 debug "为什么这次没推"。当时同时做了两件事：
+1. **后端**：`data/push_decisions.jsonl` 写 + `/api/sessions/{sid}/decisions` endpoint
+2. **前端**：卡片底部一行虚线灰字 + 点击展开 50 条 modal
+
+**问题**：用户开源后看到真实环境的卡片，反馈"内容很杂乱"。具体几个槽点：
+- 卡片底部 `permission_mode · effort_level`（"bypassPermissions · xhigh"）是 Claude Code 内部状态名，普通用户不懂
+- `心跳 N 分钟前` 与相对时间重复，也是开发者监控视角
+- **trace 行 + modal 最严重**：内容像 `最近：14:02 ✗ policy_off · 14:00 ✗ notif_idle_dup(0.8min<15min)`，普通用户根本不知道 "policy_off / notif_idle_dup" 是什么。点开是 50 条这种行的表格，纯 debug 面板。
+
+**核心教训**：**面向开发者的可观测性工具 ≠ 面向最终用户的 UI**。哪怕同样的数据，呈现给谁、什么时候呈现，是两个完全不同的设计问题。给开发者的 jsonl + curl endpoint 是合理的；把它"顺手"渲染进最终用户的主视野，就违反了"默认隐藏专家功能"原则。
+
+**修复（L38）**：
+- 前端：删 `modal-trace` HTML、`renderTraceLine` JS、`openTraceModal/closeTraceModal/renderTraceModalBody/traceFullTime`、CSS `.push-trace/.trace-row/.trace-time/.trace-event/.trace-mark/.trace-reason/.trace-policy/.trace-body` 整组、`api.listDecisions` 调用、`grid-template-areas` 里的 `trace` 行、`recent_decisions` 字段消费。
+- 前端同时清理：删 `permission_mode · effort_level` 副元行、删"心跳 N 分钟前"、绝对+相对时间合并成"相对时间 + hover 完整"一处。
+- 后端：**保留** `decision_log.append` 写盘、`/api/sessions/{sid}/decisions` endpoint。开发者要 debug 仍能 `tail -f data/push_decisions.jsonl` 或 curl endpoint。
+- 文档：user-guide.md §五 "push trace reason 字典" 删除（reason 速查并入 §五"场景速查"的"我怀疑某条没推"段，给开发者看）。modules.md `backend.decision_log` 模块说明加 L38 备注"前端 UI 已下线"。
+
+**判断准则（给未来）**：要不要把一个数据放在卡片首屏？三问：
+1. **新用户看到能理解吗**？不能 → 默认隐藏
+2. **看到能 actionable 吗**（看到后能/需要做什么）？看不出能做啥 → 默认隐藏
+3. **不看会错过关键信息吗**？不会 → 默认隐藏
+
+trace 三问全 No。permission_mode / effort_level 同样三问全 No。心跳时间同样 No（relTime 已够）。**默认隐藏不等于删除**——后端数据照写，开发者另有路径（jsonl + endpoint）。这是"两个用户群"思维：最终用户的 UI 极简、开发者的可观测性走旁路。
+
+**反例（不该这么改）**：
+- ~~在配置里加 `display.show_trace` 开关默认 off~~：增加配置复杂度，YAGNI。开发者要看直接 curl。
+- ~~把 trace 行折进"详情抽屉"~~：drawer 里塞这种 debug 内容仍然误导（用户点开是想看"这个 session 在干啥"，不是"为什么这条没推"）。
+
+**用户层面**：
+- 硬刷页面（cmd+shift+R）即生效。
+- 卡片现在只剩：状态 / 紧急徽 / 静音按钮 / 终端按钮 / 摘要 / cwd + 一处时间。
+- 开发者 debug 推送：`tail -f data/push_decisions.jsonl` 或 `curl /api/sessions/<sid>/decisions`。
 

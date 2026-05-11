@@ -19,7 +19,7 @@ claude-notify 把所有 Claude Code 进程的 hook 事件聚合起来：
 
 ![dashboard](docs/assets/dashboard.png)
 
-> 4 个 session 同时跑：等输入 + 🔥 指令选择徽 + ⏱ 13min 红色紧急度 / 运行中 / 回合结束 + 紧急度徽 / 项目分组路径 / 右侧记事本。截图数据为演示用，启动后看到的是你自己的 session。
+> 4 个 session 同时跑：等输入 + 🔥 指令选择徽 + ⏱ 13min 红色紧急度 / 运行中 / 回合结束 + 紧急度徽 / 项目分组路径 / 右侧记事本。卡片极简，只显示状态机里有意义的信息；开发者要 debug 推送决策走 `data/push_decisions.jsonl`（见末段）。
 
 ## 快速开始
 
@@ -107,12 +107,13 @@ dashboard ⚙ → 配置面板里有 LLM 段。三种 provider 选一：
 | → 终端 focus | session 详情抽屉 | 一键唤起对应终端（基于 tty 记录） |
 | ⏱ 紧急度徽 | 自动出现 | idle/waiting/suspect 状态卡片按等待时长显示浅黄/橙/红 |
 | 🔥 指令选择·待响应 | 自动出现 | Claude 列菜单等你选择（"❯ 1. xxx"），bypass dup 立即推送 |
-| trace 决策 | 卡片底部虚线行点开 | 每次推/吞 50 条历史 + reason 字典，debug 漏推/错推 |
 | 📝 记事本 | 右侧面板 | 800ms 自动存盘 + 多窗口同步，记 TODO / 调试线索 |
 | 视图切换 | topbar 列表/按项目 | 5+ 项目同时跑用「按项目」分组 |
 | 全局免打扰 | ⚙ → 免打扰时段 | 跨午夜支持 / 仅工作日 / 穿透白名单 |
 
-完整操作语义（状态机 / 推送规则 / 别名 / 记事本 / trace reason 字典） → [docs/user-guide.md](docs/user-guide.md)
+完整操作语义（状态机 / 推送规则 / 别名 / 记事本） → [docs/user-guide.md](docs/user-guide.md)
+
+> 开发者 debug 推送决策（"为什么这条推了 / 没推"）：后端仍在 `data/push_decisions.jsonl` 写决策日志，可 `curl http://127.0.0.1:8787/api/sessions/<sid>/decisions` 读，或直接 `tail -f` 文件。dashboard 之前的 trace UI 已下线（对最终用户是噪音）。
 
 ## 推送策略
 
