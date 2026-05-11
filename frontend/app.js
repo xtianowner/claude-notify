@@ -473,6 +473,11 @@ function sessionCardHTML(s) {
   // L26（Round 7·A）：紧急度徽章（仅 idle/waiting/suspect 且 age ≥ 2min）
   const urgencyHtml = urgencyBadge(status, s.age_seconds);
 
+  // R11：菜单 prompt 紧急徽（Claude 正在等用户做菜单选择）
+  const menuBadgeHtml = s.menu_detected === true
+    ? `<span class="urgency-badge urgency-menu" title="Claude 等你做选择">🔥 指令选择·待响应</span>`
+    : "";
+
   const metaLeftBits = [s.cwd_short, s.permission_mode, s.effort_level]
     .filter(Boolean).map(escapeHtml).join(" · ");
   const heartbeatBit = s.last_heartbeat_ts
@@ -500,6 +505,7 @@ function sessionCardHTML(s) {
         <span class="name" title="${escapeHtml(sid)}">${name}</span>
         <button class="alias-edit" data-sid="${escapeHtml(sid)}" type="button" title="起别名/备注" aria-label="起别名">✎</button>
         <span class="${statusBadgeClass(status)}">${escapeHtml(statusLabel(status))}</span>
+        ${menuBadgeHtml}
         ${mutedBadge}
       </div>
       <div class="item-actions">${urgencyHtml}${muteBtnHtml}${focusBtnHtml}</div>

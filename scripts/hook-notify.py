@@ -13,6 +13,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone, timedelta
@@ -22,6 +23,29 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 EVENTS_PATH = DATA_DIR / "events.jsonl"
 BACKEND_URL = os.environ.get("CLAUDE_NOTIFY_URL", "http://127.0.0.1:8787/api/event")
+
+# R11 Bug B：菜单类 Notification（select prompt / Type something）是"真等输入"
+# 不能被 idle_dup 阈值吞。检测后给 evt.raw.menu_detected=True，
+# notify_filter._idle_reminder_decision 看到该标记直接 bypass dup。
+# 正则不强求行首（transcript JSONL 一行一 record，菜单文本里换行是 \n 字面）
+MENU_PROMPT_RE = re.compile(r"❯\s*\d+\.|Type something")
+
+
+def _detect_menu_prompt(transcript_path: str) -> bool:
+    """读 transcript 末 20 行整行子串匹配菜单 prompt（R11 主线版）。
+
+    JSONL 的 escape 换行（"\\n"）原样保留即可——MENU_PROMPT_RE 不要求行首锚定，
+    `❯ 1.` / `Type something` 在 escape 字串里仍能命中。失败一律 False。
+    """
+    if not transcript_path:
+        return False
+    try:
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()[-20:]
+        joined = "".join(lines)
+        return bool(MENU_PROMPT_RE.search(joined))
+    except Exception:
+        return False
 
 
 def now_iso() -> str:
@@ -88,6 +112,14 @@ def main() -> int:
         "reason": payload.get("reason"),
         "raw": payload,
     }
+
+    # R11 Bug B：Notification 事件检测菜单 prompt，标 raw.menu_detected
+    # 让后端 notify_filter bypass idle_dup（菜单是真等输入，不是 Stop 后副本）
+    if event_name == "Notification":
+        if _detect_menu_prompt(evt.get("transcript_path") or ""):
+            if not isinstance(evt.get("raw"), dict):
+                evt["raw"] = {}
+            evt["raw"]["menu_detected"] = True
 
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)

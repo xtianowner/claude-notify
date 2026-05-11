@@ -1,7 +1,7 @@
 <!-- purpose: 设计教训记录 — 删除/否定一个设计前先写一段简要总结，避免后续重复犯错 -->
 
 创建时间: 2026-05-09 16:25:00
-更新时间: 2026-05-11 10:30:00
+更新时间: 2026-05-11 11:00:00
 
 # 设计教训
 
@@ -974,3 +974,159 @@ _REMINDER_REASON_RE = re.compile(r"^notif_idle_reminder_(\d+)_at_([\d.]+)min$")
 **未来留白**：
 - 真出现多用户场景时再回头补乐观锁——届时 backend 不再是 single-process，需要的不只是 version 还有 etag / locking server，跟当前架构差距大，不预先抽象。
 - 是否给状态行加"远程刚被改过"的灰字提示（用户在 dirty 时收到 WS 时）：**留白**，先看真实使用反馈是否需要。
+
+---
+
+## L32 — active_window ≤ dead_threshold 边缘 bug：dead 判定永远触发不了（已修）
+
+**修改时间**：2026-05-11
+
+**否定方案**：`liveness_watcher` 用一组**互相独立、默认值碰巧重合**的阈值：
+- `active_window_minutes` 默认 30：`event_store.list_sessions` 用它过滤"窗口内有事件的 session"
+- `dead_threshold_minutes` 默认 30：session transcript 静默超过此阈值才升 `dead`
+
+两个默认值同为 30，看起来语义独立，但在判定链路上**直接重叠**——一旦 session 静默到 30 分钟，先被 `list_sessions` 过滤掉，根本进不了 `liveness_watcher` 的 dead 判定循环。
+
+**为什么不行**：
+1. **死循环不可达**——dead 判定路径形如 `for s in list_sessions(active_window=30): if silence(s) > dead_threshold(30): mark_dead(s)`。`silence(s) > 30` 的 session 必然不在 `list_sessions` 返回里，逻辑层面 `mark_dead` 永远走不到。
+2. **症状隐蔽**——从 trace 上看 session 卡在 `status=suspect` + 心跳 31min+，UI 显示"已 31 分钟无活动"但永远不升 dead。日志里也看不到"dead 判定被跳过"，因为根本没进循环。Round 10 用户体感是"dead 这个状态我从来没见过"。
+3. **默认值耦合是隐式合约**——两个配置项分别有合理默认值，但合在一起就坏。代码里没有任何注释 / 断言提醒它们必须满足 `active_window > dead_threshold + buffer`。
+
+**替代方案（已实施）**：active_window 动态默认 = `max(60, dead_threshold * 2)`。
+- `liveness_watcher.py` 加 `_read_raw()` 区分"用户在 config.json 显式写了 active_window_minutes"还是"走 DEFAULTS 合并出来的 30"。
+- 用户显式写了 → 尊重用户设定（即使会触发同样的 bug，也是用户自己的选择，但 dashboard 仍能看到）。
+- 用户没写 → 默认 `max(60, dead*2)`：dead=30 时 active_window=60，保证至少有 30 分钟的"判定窗口"。
+
+**保留的部分**：`dead_threshold_minutes` 配置项不动；`active_window_minutes` 仍允许显式覆盖。语义"两个独立配置项"对外保持不变，只是默认值算法改了。
+
+**核心教训**：
+1. **语义相关的阈值需要显式不变量声明**——`active_window` 是"我会去看这个 session 多久前的事件"，`dead_threshold` 是"我多久判它死"。不变量是 `active_window ≥ dead_threshold + buffer`，否则 dead 判定不可达。代码层面应该有 assert 或 startup 检查；docs 层面应该写明这个约束。未来加新窗口 / 新阈值时，先把所有"窗口对阈值"的不变量列出来再编默认值。
+2. **DEFAULTS 合并破坏"用户显式 vs 系统默认"区分**——`config.load()` 把 DEFAULTS 和用户 config.json 合并成一个 dict 后，下游代码 `cfg.get("k") or fallback` 永远拿不到 None，无法识别"用户没设这个项"。需要的话必须直接读 `_read_raw()` 原始 dict。这是配置层的通用陷阱。
+3. **"默认值碰巧相等"是最难发现的 bug**——两个配置项独立写时各自合理，组合起来就坏。code review 时无法靠"读一处看不出问题"识别；必须做"所有相关阈值的相互关系矩阵"才能发现。
+
+**未来留白**：
+- 是否给 `_read_raw()` 增加更通用的"未显式配置"探测（用 sentinel `_UNSET` 替代 dict 合并），让所有"想知道用户设没设"的代码点都用同一套接口：**留白**，目前只有 active_window 一处需要，等第二处出现再统一抽象。
+- 是否在 backend 启动时做"阈值不变量检查"（如 `active_window < dead_threshold` 时打 warning）：**留白**，先看是否还有别的阈值对暴露类似问题再统一加。
+
+---
+
+## L33 — 阈值不能脱离信号源识别：菜单 prompt 要先识别再 bypass（已实施）
+
+**修改时间**：2026-05-11
+
+**否定方案**：用户希望"Claude 列菜单等用户选（`❯ 1. xxx`）→ 立即飞书提醒"。第一反应是**直接缩 `notif_idle_dup` 阈值**：把"距上一次 Stop 5 分钟内的 idle prompt 副本被吞"改成 2 分钟，让菜单提示能更快推送出去。
+
+**为什么不行**：
+1. **菜单 prompt 不是唯一的 idle Notification 源**——Claude Code 的 `Notification` hook 在多种场景触发：菜单选择、回合心跳、tool 提示、空回合 idle 等。`notif_idle_dup` 之所以默认 5 分钟，就是因为 idle Notification 在一次任务里会被反复触发（每次 Claude 写一段就发一条），不去重的话 5 分钟内能收到 10+ 条几乎一样的提示。
+2. **缩阈值是"群体改动"**——把 5min → 2min 意味着**所有** Notification 都更快放行，包括"心跳通知"。结果是：菜单场景如愿快了，但日常 idle 心跳也开始 2 分钟一弹，整体噪声反而上升。用户的诉求是"菜单要快推"，不是"所有 idle 都要快推"。
+3. **失去 dup 过滤价值**——把窗口压到 2 分钟接近无过滤；当初引入 dup 过滤就是为了避免同一回合内重复打扰，缩到 2min 等于半废这个机制。
+
+**替代方案（已实施）**：先识别"真等用户输入"的菜单信号，再让它走 bypass 通道。
+- `hook-notify.py` 加 `_detect_menu_prompt(transcript_path)`：读 transcript 末 20 行，子串匹配 `❯\s*\d+\.|Type something`，命中 → `evt.raw.menu_detected=true`
+- `notify_filter._idle_reminder_decision` 首位加 menu bypass：`if evt.raw.get("menu_detected"): return True, "menu_detected_bypass_dup"`
+- 普通 Notification 仍按 `notif_idle_dup` 5min 走 dup（实际本轮调成与 reminder 阈值同步），噪声不变
+
+**保留的部分**：
+- `notif_idle_dup` 阈值机制不动（语义"普通 idle 心跳的去重窗口"）
+- `notif_idle_reminder_minutes` 数组机制不动（语义"按累积等待时长升级"）
+- 菜单识别只在 hook 侧打 flag，filter 侧只读 flag 不重新检测——职责分离
+
+**核心教训**：
+1. **当一个通道既有"真等用户"又有"心跳"时，先做信号源分类再调阈值**——所有"调阈值缓解某场景"的提案，先问"这个场景的事件是不是和其它场景同源"。如果同源，就要先做识别再做差异化处理，不能直接缩阈值。
+2. **bypass 优于阈值压缩**——阈值是统计学口径（"大多数情况下 X 分钟够了"），bypass 是确定性口径（"这条事件就是我要的，不参与去重"）。识别准确时 bypass 永远优于阈值；识别不准时阈值兜底。
+3. **识别成本应该花在 hook 侧而非 filter 侧**——hook 拿到原始 transcript，做一次子串匹配几乎零成本；filter 侧拿到的是规范化后的 evt，重新去读 transcript 是耦合污染。把"识别"作为 evt 的元数据字段是更干净的分层。
+
+**未来留白**：
+- transcript JSONL 的菜单文本是 escape 字符串（`\n` 是字面 `\n` 不是真换行），`re.MULTILINE` 锚定不可用。如果未来要识别更复杂的 prompt 模式（如"按 y 确认"、"Choose an option:"），仍优先子串匹配，不要走多行正则。
+- 当前菜单识别只在 hook 触发时做一次（事件驱动）；若未来 Claude Code 改成"菜单显示后但不发 Notification"的模式，需要补 transcript watcher 主动扫描。目前没必要。
+
+---
+
+## L34 — 阈值 [15, 45] 节奏选定：避免"刚走开冲杯咖啡就被叫回"（已确认）
+
+**修改时间**：2026-05-11
+
+**否定方案候选**：
+- A) `[5, 10]`（R7 旧节奏）—— 5min 二次提醒 + 10min 最终提醒
+- B) `[10, 30]` —— 中庸方案
+- C) `[10, 60]` —— 长尾覆盖 AFK
+- D) `[15, 45]` —— 用户最终选定
+
+**为什么旧 `[5, 10]` 不行**：
+1. **微中断成本高**——R7 节奏下用户反馈"我刚去倒杯咖啡，5 分钟后第二次提醒就来了，10 分钟后第三次又来了，连续被三条飞书追着"。短任务的"已完成"提示和"还在等你"提醒之间间隔过短，体感是"刚回完一句话还没消化呢"。
+2. **不匹配真实 AFK 场景**——典型离桌行为是"接个水/上个厕所/拿快递"（2-10 分钟）或"开会/午饭/小睡"（30-60 分钟）。`[5, 10]` 落在第一档的尾巴，正好覆盖"我准备回去看"的窗口，刚要回来就被提醒，等于"白叫"。
+3. **不匹配菜单 bypass 机制**——L33 的菜单识别已经让"真要立即处理"的 prompt 走 bypass 通道，普通 idle 提醒不再承担"快速响应"的职责，可以放慢。
+
+**B / C 为什么也不选**：
+- B `[10, 30]` 一档勉强够离桌缓冲，但 30min 最终提醒卡在"dead 判定也是 30min"的边界（参考 L32），容易让用户分不清"是 reminder 还是 dead"。
+- C `[10, 60]` 第一档 10min 仍偏短，60min 太长——超过 30min 大多数情况已经升 dead 或被用户主动关掉 session，最终提醒就推不到了。
+
+**替代方案（已实施）**：`notif_idle_reminder_minutes = [15, 45]`
+- 15min 二次提醒：覆盖"短任务后离桌一会"，避免微中断
+- 45min 最终提醒：覆盖"开会/午饭/拿快递"的典型 AFK 场景，且远离 dead 边界（30min）
+- 配合 L33 菜单 bypass：真"等用户输入"的菜单场景从第 0 分钟就立即推，不受 reminder 节奏影响
+
+**保留的部分**：
+- 3 次硬上限不变（L22）：第 1 次 = 立即（Stop 完成）、第 2 次 = 15min、第 3 次 = 45min，之后永远不再推
+- 反向兜底机制不变：用户可在 `config.json` 显式改回 `[5, 10]` 或自定义任意数组
+
+**核心教训**：
+1. **提醒节奏要按"用户离桌典型时长"而非"我担心他错过"设定**——担心错过是工具方视角；用户视角是"打扰我多少次合理"。15/45 的间隔承认了"用户有权离桌 45 分钟"，工具不该每 5 分钟刷一次存在感。
+2. **配对系统的阈值要协调**——L32 已经让 dead=30min 是个稳定的状态切换边界；reminder 阈值不应跨过 dead 边界（30→45 才是合理顺序）。否则会出现"已推 reminder #2 / 此时 session 也判 dead"的语义重叠。
+3. **节奏调整不能孤立做，必须和信号源识别一起做**——本轮 [5,10]→[15,45] 之所以可行，前提是 L33 已经让"真急的事"走 bypass，普通 reminder 才有资格放慢。若没有 bypass，单纯放慢 reminder 会真错过菜单场景。
+
+**未来留白**：
+- 若用户反馈"菜单出来后 15min 才二次提醒太慢"：单独给菜单场景做"加速 reminder"——`menu_detected=true` 的 session 用独立的 `[5, 15]` reminder 数组，与 idle_dup bypass 配合实现"菜单从第 0 分钟就紧急"。当前不预先抽象，等用户反馈触发。
+- 是否给 reminder 阈值加"自适应"（首次 [5,10] 试推几次，用户响应慢就拉长到 [15,45]）：**留白**，自适应需要"用户响应"信号源，目前 dashboard 没记录"用户什么时候点开 session"。
+
+---
+
+## L35 — UI 紧急徽不引入新 status enum：派生 UI hint 字段 vs 状态机字段（已确认）
+
+**修改时间**：2026-05-11
+
+**否定方案候选**：
+- A) 新增 status enum `awaiting_select`（菜单等待中）—— 走完整状态机
+- B) 仅加 UI 紧急徽（`menu_detected: bool` 派生字段）—— 不动状态机
+- C) 不改 UI，只动飞书推送（菜单时改文案）—— 缺 dashboard 反馈
+
+**为什么 A 不可行**：
+1. **status enum 是状态机核心字段**——`status: running | idle | waiting | suspect | ended | dead` 涉及：
+   - `derive_status()`：根据事件序列计算（7+ 处分支）
+   - `list_sessions` 排序权重：waiting > suspect > idle > running > ended > dead（每次新加 enum 要重排权重）
+   - 飞书消息文案分支：每个 status 有独立的 emoji / 模板
+   - dashboard 卡片颜色 / 排序 / 过滤 chips：每个 status 对应一组 UI 元素
+   - 紧急度徽（L26）按 status 决定阈值表
+2. **awaiting_select 不是新状态而是 idle 的子类**——菜单出来时 session 本质上还是 idle（Claude 回完一段、等用户）。强行加一个并列 enum 会让 `idle vs awaiting_select` 的边界模糊（菜单出来但用户也可能不点选直接发新消息，那它该转回 idle 还是停在 awaiting_select？又要加一组转换规则）。
+3. **新增 enum 是滚雪球改动**——加完 status 还要补：派生函数、排序权重、飞书模板分支、徽章配色、过滤 chip、状态语义文档（user-guide §一）、状态转换图。每处都是潜在 bug 点，且没一个是用户真要的。
+
+**为什么 C 不够**：
+- 缺 dashboard 反馈：用户开 dashboard 想"扫一眼看哪个 session 在等我"，没视觉差异就看不出
+- 飞书消息文案变化是事后的（要等推送），不是实时的（菜单一出就该看到）
+
+**替代方案（已实施）**：B - 加派生 UI hint 字段 `menu_detected: bool`，不动状态机。
+- `event_store.list_sessions` 在派生 session 摘要时加 `menu_detected` 字段：
+  - 见到 `Notification` 且 `raw.menu_detected=true` → 置 `true`
+  - 见到 `Stop` → 清零（菜单已被新事件取代）
+  - 见到 `SubagentStop` → 不清零（子 agent 完成不代表主菜单消失）
+- 前端 `app.js` `renderSessionRow` 加紧急徽 HTML：`menu_detected=true` 时在状态徽旁加 🔥 "指令选择·待响应"
+- 前端 `styles.css` 加 `.urgency-badge.urgency-menu` + 1.8s pulse 动画 + `prefers-reduced-motion` 守约（无障碍）
+- 复用既有 `--c-suspect-soft/solid` token，不引入新色板
+
+**保留的部分**：
+- status 状态机不动，所有既有逻辑（排序权重、消息模板、过滤）零影响
+- 紧急徽（L26）继续按 status + age 算法生效，菜单徽与紧急徽**并存**（菜单徽显眼，紧急徽显时长）
+- `menu_detected` 字段是派生的，不存盘——重启 backend 后从 events 重新派生
+
+**核心教训**：
+1. **新增 UI 视觉差异时先评估是不是状态机层面的事**——判断标准：
+   - 影响排序 / 过滤 / 持久化逻辑 → 状态机字段（status enum）
+   - 仅影响视觉表现（颜色/图标/动画） → 派生 UI hint 字段（bool / enum）
+   - 当前菜单场景属于后者：菜单出来 = "提醒用户看一眼"，但 session 本质生命周期没变。
+2. **派生字段比 enum 扩展便宜一个数量级**——加 `menu_detected: bool` 涉及 1 个派生函数 + 1 处 UI 渲染 + 1 处 CSS；加 `awaiting_select` enum 涉及 7+ 处状态机协调。同样的用户价值，成本差 7×。
+3. **派生 = 单一职责**——`menu_detected` 只回答"现在 session 卡片要不要显示菜单徽"，不参与排序、不参与推送决策、不进飞书消息。语义边界极小，未来想砍也容易（删 3 行代码）。
+
+**未来留白**：
+- 若未来发现"菜单徽 + 紧急徽并存视觉太挤"，可以让菜单徽**替换**紧急徽（同位置渲染，菜单优先）。当前两个徽是不同语义不重叠，先并存看用户反馈。
+- 若未来要在飞书消息也加菜单标识（如"📋 task · 等你选"），那时是消息模板分支的事，不需要回头改 status enum——继续走"派生字段进消息"的路径。
+- 是否给菜单徽加"已等 X 分钟"细节（类比紧急徽）：**留白**，先看用户实际使用反馈是否需要时长信息。

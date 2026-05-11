@@ -100,9 +100,16 @@ async def watch_loop(on_event: OnEvent, interval_seconds: int = 30):
         try:
             await asyncio.sleep(interval_seconds)
             cfg = cfg_mod.load()
-            active_window = int(cfg.get("active_window_minutes") or 30)
             timeout_min = int(cfg.get("timeout_minutes") or 5)
             dead_threshold_min = int(cfg.get("dead_threshold_minutes") or 30)
+            # R11 Bug A fix：当 active_window == dead_threshold 时，静默 30min 的 session 刚
+            # 好被 list_sessions 过滤掉，永远进不来 dead/suspect 判定循环（用户截图心跳
+            # 31min 没动但仍是 suspect 的根因）。仅当用户没显式配置时走动态默认
+            # max(60, dead*2)，保证 dead 判定窗口必然覆盖。
+            # 直接读 raw config 区分"用户显式 vs DEFAULTS 合并值"
+            _raw = cfg_mod._read_raw()
+            _user_active = _raw.get("active_window_minutes")
+            active_window = int(_user_active) if isinstance(_user_active, (int, float)) else max(60, dead_threshold_min * 2)
             per_state_cfg = cfg.get("liveness_per_state_timeout") or {}
             sessions = event_store.list_sessions(active_window_minutes=active_window)
             now = time.time()

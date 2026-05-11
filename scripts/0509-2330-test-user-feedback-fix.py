@@ -10,12 +10,15 @@ from backend.notify_filter import _stop_decision, _notification_decision, DEFAUL
 
 
 def test_l22_3cap_idle_reminders():
-    """L22：默认配置 [5, 10] —— 5min 后第 1 次 reminder，10min 后第 2 次，之后永远吞"""
+    """L22：测试 3 次推送节奏（5min/10min 阈值）。R11 起默认改为 [15,45]，
+    本测试显式设 [5,10] 验证节奏机制本身，不依赖默认值。"""
     from backend import idle_reminder
     sid = "test-l22-3cap"
     idle_reminder.reset(sid)
 
-    cfg = {"notify_filter": dict(DEFAULT_FILTER_CFG)}
+    cfg_filter = dict(DEFAULT_FILTER_CFG)
+    cfg_filter["notif_idle_reminder_minutes"] = [5, 10]
+    cfg = {"notify_filter": cfg_filter}
     base = time.time()
 
     # 60s 后 idle prompt → gap=1min < 5min → 吞，count 仍 0
@@ -60,7 +63,10 @@ def test_l22_reset_on_new_stop_push():
     assert idle_reminder.get_count(sid) == 0
 
     # reset 后又来 idle prompt → 视为第 1 次 reminder candidate
-    cfg = {"notify_filter": dict(DEFAULT_FILTER_CFG)}
+    # 显式设 [5,10] 让 5.5min 触发 reminder 1（R11 默认改为 [15,45]）
+    cfg_filter = dict(DEFAULT_FILTER_CFG)
+    cfg_filter["notif_idle_reminder_minutes"] = [5, 10]
+    cfg = {"notify_filter": cfg_filter}
     evt = {"event": "Notification", "session_id": sid, "message": "Claude is waiting for your input"}
     ok, r = _notification_decision(evt, {"last_stop_pushed_unix": time.time() - 330}, cfg)
     assert ok and "notif_idle_reminder_1" in r, f"reset 后应能推 reason={r}"

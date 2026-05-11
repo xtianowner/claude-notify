@@ -525,6 +525,7 @@ def list_sessions(active_window_minutes: int = 30,
                 "_last_stop_unix": 0.0,
                 "_last_stop_ts": "",
                 "_last_stop_event_type": "",  # Stop / SubagentStop
+                "menu_detected": False,  # R11：最近一次 Notification 是否在菜单 prompt 上
             }
             sessions[sid] = s
         ev_name = evt.get("event") or ""
@@ -580,11 +581,15 @@ def list_sessions(active_window_minutes: int = 30,
         if evt.get("event") == "Notification":
             s["_last_notification_msg"] = evt.get("message") or ""
             s["_last_notification_unix"] = parse_iso(evt.get("ts", ""))
+            # R11：菜单 prompt 探测（backend hook 在 raw.menu_detected 打标），冒泡到 session level
+            _raw = evt.get("raw") or {}
+            s["menu_detected"] = bool(isinstance(_raw, dict) and _raw.get("menu_detected"))
         if evt.get("event") == "Stop":
             s["_last_stop_assistant"] = evt.get("last_assistant_message") or ""
             s["_last_stop_unix"] = parse_iso(evt.get("ts", ""))
             s["_last_stop_ts"] = evt.get("ts") or ""
             s["_last_stop_event_type"] = "Stop"
+            s["menu_detected"] = False  # 回合结束 → 清菜单标记
         if evt.get("event") == "SubagentStop":
             # 子 agent 完成也算一次回合结束，可作为兜底来源（但只在没有 Stop 时填充）
             if evt.get("last_assistant_message") and not s.get("_last_stop_ts"):

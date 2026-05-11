@@ -3,7 +3,7 @@
 # modules
 
 创建时间: 2026-05-08 20:29:45
-更新时间: 2026-05-11 10:30:00
+更新时间: 2026-05-11 11:00:00
 
 ## backend.config
 - 输入：磁盘 `data/config.json`，运行时 patch dict
@@ -20,6 +20,7 @@
 - 复用入口：
   - `event_store.append_event(evt)` 跨进程安全 append（hot 文件）
   - `event_store.list_sessions(active_window_minutes, include_archive=False)` 返回带 status 的 session 列表
+    - **R11 派生字段 `menu_detected: bool`（L35）**：Notification + `raw.menu_detected=true` → true；Stop → 清零；SubagentStop → 不清。属"UI hint 字段"语义，不是 status 状态机字段。
   - `event_store.read_events_for(session_id, limit, include_archive=False)` 按 session 过滤事件
   - `event_store.normalize_incoming(payload)` 把 hook payload 规范化
   - `event_store.archive_if_needed()` 触发滚动归档（启动时调用；返回 stats）
@@ -45,7 +46,7 @@
 - 复用入口：`await feishu.send_event(evt)` / `await feishu.send_test()`
 - 节流：SubagentStop 默认 30s 同 session 合并；Notification/Stop 不节流；Heartbeat 不推
 
-## backend.liveness_watcher（v2 替代 timeout_watcher，L09 升级到分状态阈值）
+## backend.liveness_watcher（v2 替代 timeout_watcher，L09 升级到分状态阈值，L32 修 active_window 边缘 bug）
 - 输入：`watch_loop(callback, interval_seconds)` + 配置阈值
 - 输出：
   - PID 失活 + transcript stale → append `SessionDead`
@@ -55,6 +56,8 @@
   - `PreToolUse` → 15 分钟（长 tool 容忍）+ transcript mtime ≤ 60s 视为活，跳过报警
   - `PostToolUse / Heartbeat / SessionStart / 其它` → 10 分钟
   - `liveness_per_state_timeout.enabled=False` → 退化到旧 `timeout_minutes` 一刀切（kill switch）
+- **active_window（L32 修复）**：`list_sessions` 过滤窗口动态默认 `max(60, dead_threshold * 2)`，避免与 dead_threshold 默认 30 重合导致 dead 判定永远不可达；用 `_read_raw()` 区分用户显式 vs DEFAULTS 合并值
+- 不变量：`active_window_minutes ≥ dead_threshold_minutes + buffer`（buffer ≥ 30），否则 dead 判定路径死循环不可达
 - 依赖：backend.config + backend.event_store（读取 `last_event_kind` 字段）
 - 复用入口：`asyncio.create_task(liveness_watcher.watch_loop(on_event))`
 
@@ -86,6 +89,8 @@
      - 命中过期项时调 `cfg.clear_session_mute(sid)` best-effort 清理
   2. **L15 `_quiet_hours_check`**：命中全局静音时段 → drop（passthrough 白名单除外）
   3. 事件类型分发：always_true / always_false / Notification dedupe（L05/L08）/ Stop 复合判别（L11）
+- **R11 阈值调整**：`notif_idle_reminder_minutes` 默认 `[5, 10]` → `[15, 45]`（L34）；用户可显式覆盖
+- **R11 menu bypass（L33）**：`_idle_reminder_decision` 首位检查 `evt.raw.menu_detected`，命中 → `(True, "menu_detected_bypass_dup")` 直接放行，绕过 `notif_idle_dup` 窗口
 - 配置入口：`notify_filter` 字段 + `session_mutes` 字段 + `quiet_hours` 字段
 - 复用入口：`notify_filter.should_notify(evt, summary, cfg, log_trace=True) -> (ok, reason)`
 
@@ -135,6 +140,7 @@
 ## scripts.hook-notify
 - 入口：被 Claude Code 调起，stdin = JSON
 - 行为：写本地 jsonl（兜底）+ 异步 POST 到后端
+- **R11 菜单识别（L33）**：`_detect_menu_prompt(transcript_path)` 读 transcript 末 20 行，子串匹配 `❯\s*\d+\.|Type something`，命中 → 在 evt 上挂 `raw.menu_detected=true`。filter 侧据此走 bypass 通道（不重新读 transcript，职责分离）
 - 依赖：纯标准库 + system `curl`（保证 Claude 启动期可用）
 - 复用入口：`scripts/hook-notify.py [--heartbeat]`
 

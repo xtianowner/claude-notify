@@ -53,8 +53,8 @@ DEFAULT_FILTER_CFG = {
     "stop_min_gap_after_notification_min": 5,
     "stop_short_summary_grace_min": 8,
     "stop_sensitivity": "normal",
-    # L22：每个任务最多 3 次推送（任务完成 + 5min + 10min）
-    "notif_idle_reminder_minutes": [5, 10],
+    # L22：每个任务最多 3 次推送（任务完成 + 15min + 45min） — Round 11 放宽（之前 [5,10] 太骚扰）
+    "notif_idle_reminder_minutes": [15, 45],
     # 兼容字段（已废弃，仅当 notif_idle_reminder_minutes 被显式设为 [] 时才走 strict 模式）
     "notif_suppress_after_stop_min": 3,
     "notif_filler_phrases": list(DEFAULT_FILLER_PHRASES),
@@ -205,11 +205,16 @@ def _idle_reminder_decision(
     """L22：idle prompt 来时按 reminder 计数 + gap 阈值决定推/吞。
 
     规则：
+    - R11 Bug B：raw.menu_detected=True → bypass dup（菜单是真等输入，必须推）
     - reminder_minutes 列表为空 → 严格 1 次模式（永远吞副本，等同 L21）
     - 已发 reminder 数 >= len(reminder_minutes) → 达到上限，吞
     - 未达上限 + gap >= reminder_minutes[count] → 推（mark_sent）
     - 未达上限但 gap 不够 → 吞（等下一次 idle prompt 来再判）
     """
+    # R11 Bug B：菜单选择是真等输入，bypass dup 过滤
+    if (evt.get("raw") or {}).get("menu_detected") is True:
+        return True, "menu_detected_bypass_dup"
+
     sid = (evt.get("session_id") or "").strip()
     reminder_minutes = fcfg.get("notif_idle_reminder_minutes")
     if not isinstance(reminder_minutes, (list, tuple)):

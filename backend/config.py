@@ -54,9 +54,9 @@ DEFAULT_NOTIFY_FILTER = {
     #   3. Stop 后 M 分钟用户还无反应 → idle reminder 最后一次
     # `notif_idle_reminder_minutes`：每次 idle reminder 距 Stop push 的最小 gap。
     #   [] = 严格 1 次（只推完成那次，类似 L21）
-    #   [5, 10] = 默认 2 次提醒（在 5min 和 10min 阈值后 各推 1 次）
+    #   [15, 45] = 默认 2 次提醒（在 15min 和 45min 阈值后 各推 1 次） — Round 11 放宽
     # 下一次新 Stop push → 重置该 sid 的 reminder 计数
-    "notif_idle_reminder_minutes": [5, 10],
+    "notif_idle_reminder_minutes": [15, 45],
     # 兼容字段（已废弃，保留是为了用户配置回退；新代码不读）
     "notif_dedup_until_next_stop": True,
     "notif_suppress_after_stop_min": 3,

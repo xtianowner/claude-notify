@@ -1876,3 +1876,28 @@ main {
     transition: none;
   }
 }
+
+/* ───────── R11：菜单 prompt 紧急徽（Claude 等用户做菜单选择） ───────── */
+.urgency-badge.urgency-menu {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: var(--c-suspect-soft);
+  color: var(--c-suspect-solid);
+  border: 1px solid color-mix(in srgb, var(--c-suspect-solid) 35%, transparent);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  white-space: nowrap;
+  flex-shrink: 0;
+  animation: urgency-pulse 1800ms ease-in-out infinite;
+}
+@keyframes urgency-pulse {
+  0%, 100% { transform: scale(1); }
+  50%      { transform: scale(1.05); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .urgency-badge.urgency-menu { animation: none; }
+}
