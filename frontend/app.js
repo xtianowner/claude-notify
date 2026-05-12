@@ -50,6 +50,7 @@ const state = {
   viewMode: loadViewMode(),                   // L24：列表 / 按项目
   collapsedGroups: loadCollapsedGroups(),     // L24：折叠的 cwd_short 集合
   setupHealth: null,                          // L27：仅在 0 sessions 时拉一次，作首次接入引导
+  _lastPushTs: "",                            // L42 / R17：最后收到的 push_event ts（ISO），重连补发用
 };
 
 // status 排序权重：值越小越靠前
@@ -1351,8 +1352,10 @@ function onHashChange() {
 function onWsEnvelope(env) {
   if (!env || typeof env !== "object") return;
   if (env.type === "notes_updated") { onNotesWS(env); return; }
-  // L41 / R16：后端决定推送 → 弹浏览器桌面通知（飞书与否独立）
+  // L41 / R16 + L42 / R17：后端决定推送 → 弹浏览器桌面通知（飞书与否独立）
+  // 记 lastPushTs 给 WS 重连补发用；notifyOnPush 内部按 (sid,ev_type,ts) dedupe 防补发重复弹
   if (env.type === "push_event") {
+    if (env.ts && env.ts > state._lastPushTs) state._lastPushTs = env.ts;
     notifyOnPush(env, () => state.config || {});
     return;
   }
@@ -1699,5 +1702,9 @@ setInterval(renderSnoozeBadge, 60 * 1000);
   // L41 / R16：浏览器桌面通知授权条带
   notifyBindBar(state.config || {});
   notifyUpdateBar(state.config || {});
-  connectWS({ onEvent: onWsEnvelope, onStatus: setWsStatus });
+  connectWS({
+    onEvent: onWsEnvelope,
+    onStatus: setWsStatus,
+    getLastPushTs: () => state._lastPushTs || "",
+  });
 })();

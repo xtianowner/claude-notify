@@ -53,7 +53,9 @@ export const api = {
 };
 
 // WebSocket：自动 5s 重连，回调收到完整 envelope
-export function connectWS({ onEvent, onStatus }) {
+// L42 / R17：getLastPushTs 可选，重连时把最后收到的 push_event ts 写到 query，
+// 后端按 ring buffer 补发漏掉的 push_event（覆盖 Chrome Memory Saver / 网络抖动）。
+export function connectWS({ onEvent, onStatus, getLastPushTs }) {
   let ws = null;
   let stopped = false;
   let retryTimer = null;
@@ -63,7 +65,9 @@ export function connectWS({ onEvent, onStatus }) {
   function open() {
     if (stopped) return;
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
-    const url = `${proto}://${window.location.host}/ws`;
+    const lastTs = (typeof getLastPushTs === "function") ? (getLastPushTs() || "") : "";
+    const qs = lastTs ? `?since_ts=${encodeURIComponent(lastTs)}` : "";
+    const url = `${proto}://${window.location.host}/ws${qs}`;
     setStatus("connecting");
     try {
       ws = new WebSocket(url);

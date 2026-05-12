@@ -82,6 +82,12 @@
 - L12：每个推 / 不推决策点（`policy_off` / `silence-scheduled` / `merged` / `merged_all_filtered`）调 `_trace(...)` 写 `decision_log`
 - **L41 / R16 push listener**：`set_push_listener(cb)` 由 `app.py:lifespan` 注入；dispatcher 5 个调 feishu 的位置前都先 `_emit_browser_push(evt, reason)` 给 WS 广播 `push_event`。listener 自带 `_globally_silenced(cfg)` 判断（muted / snooze_until 时不广播）。渠道解耦：feishu channel off 时仍广播给 browser，反之亦然。
 
+## backend.app — PushBuffer + WS resume（L42 / R17 新增）
+- 类 `PushBuffer`：环形缓冲存最近 60s 内的 `push_event` payload，cap 200；GC 按 `_unix` 字段（time.time() 写入）滚出；`since_iso(iso) → list` 返回严格大于 since_unix 的条目；`parse_iso` 失败回退 0.0 时直接返 `[]`（防伪 since_ts 灌历史）
+- `_on_push_for_browser`：每次广播前同步 `push_buffer.add(payload_with_unix)` + 写 `clients=N` 诊断日志，再 strip `_unix` 后 `hub.broadcast`
+- WS endpoint `/ws`：接受 `?since_ts=<ISO>` query；握手后从 buffer replay missed；客户端不带 since_ts 时不灌历史（保持原行为）
+- 测试：`PushBuffer` 单元 5 case + GC 通过；e2e 4 连接场景（无 since / past since / future since / garbage since）
+
 ## backend.notify_filter
 - 职责：should_notify 入口，做"哪些事件该推 / 该吞"的纯计算判定（不调 LLM）
 - 调用方：notify_policy.submit / _wait_and_send 在 immediate / silence-then 路径前都调一次
@@ -154,11 +160,11 @@
 ## frontend (vanilla SPA)
 - 入口：`frontend/index.html`，由后端 StaticFiles 挂载
 - 模块：
-  - `api.js` — REST + WebSocket 客户端
+  - `api.js` — REST + WebSocket 客户端。L42 / R17：`connectWS` 接受 `getLastPushTs` 回调，重连时把 `lastPushTs` 编码进 `?since_ts=` query 让后端补发漏的 push_event
   - `format.js` — 时间相对化、状态徽章颜色映射；`stripMd` 卡片摘要清理 markdown 控制符
-  - `app.js` — 主控制器（session 网格 / 抽屉 / 配置弹窗 / 测试按钮）
+  - `app.js` — 主控制器（session 网格 / 抽屉 / 配置弹窗 / 测试按钮）。L42 / R17：`state._lastPushTs` 在 `onWsEnvelope` 收到 push_event 时单调更新；`connectWS` 调用注入 `getLastPushTs`
   - `notes.js` — 记事本面板（L28/L29/L31）
-  - **`notify.js`（L41 / R16）— 浏览器桌面通知**：监听 WS `push_event` → 调 Notification API；顶部"启用桌面通知"条带管理 permission 授权；channel 开关跟随 `state.config.push_channels.browser`
+  - **`notify.js`（L41 / R16，L42 / R17 加固）— 浏览器桌面通知**：监听 WS `push_event` → 调 Notification API；顶部"启用桌面通知"条带管理 permission 授权；channel 开关跟随 `state.config.push_channels.browser`。L42 / R17：tag 改 `sid|ev_type|ts` 让多事件能堆栈（而非互相覆盖）；`(sid,ev_type,ts)` LRU dedupe Set（200 条）防 WS 补发重弹；入口 `console.info("[notify] push_event recv", {...})` + skip 原因日志（用户复现"飞书有浏览器没"时打开 console 立即可定位）
   - `styles.css` — 单文件样式
 - L38（2026-05-11）：卡片底部 trace 行 + modal 已删除（开发者 debug 工具，对最终用户是噪音）。后端 `data/push_decisions.jsonl` 仍写，`/api/sessions/{sid}/decisions` 仍可 curl。
 - 不引入任何 npm 依赖

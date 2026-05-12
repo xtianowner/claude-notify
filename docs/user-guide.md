@@ -44,6 +44,16 @@ dashboard ⋯ → 配置 → 最顶部 **推送渠道** 两个独立 checkbox：
 
 > 浏览器通知不响声音（设计如此）。需要声音请用飞书。
 
+### 浏览器通知不稳？复现时先看 console（L42 / R17）
+
+打开 dashboard 的 Devtools → Console，触发"测试推送"：
+
+- **没看 `[notify] push_event recv`** → 前端没收到，再看 backend 终端 `push_event broadcast clients=N`：`clients=0` 说明你这个 tab 当时没接上 WS（被 Chrome Memory Saver 休眠了 / 刚刷新 / 还在重连）→ 切到前台让它重连，最近 60s 内的事件会自动补发
+- **看到 `[notify] push_event recv` 但屏幕没弹** → 紧跟一行 `skip: ...`：`channel off` / `permission = denied` / `dup`（dup 是重连补发去重，正常）→ 各自按 README 故障排查段处理
+- **没 skip 但没弹** → 100% 系统层吞了，按上面 macOS 系统通知 / 勿扰检查
+
+**已知限制**：60s 是后端 ring buffer 上限。超过 60s 的丢失场景（dashboard 关 1 小时再开）由飞书兜底，浏览器通道不补发更久前的事件。
+
 ---
 
 ## 一、6 种 session 状态

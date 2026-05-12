@@ -2,6 +2,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -55,6 +57,48 @@ class WSHub:
 hub = WSHub()
 
 
+class PushBuffer:
+    """L42 / R17：最近 N 秒的 push_event 环形缓冲，用于 WS 断线重连补发。
+
+    - 每条 payload 落库时打上 `_unix` 字段；超过 retention 的旧条目滚出
+    - since_ts (ISO) 给定时返回严格大于该 ts 的条目（前端 lastPushTs 之后的）
+    - 客户端连接时不灌历史（since 空 → 不补发）；只有重连且明示 since_ts 才走补发
+    - feishu 是兜底通道；这里只保 ~60s，足以覆盖 Chrome Memory Saver / 网络抖动
+    """
+
+    def __init__(self, retention_seconds: float = 60.0, cap: int = 200) -> None:
+        self.retention = retention_seconds
+        self.items: deque[dict[str, Any]] = deque(maxlen=cap)
+        self._lock = asyncio.Lock()
+
+    async def add(self, payload: dict[str, Any]) -> None:
+        async with self._lock:
+            self.items.append(payload)
+            self._gc_unlocked()
+
+    async def since_iso(self, since_iso: str) -> list[dict[str, Any]]:
+        if not since_iso:
+            return []
+        try:
+            since_unix = event_store.parse_iso(since_iso)
+        except Exception:
+            return []
+        # parse_iso 解析失败时返回 0.0；不可信 since_ts 不要回放整个 buffer
+        if since_unix <= 0:
+            return []
+        async with self._lock:
+            self._gc_unlocked()
+            return [it for it in self.items if it.get("_unix", 0.0) > since_unix]
+
+    def _gc_unlocked(self) -> None:
+        cutoff = time.time() - self.retention
+        while self.items and self.items[0].get("_unix", 0.0) < cutoff:
+            self.items.popleft()
+
+
+push_buffer = PushBuffer()
+
+
 def _strip_internal(s: dict[str, Any]) -> dict[str, Any]:
     s.pop("suspect_pushed_for_unix", None)
     s.pop("dead_pushed_for_unix", None)
@@ -79,7 +123,10 @@ async def _on_watcher_event(evt: dict[str, Any]):
 
 async def _on_push_for_browser(evt: dict[str, Any], reason: str):
     """notify_policy dispatcher 决定推送时调（飞书开关无关）。
-    给 dashboard 广播一条 push_event，前端按 push_channels.browser 决定是否弹 toast。"""
+    给 dashboard 广播一条 push_event，前端按 push_channels.browser 决定是否弹 toast。
+
+    L42 / R17：同步写 push_buffer 供 WS 断线重连补发；info 日志记录当前 WS clients 数量。
+    """
     sid = evt.get("session_id") or ""
     summary = _session_summary(sid) if sid else None
     title = (summary or {}).get("alias") or sid[:8] if sid else "claude-notify"
@@ -88,16 +135,23 @@ async def _on_push_for_browser(evt: dict[str, Any], reason: str):
         or (summary or {}).get("last_assistant_message") \
         or evt.get("message") \
         or ""
-    await hub.broadcast({
+    ts = evt.get("ts") or event_store.now_iso()
+    payload = {
         "type": "push_event",
         "session_id": sid,
         "event_type": evt.get("event") or "",
         "reason": reason,
         "title": title,
         "body": (body or "")[:200],
-        "ts": evt.get("ts") or "",
+        "ts": ts,
         "status": (summary or {}).get("status") or "",
-    })
+        "_unix": time.time(),  # ring buffer GC 用，broadcast 前 strip
+    }
+    await push_buffer.add(dict(payload))
+    log.info("push_event broadcast clients=%d sid=%s ev=%s reason=%s",
+             len(hub.clients), sid[:8], payload["event_type"], reason)
+    payload.pop("_unix", None)
+    await hub.broadcast(payload)
 
 
 @asynccontextmanager
@@ -598,9 +652,23 @@ def health_setup():
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
+    since_ts = (ws.query_params.get("since_ts") or "").strip()
     await hub.add(ws)
     try:
         await ws.send_text(json.dumps({"type": "hello", "ts": event_store.now_iso()}))
+        # L42 / R17：断线重连补发 —— 客户端把 lastPushTs 写在 since_ts 上，
+        # 我们回放 ring buffer 中 ts > since_ts 的 push_event。
+        # ring buffer 只留 ~60s，过窗的丢失场景由飞书兜底。
+        if since_ts:
+            try:
+                missed = await push_buffer.since_iso(since_ts)
+                for m in missed:
+                    out = {k: v for k, v in m.items() if not k.startswith("_")}
+                    await ws.send_text(json.dumps(out, ensure_ascii=False))
+                if missed:
+                    log.info("ws resume: replayed %d push_event since=%s", len(missed), since_ts)
+            except Exception:
+                log.exception("ws resume failed since=%s", since_ts)
         while True:
             try:
                 await asyncio.wait_for(ws.receive_text(), timeout=30.0)
