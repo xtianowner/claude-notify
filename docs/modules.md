@@ -145,6 +145,10 @@
 ## backend.app
 - 入口：`python -m backend.app`（uvicorn 127.0.0.1:8787）
 - 路由：见 `docs/plan/0508-2029-design.md §3.2`；v10 新增 `GET /api/notes` / `PUT /api/notes`，PUT 成功后 `await ws_hub.broadcast({"type": "notes_updated", ...})`
+- L49 / R24 入参校验加固：
+  - `POST /api/event`：必须是 JSON dict 且带 `session_id`（B1），非法 JSON 返 400 而非 500（B2）
+  - `POST /api/config`：非法 JSON 返 400；`tab_reuse_mode` 走白名单
+  - `GET /api/health/setup` `hooks_expected` 列表 7 项（与 `scripts/install-hooks.py:EVENTS_NORMAL` 同步，B3）
 - 依赖：fastapi + uvicorn + 上述 4 个模块
 
 ## scripts.hook-notify
@@ -166,7 +170,7 @@
 - 模块：
   - `api.js` — REST + WebSocket 客户端。L42 / R17：`connectWS` 接受 `getLastPushTs` 回调，重连时把 `lastPushTs` 编码进 `?since_ts=` query 让后端补发漏的 push_event
   - `format.js` — 时间相对化、状态徽章颜色映射；`stripMd` 卡片摘要清理 markdown 控制符
-  - `app.js` — 主控制器（session 网格 / 抽屉 / 配置弹窗 / 测试按钮）。L42 / R17：`state._lastPushTs` 在 `onWsEnvelope` 收到 push_event 时单调更新；`connectWS` 调用注入 `getLastPushTs`。L45 / R20+R22：BroadcastChannel `claude-notify-tab` + 250ms PING_FOCUS/PONG 仲裁，飞书 `#s=<sid>` 链接复用已有 dashboard tab；按 `config.tab_reuse_mode` 分支：`focus_old`（默认，新 tab `#tab-auto` 自动消失提示）/ `user_choice`（新 tab `#tab-takeover` 两按钮）；mode 缓存在 `localStorage.cn.tabReuseMode`，loadConfig 完成时回写真值。L46 / R21：visibilitychange→visible 时立即 `loadSessions()` 修后台节流导致的 stale state；L48 / R23：`onHashChange` + 仲裁同 hash 路径都 await `loadSessions()` 再 openDrawer，确保通知/链接跳转打开 drawer 用最新状态
+  - `app.js` — 主控制器（session 网格 / 抽屉 / 配置弹窗 / 测试按钮）。L42 / R17：`state._lastPushTs` 在 `onWsEnvelope` 收到 push_event 时单调更新；`connectWS` 调用注入 `getLastPushTs`。L45 / R20+R22：BroadcastChannel `claude-notify-tab` + 250ms PING_FOCUS/PONG 仲裁，飞书 `#s=<sid>` 链接复用已有 dashboard tab；按 `config.tab_reuse_mode` 分支：`focus_old`（默认，新 tab `#tab-auto` 自动消失提示）/ `user_choice`（新 tab `#tab-takeover` 两按钮）；mode 缓存在 `localStorage.cn.tabReuseMode`，loadConfig 完成时回写真值。L46 / R21：visibilitychange→visible 时立即 `loadSessions()` 修后台节流导致的 stale state；L48 / R23：`onHashChange` + 仲裁同 hash 路径都 await `loadSessions()` 再 openDrawer，确保通知/链接跳转打开 drawer 用最新状态；L49 / R24·B6：`loadSessions` 加 module-level `_loadSessionsInflight` promise，多触发源并发时复用同一 fetch（visibility + hashchange + 兜底定时 + WS upsert fallback 叠加时只发 1 次）
   - `notes.js` — 记事本面板（L28/L29/L31）
   - **`notify.js`（L41 / R16，L42 / R17 加固）— 浏览器桌面通知**：监听 WS `push_event` → 调 Notification API；顶部"启用桌面通知"条带管理 permission 授权；channel 开关跟随 `state.config.push_channels.browser`。L42 / R17：tag 改 `sid|ev_type|ts` 让多事件能堆栈（而非互相覆盖）；`(sid,ev_type,ts)` LRU dedupe Set（200 条）防 WS 补发重弹；入口 `console.info("[notify] push_event recv", {...})` + skip 原因日志（用户复现"飞书有浏览器没"时打开 console 立即可定位）
   - `styles.css` — 单文件样式
