@@ -12,6 +12,20 @@ import { initNotes, onNotesEvent as onNotesWS } from "./notes.js";
 // L24（Round 6·B）：viewMode + collapsedGroups 持久化在浏览器
 const LS_VIEW_MODE = "cn.viewMode";          // "list" | "grouped"
 const LS_COLLAPSED = "cn.collapsedGroups";   // JSON array of cwd_short
+// R22 / L45：tab_reuse_mode 的本地缓存。后端 config 才是真实源，但仲裁要在 loadConfig 前
+// 立即决策（启动 250ms 窗口太早），所以读 cache；loadConfig 完成时回写 cache 与后端同步
+const LS_TAB_REUSE_MODE = "cn.tabReuseMode";
+const TAB_REUSE_MODE_VALUES = new Set(["focus_old", "user_choice"]);
+function loadTabReuseMode() {
+  try {
+    const v = localStorage.getItem(LS_TAB_REUSE_MODE);
+    return TAB_REUSE_MODE_VALUES.has(v) ? v : "focus_old";
+  } catch { return "focus_old"; }
+}
+function saveTabReuseMode(v) {
+  if (!TAB_REUSE_MODE_VALUES.has(v)) return;
+  try { localStorage.setItem(LS_TAB_REUSE_MODE, v); } catch { /* ignore */ }
+}
 
 function loadViewMode() {
   try {
@@ -991,6 +1005,13 @@ function fillConfigForm(cfg) {
   const ch = cfg.push_channels || {};
   if (f.elements["channel_feishu"]) f.elements["channel_feishu"].checked = ch.feishu !== false;
   if (f.elements["channel_browser"]) f.elements["channel_browser"].checked = ch.browser !== false;
+  // R22 / L45：tab 复用模式
+  const tabMode = TAB_REUSE_MODE_VALUES.has(cfg.tab_reuse_mode) ? cfg.tab_reuse_mode : "focus_old";
+  const tabRadios = f.elements["tab_reuse_mode"];
+  if (tabRadios) {
+    const list = tabRadios.length ? Array.from(tabRadios) : [tabRadios];
+    list.forEach(r => { r.checked = (r.value === tabMode); });
+  }
   f.elements["feishu_webhook"].value = cfg.feishu_webhook || "";
   f.elements["timeout_minutes"].value = cfg.timeout_minutes ?? 5;
   f.elements["dead_threshold_minutes"].value = cfg.dead_threshold_minutes ?? 30;
@@ -1091,11 +1112,21 @@ function readConfigForm() {
     weekdays_only: f.elements["qh_weekdays_only"] ? f.elements["qh_weekdays_only"].checked : false,
   };
 
+  // R22 / L45：读 radio 当前选中
+  let tab_reuse_mode = "focus_old";
+  const tabRadios = f.elements["tab_reuse_mode"];
+  if (tabRadios) {
+    const list = tabRadios.length ? Array.from(tabRadios) : [tabRadios];
+    const checked = list.find(r => r.checked);
+    if (checked && TAB_REUSE_MODE_VALUES.has(checked.value)) tab_reuse_mode = checked.value;
+  }
+
   return {
     push_channels: {
       feishu: f.elements["channel_feishu"] ? f.elements["channel_feishu"].checked : true,
       browser: f.elements["channel_browser"] ? f.elements["channel_browser"].checked : true,
     },
+    tab_reuse_mode,
     feishu_webhook: f.elements["feishu_webhook"].value.trim(),
     timeout_minutes: parseInt(f.elements["timeout_minutes"].value, 10) || 5,
     dead_threshold_minutes: parseInt(f.elements["dead_threshold_minutes"].value, 10) || 30,
@@ -1234,6 +1265,10 @@ async function loadConfig() {
   }
   $btnConfig.disabled = state.config == null;
   $btnConfig.title = state.config ? "" : "配置加载失败，刷新页面重试";
+  // R22 / L45：把后端权威 tab_reuse_mode 回写到 localStorage，供下次启动仲裁阶段使用
+  if (state.config && state.config.tab_reuse_mode) {
+    saveTabReuseMode(state.config.tab_reuse_mode);
+  }
   renderWebhookBadge();
   renderSnoozeBadge();
 }
@@ -1674,10 +1709,131 @@ $statusFilter.addEventListener("change", (e) => {
 // hashchange：飞书跳转过来时打开抽屉 + 高亮
 window.addEventListener("hashchange", onHashChange);
 
+// ─────────── R20 / L45：BroadcastChannel tab 复用仲裁 ───────────
+// 飞书消息 ↗ 点链接 → 浏览器开新 tab → 若已有主 dashboard tab，让主 tab 接管 focus +
+// 滚动到该 session；新 tab 显示遮罩。同源同浏览器跨 tab 通讯，不依赖 OS。
+const TAB_CHANNEL_NAME = "claude-notify-tab";
+const ARBITRATE_TIMEOUT_MS = 250;
+let _tabBC = null;
+let _tabTakenOver = false;
+
+function _initTabChannel() {
+  if (_tabBC || typeof BroadcastChannel === "undefined") return _tabBC;
+  try { _tabBC = new BroadcastChannel(TAB_CHANNEL_NAME); }
+  catch (_) { return null; }
+  _tabBC.addEventListener("message", _onTabMessage);
+  return _tabBC;
+}
+
+function _onTabMessage(e) {
+  const m = (e && e.data) || {};
+  if (_tabTakenOver) return;  // 已是遮罩状态，不响应任何 PING_FOCUS
+  if (m.type === "PING_FOCUS") {
+    try { window.focus(); } catch (_) {}
+    if (m.sid) {
+      const targetHash = `s=${encodeURIComponent(m.sid)}`;
+      if (window.location.hash !== `#${targetHash}`) {
+        try { window.location.hash = targetHash; } catch (_) {}
+      } else {
+        // hash 已是该 sid → 手动触发一次（hashchange 不会再发）
+        try { openDrawer(m.sid); } catch (_) {}
+        applyHashHighlight();
+      }
+    }
+    try { _tabBC.postMessage({ type: "PONG", sid: m.sid || "" }); } catch (_) {}
+  }
+}
+
+async function _arbitrateFocus(sid) {
+  // 广播 PING_FOCUS；ARBITRATE_TIMEOUT_MS 内收到 PONG = 已有主 tab 接管 → 自己显示遮罩
+  const bc = _initTabChannel();
+  if (!bc) return false;
+  return new Promise((resolve) => {
+    let resolved = false;
+    const onMsg = (e) => {
+      if ((e.data || {}).type === "PONG" && !resolved) {
+        resolved = true;
+        try { bc.removeEventListener("message", onMsg); } catch (_) {}
+        resolve(true);
+      }
+    };
+    bc.addEventListener("message", onMsg);
+    try { bc.postMessage({ type: "PING_FOCUS", sid }); } catch (_) {}
+    setTimeout(() => {
+      if (!resolved) {
+        try { bc.removeEventListener("message", onMsg); } catch (_) {}
+        resolve(false);
+      }
+    }, ARBITRATE_TIMEOUT_MS);
+  });
+}
+
+function _showTabTakeoverOverlay() {
+  // user_choice 模式：两按钮让用户决定
+  _tabTakenOver = true;
+  const overlay = document.getElementById("tab-takeover");
+  if (overlay) overlay.classList.remove("hidden");
+  const $close = document.getElementById("tab-takeover-close");
+  const $stay = document.getElementById("tab-takeover-stay");
+  if ($close) {
+    $close.addEventListener("click", () => {
+      try { window.close(); } catch (_) {}
+      setTimeout(() => {
+        const title = document.getElementById("tab-takeover-title");
+        const sub = document.querySelector(".tab-takeover-sub");
+        if (title) title.textContent = "浏览器拒绝自动关闭";
+        if (sub) sub.textContent = "请手动按 ⌘W / Ctrl+W 关闭此 tab。";
+      }, 80);
+    });
+  }
+  if ($stay) {
+    $stay.addEventListener("click", () => {
+      _tabTakenOver = false;
+      if (overlay) overlay.classList.add("hidden");
+      _resumeAsMainTab().catch(err => console.error("[tab] resume failed", err));
+    });
+  }
+}
+
+function _showTabAutoFaded() {
+  // R22 / focus_old 模式：显示自动消失提示。2.5s 后淡出，留空白页
+  _tabTakenOver = true;
+  const overlay = document.getElementById("tab-auto");
+  const toast = document.getElementById("tab-auto-toast");
+  if (!overlay) return;
+  overlay.classList.remove("hidden");
+  // 尝试自动关 tab（浏览器多半拒绝；失败时留空白页）
+  setTimeout(() => { try { window.close(); } catch (_) {} }, 100);
+  // 2.5s 后淡出 toast（overlay 自身仍盖着，露出底色空白）
+  setTimeout(() => { if (toast) toast.classList.add("fading"); }, 2500);
+}
+
+async function _resumeAsMainTab() {
+  await Promise.all([loadSessions(), loadConfig()]);
+  const m2 = (window.location.hash || "").match(/s=([^&]+)/);
+  if (m2) { openDrawer(decodeURIComponent(m2[1])); applyHashHighlight(); }
+  initNotes({ api, toast: showToast });
+  notifyBindBar(state.config || {});
+  notifyUpdateBar(state.config || {});
+  connectWS({
+    onEvent: onWsEnvelope,
+    onStatus: setWsStatus,
+    getLastPushTs: () => state._lastPushTs || "",
+  });
+}
+
 // 30s 刷新相对时间显示
 setInterval(renderSessions, 30 * 1000);
 // 60s 兜底拉一次权威 sessions
 setInterval(loadSessions, 60 * 1000);
+// L46 / R21：tab 切回前台立即重拉权威 sessions。
+// Chrome Memory Saver / 后台节流会冻结 JS 定时器 + 暂停 WS 接收 → 60s 兜底没跑、WS 没重连，
+// 切回时仍显示旧 summary。监听 visibilitychange 强制刷新。
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && !_tabTakenOver) {
+    loadSessions().catch(err => console.warn("[app] visibility loadSessions failed", err));
+  }
+});
 // 60s 刷新静音徽章（过期自动隐藏）
 setInterval(renderSnoozeBadge, 60 * 1000);
 
@@ -1690,11 +1846,28 @@ setInterval(renderSnoozeBadge, 60 * 1000);
     b.classList.toggle("is-active", active);
     b.setAttribute("aria-selected", active ? "true" : "false");
   });
+
+  // R20 / R22 / L45：BroadcastChannel 仲裁 — 仅当 URL 含 #s=<sid> 时启动竞争
+  // 收到 PONG 表明已有主 dashboard tab 接管。根据本地缓存 tab_reuse_mode 选遮罩样式：
+  //   - focus_old（默认）：自动消失提示，无用户操作
+  //   - user_choice：两按钮（关 / 继续在此 tab）
+  const hashMatch = (window.location.hash || "").match(/s=([^&]+)/);
+  if (hashMatch) {
+    const targetSid = decodeURIComponent(hashMatch[1]);
+    const takenOver = await _arbitrateFocus(targetSid);
+    if (takenOver) {
+      const mode = loadTabReuseMode();
+      if (mode === "user_choice") _showTabTakeoverOverlay();
+      else _showTabAutoFaded();
+      return;
+    }
+  }
+  // 自己当主 tab：注册 channel 监听后续来自其它 tab 的 PING_FOCUS
+  _initTabChannel();
+
   await Promise.all([loadSessions(), loadConfig()]);
-  // 处理 URL hash #s=<session_id>
-  const m = (window.location.hash || "").match(/s=([^&]+)/);
-  if (m) {
-    openDrawer(decodeURIComponent(m[1]));
+  if (hashMatch) {
+    openDrawer(decodeURIComponent(hashMatch[1]));
     applyHashHighlight();
   }
   // Round 10：记事本（独立模块，不阻塞 sessions 渲染）

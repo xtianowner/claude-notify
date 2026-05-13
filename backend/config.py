@@ -132,8 +132,18 @@ DEFAULT_PUSH_CHANNELS = {
     "browser": True,
 }
 
+# L45 / R22：飞书 ↗ 链接打开 dashboard 时的 tab 复用模式
+# - "focus_old"（默认）：旧 tab 强制 window.focus() 切前台 + 接管 hash/drawer；
+#                       新 tab 显示 2.5s 自动消失的提示，无需用户操作
+# - "user_choice"：新 tab 弹遮罩 + 两按钮（关闭此 tab / 仍在此 tab 加载），让用户选
+# 浏览器硬限制：脚本不能让新 tab 静默 close，也不能关用户输入 URL/点链接打开的 tab。
+# 因此"自动关旧 tab + 新 tab 接手"做不到，本配置不提供该选项。
+DEFAULT_TAB_REUSE_MODE = "focus_old"
+TAB_REUSE_MODE_VALUES = {"focus_old", "user_choice"}
+
 DEFAULTS: dict[str, Any] = {
     "push_channels": DEFAULT_PUSH_CHANNELS,
+    "tab_reuse_mode": DEFAULT_TAB_REUSE_MODE,
     "feishu_webhook": "",
     "feishu_secret": "",
     "timeout_minutes": 5,

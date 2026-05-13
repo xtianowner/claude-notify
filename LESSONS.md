@@ -1,7 +1,7 @@
 <!-- purpose: 设计教训记录 — 删除/否定一个设计前先写一段简要总结，避免后续重复犯错 -->
 
 创建时间: 2026-05-09 16:25:00
-更新时间: 2026-05-11 11:00:00
+更新时间: 2026-05-13 12:00:00
 
 # 设计教训
 
@@ -1432,3 +1432,190 @@ R16 上线浏览器桌面通知后，用户反馈"有时候只有飞书推送，
 - 重连补发：dashboard tab 后台休眠醒来后 60s 内的事件会自动补；超过 60s 的丢了，靠飞书兜底。
 - 想完全可靠：保留飞书通道。浏览器通道是"前台用 dashboard 时少切到飞书 App"的便利，不是替代品。
 
+
+---
+
+## L43 — Dashboard 状态从等输入翻不回工作中的根因 = 缺 UserPromptSubmit hook（已修）
+
+**触发症状**：Claude 弹了 Notification（dashboard 显示等你 / 🔥 请你 →），用户在终端回了消息、Claude 已经开始干活几十秒乃至几分钟，dashboard 还是等输入。直到 Claude 这一回合 Stop，状态才翻成刚完成。
+
+**根因**：
+- `scripts/install-hooks.py` 的 `EVENTS_NORMAL` 只注册了 `[Notification, Stop, SubagentStop, SessionStart, SessionEnd]` + 一条心跳 `PreToolUse`。**没注册 UserPromptSubmit**。
+- 用户回车的瞬间，Claude Code 触发 `UserPromptSubmit`（**没 hook，丢了**）+ 后续 `PreToolUse`（**hook 了但 backend `NON_STATUS_EVENTS` 屏蔽，不写 `last_event`**）。
+- 后端 `derive_status` 只看 `last_event`：`Notification → waiting`，`Stop → idle`，其他 → `running`。从 `Notification` 翻回 `running` 唯一的事件源就是 "既不是 NON_STATUS、又不是 Notification` 副本" 的事件 —— 而这正是 UserPromptSubmit 该担当的角色。
+- 在用户终端回复 → Claude 这一回合 Stop 之间这段时间（Claude 跑长任务时可达数分钟），dashboard 状态完全错位，并且 R11 的 🔥 紧急徽继续显示，让用户以为还在等自己。
+
+**修法**：
+- 一行：`EVENTS_NORMAL` 追加 `"UserPromptSubmit"`。
+- 后端不用改：`sources._normalize_claude_code` 是泛化的，事件名原样透传；`event_store.append` 里 UserPromptSubmit 既不在 NON_STATUS 也不是 Notification → 自动写入 `last_event` → `derive_status` 走 default `running` 分支。
+- `notify_policy` 未在 config 显式列出的事件类型默认 off（`backend/notify_policy.py:114`），不会带来飞书/浏览器推送骚扰。
+
+**教训本质**：
+1. **状态机的事件白名单要和 hook 注册同源**：后端状态机定义了 "哪些事件改 status"，但 hook 注册侧没保证 "这些事件都注册"。两份配置漂移的代价就是状态翻不回来这种安静 bug。修正后将哪些事件需要注册明确写到 install-hooks 注释里。
+2. **"心跳事件不改 status" 这条规则在缺位 UserPromptSubmit 时坏掉**：`PreToolUse` 被列 NON_STATUS 是对的（避免 Heartbeat 把 idle 翻回 running 的副作用），但前提是用户开始回复有更早的事件源（UserPromptSubmit）。一旦缺位，`PreToolUse` 反成唯一可用信号，被屏蔽就没了下家。**任何过滤式白名单都必须有兜底事件**。
+3. **dashboard 状态的语义本质是用户对屏幕的认知期望**：飞书走事件即推送管道不需要状态推断，所以这个 bug 在飞书侧不可见。dashboard 是状态可视化窗口，状态机必须覆盖所有可能的语义跃迁。
+
+**修法只改一行（`scripts/install-hooks.py`），但要求用户重装 hook**：`python scripts/install-hooks.py`。重装幂等，已有 5 个事件不会被破坏。重装后用户回复 Claude 的瞬间 dashboard 应该立刻翻工作中。
+
+**验证**：
+- 重装后看 `~/.claude/settings.json` 的 `hooks` 段有 6 个 event（5 + UserPromptSubmit + PreToolUse heartbeat）。
+- 在 Claude 回话时观察 dashboard：Notification 弹 → 终端回车 → dashboard 应在 ~1s 内从等你翻工作中。
+- 后端 log: `tail -f data/events.jsonl` 应看到 `UserPromptSubmit` 事件被持久化。
+
+
+---
+
+## L44 — 状态机静态字符串 vs 活动证据：AskUserQuestion 答题后 dashboard 翻不回（已修）
+
+**触发症状**（两个面向）：
+1. Notification（AskUserQuestion / 权限请求 y/n）弹出 → 用户做完决策 → Claude 继续跑（一连串 Heartbeat）→ dashboard 永远停在 "等输入 / 🔥 请你 →"。终端早已在工作，但 web 不更新。
+2. waiting/idle 卡超时被 watcher 报 `TimeoutSuspect` → status=suspect → 之后 Claude 又开始跑（Heartbeat 涌入）→ dashboard 永远停在 "疑似挂起 N 分钟前"。
+
+**根因**：
+- `derive_status` 只看 `last_event` 字符串：`Notification → waiting`、`TimeoutSuspect → suspect`、`Stop → idle`。
+- `NON_STATUS_EVENTS = {Heartbeat, PreToolUse, SessionStart}` —— 这些事件不更新 `last_event`。
+- 设计意图（L20 时期）是"心跳不应把 idle 翻 running"；但**前提是 idle 之后没有用户输入**。一旦用户回话后 Claude 真在跑，Heartbeat 是**最早能感知**的事件源（也是大多数情况下**唯一的事件源**，因为 AskUserQuestion 答题不走 UserPromptSubmit、权限请求 y/n 也不走）。
+- R18 加 `UserPromptSubmit` hook 只能覆盖"用户在终端打字回复"那一类场景；**菜单选择 / y/n 授权 / AskUserQuestion 这些结构化问询，答案走 tool_result 通道，hook 层完全收不到任何事件**。
+
+**修法**：把"活动证据胜过静态等待状态"原则内化到 `derive_status`：
+1. `derive_status(arg)` 改签名接受 session dict 或 last_event 字符串（兼容旧测试）
+2. session dict 维护 `_last_status_event_unix`：每次 `last_event` 被赋值时同步刷新
+3. 当 `last_event ∈ {Notification, TimeoutSuspect}` 时多判一步：
+   - `last_event_unix > _last_status_event_unix + 1s`（1s 容差防止同秒抖动误翻）
+   - 即 status 事件之后还有 NON_STATUS 活动 → 翻 `running`
+4. 旧行为完全保留：last_event 是 Stop/SessionEnd/SessionDead 等仍按 string 派生；旧字符串签名调用 fallback 到无活动证据的简化逻辑
+
+**为什么不动 `NON_STATUS_EVENTS`**：把 Heartbeat / PreToolUse 加入 status 事件会破坏 L20 防御（Stop 后 PreToolUse 不应翻 idle→running，因为那时确实没有用户输入）。**修法的关键洞察**：是不是该翻 running，**取决于翻之前的 last_event 语义**，不是"事件类型本身能不能改状态"。所以应该在 `derive_status` 派生时根据 last_event 决定是否纳入活动证据，而不是 append 时一刀切。
+
+**教训本质**：
+1. **状态机不能只看"最后一个 status 事件"**：静态等待状态（waiting / suspect）必须看后续活动证据。否则形成"单向锁"——进得去出不来。
+2. **"事件类型白名单"是个错的抽象**：`NON_STATUS_EVENTS` 试图把"哪些事件能改状态"做成全局规则，实际上**同一个事件类型在不同 last_event 下应该有不同语义**。Heartbeat 接在 Stop 之后 = 噪音（不该翻 running），接在 Notification 之后 = 真活动信号（必须翻 running）。
+3. **hook 不可达的状态转换必须有内部兜底**：AskUserQuestion / 权限请求等 Claude Code 内部结构化交互**永远收不到 hook**（Anthropic 设计如此）。任何只靠"等下一个 hook 事件"的状态机都会在这类场景下死锁。修法必须是"从已有事件流推断"（活动证据），不能依赖加 hook。
+
+**验证**：
+- 单测 7 case 全过（dict / string 兼容 / Notification+HB / TimeoutSuspect+HB / 仅 Notification 不翻 / 1s 容差 / 旧字符串签名）
+- E2E 临时 jsonl 重放 3 case（Notification+Heartbeat → running / Notification only → waiting / TimeoutSuspect+Heartbeat → running）
+
+**用户层面**：
+- 修完后 dashboard 状态翻转链路：
+  - **AskUserQuestion 弹 → 答完后 Claude 跑 → ~1s 内翻"工作中"**（靠第一条 Heartbeat 触发）
+  - **权限请求 y/n 同理**
+  - **TimeoutSuspect 之后 Claude 继续跑也会自动翻 running**（不再死锁在"疑似挂起"）
+- **必须重启 backend** 才生效：`pkill -f 'uvicorn backend.app' && python -m uvicorn backend.app:app --host 127.0.0.1 --port 8787 &`
+- 状态翻得快 = ~30s（取决于 Heartbeat 频率，即下一个 PreToolUse 触发）。极端场景：Claude 一直在 LLM 推理不调工具，那就要等到调工具或 Stop。
+
+---
+
+## L45 — 飞书链接 tab 复用：BroadcastChannel 仲裁 + 遮罩兜底（已实现）
+
+**触发**：飞书消息每条带 `↗ http://127.0.0.1:8787/#s=<sid>`，用户频繁点链接看详情 → 浏览器每次开新 tab → 几小时后 dashboard tab 爆炸 + WS 连接数膨胀 + Memory Saver 杀掉旧 tab。
+
+**根因**：浏览器对"点链接是否复用 tab"的默认行为依赖飞书链接的 `target` 属性 —— 飞书消息卡片渲染由飞书自家 webview 控制，**无法注入自定义 target**。所以"已开 dashboard 复用 tab"必须在前端代码层自己仲裁，浏览器层 / 操作系统层都没钩子。
+
+**实现**：BroadcastChannel + 250ms 仲裁窗口
+1. 飞书链接保持 `#s=<sid>`（不动 backend / feishu.py）
+2. 前端 main 启动时检查 URL 是否含 `#s=<sid>`：
+   - 是 → 创建 `BroadcastChannel("claude-notify-tab")` + 广播 `{type:"PING_FOCUS", sid}` + 等 250ms
+   - 否 → 跳过仲裁，正常加载（普通访问 dashboard 不应触发任何竞争）
+3. 已存在的主 tab 监听 channel，收到 PING_FOCUS：
+   - `window.focus()` → 浏览器尝试把后台 tab 切前台
+   - 写 hash `#s=<sid>` → 触发已有 `hashchange` listener → 打开 drawer + 滚动高亮
+   - 回 `{type:"PONG", sid}`
+4. 新 tab 250ms 内收 PONG → 已被接管 → 显示遮罩"已切换到现有 dashboard 窗口" + 「关闭此 tab」/「仍在此 tab 加载」两个按钮
+5. 没收 PONG → 自己当主 tab → 注册 channel 监听 + 正常加载（覆盖"第一次开 dashboard"和"主 tab 被 Memory Saver 杀掉后"两个场景）
+
+**关键设计决策**：
+- **只在有 hash 时仲裁**：普通用户打开 dashboard 不该触发竞争（否则多 tab 并存被强行收编反而错）。仅"带定向 sid"的访问视为飞书点击。
+- **遮罩 stay 按钮兜底**：用户故意要"在此 tab 加载"（比如想分屏看两个 session）→ stay 按钮 → 调 `_resumeAsMainTab()` 重跑一遍 loadSessions / WS / notify bar 等初始化。设计成"非破坏性"：即使误判，1 次点击就能恢复。
+- **window.close() 不抱期望**：浏览器只允许关闭脚本 `window.open()` 打开的窗口，用户点链接打开的不算。试一下，失败则把遮罩文案换成"请手动 ⌘W"。**这是浏览器层硬限制，跨 OS 一致，没解。**
+- **250ms 选型**：BroadcastChannel 同源同浏览器通信是同步级别（< 5ms RTT），250ms 给足慢机器 / debug 工具拖慢的余量；同时短到用户感知不到等待。
+
+**已知限制（全是浏览器层，OS 完全无关）**：
+1. **跨浏览器不工作**：Chrome 开了 dashboard，Safari 点飞书链接 → 各自当主 tab。同源同浏览器同 profile 才共享 BroadcastChannel。
+2. **`window.focus()` 不保证切到前台**：Chrome / Firefox 对脚本调用的 `focus()` 在某些时机会忽略（通常是非用户事件链）。但消息流"用户点链接 → 浏览器开 tab → 新 tab 脚本广播 → 主 tab 接收 + focus"在 Chrome 实测稳定。若不切，至少 hash 已改、drawer 已开，用户切回去就能看到。
+3. **Chrome Memory Saver 把后台 tab 休眠 → BroadcastChannel 也休眠**：新 tab 收不到 PONG → 自己当主 tab。结果是两个活跃 dashboard tab 并存，但每个都独立工作。这是 Memory Saver 预期，无法绕过。
+4. **多 dashboard tab 同时开（用户故意分屏）**：哪个先回 PONG 哪个赢，其它保持现状。可接受。
+
+**教训本质**：
+1. **"已存在则复用"是个看似简单实则需要 application 层协调的特性**。`<a target="_self">` 不够（target 名固定才能复用，飞书链接无法注入）；浏览器历史栈复用也不行（不同源 / 不同时间）。BroadcastChannel 是同源 tab 间协调的标准答案，但它只是**通信通道**，仲裁协议（谁先谁主、超时回退、stay 兜底）必须自己设计。
+2. **设计带超时仲裁时，永远要有"超时后降级"路径**：250ms 没收 PONG 不等于"一定没主 tab"（可能主 tab 暂时无响应 / Memory Saver 短暂唤醒延迟），但**当作没有处理**比"无限等"更稳。新 tab 自己当主 tab 是 graceful degradation，最坏结果就是双 tab 并存 —— 用户体验比"卡在加载页等永久 PONG"好太多。
+3. **不要假设浏览器允许关 tab**：`window.close()` 限制极严。所有"自动关闭"逻辑都得有"用户手动关"的退路 UI。
+
+**回归保护**：
+- puppeteer e2e 11/11（A 主 tab 接管 / B 无主 tab 单独 / C stay 按钮恢复 / D 无 hash 不触发；含 4 项核心断言 + 状态字段检查）
+- 浏览器兼容：Chrome 64+ / Firefox 38+ / Safari 15.4+ / Edge 79+（BroadcastChannel 普遍支持）
+
+**用户层面**：
+- 点飞书消息 ↗ 链接：若已开 dashboard tab → 该 tab 自动 focus + 跳到对应 session；新 tab 显示遮罩可手动关
+- 普通输入 URL 打开 dashboard：完全不触发仲裁，行为不变
+- 想强制在新 tab 加载（比如分屏看不同 session）：点遮罩里"仍在此 tab 加载"按钮
+
+---
+
+## L46 — Dashboard 显示旧 summary：tab 后台节流冻结 WS + 定时器（已修）
+
+**触发**：用户切回 dashboard tab，看到 session 卡片显示"卡 21 分钟 · 上次 Bash: grep ..." —— 那是 21 分钟前的工具调用，新任务都执行完了。后端 `/api/sessions` 返回的 status 已经是 running、last_action 是最新命令，但前端 state 卡在旧值。
+
+**根因**：
+- dashboard summary 数据流是**事件驱动**：后端收到 hook event → `_dispatch` → `hub.broadcast({type:"event", session: summary})` → 前端 `upsertSessionFromEvent` 替换 `state.sessions[idx]` → render
+- 兜底：每 60s 调一次 `loadSessions()` 重拉 `/api/sessions`，覆盖错过的更新
+- **当 tab 切到后台**：
+  - Chrome / Firefox 后台 tab 节流：`setInterval` 最低 1s 间隔（轻度），Memory Saver 重度休眠时**完全暂停 JS 定时器 + WS 接收**
+  - 60s 兜底定时器没跑、WS 缓冲的 broadcast 没派给 handler
+  - tab 切回前台，定时器恢复，但**下一次 60s 兜底要等到下一周期才触发**，期间用户看的是 stale 数据
+- 与 L42 / R17 的 push_event ring buffer 不重叠：R17 只补 `push_event`（推送通知用），不补 `type:event`（dashboard summary 用）。补全 `type:event` 也不现实（高频，且通常用户已能从 `/api/sessions` 拿到正确状态）
+
+**修法**：监听 `visibilitychange`，tab 切回 `visible` 时立刻 `loadSessions()`：
+```javascript
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && !_tabTakenOver) {
+    loadSessions().catch(err => console.warn("[app] visibility loadSessions failed", err));
+  }
+});
+```
+`_tabTakenOver` 是 R20 / L45 的遮罩状态字段 —— 遮罩态不应再发 API 请求（已被其它 tab 接管）。
+
+**教训本质**：
+1. **"事件驱动 + 定时兜底"在浏览器后台不可靠**：JS 定时器和 WS 都受后台节流影响。任何依赖周期性 polling 的设计都要补一个"用户回来"的钩子：`visibilitychange` / `focus` / `pageshow` 视场景挑。
+2. **WS resume 不等于 state 同步**：R17 加的 since_ts 补发只覆盖 push_event 一种 envelope；session summary 类的 envelope 没补就靠下一次 event 触发或 visibilitychange 拉取。
+3. **后端正确不等于前端正确**：debug 时 `curl /api/sessions` 看到的是后端实时计算的；用户 dashboard 看到的是前端 cached state。两端不一致时多半是同步缝隙问题，不是后端逻辑 bug。
+
+**回归保护**：puppeteer e2e — visibility 'visible' dispatch 触发 1 次 `/api/sessions` 拉取 ✓
+
+---
+
+## L47 — Tab 复用模式：从"强制让用户选"改"自动 focus + Settings 兜底"（R22，L45 迭代）
+
+**R20 初版反馈**：用户嫌"两按钮遮罩"增加操作复杂度且无实际价值。要求改成"识别并跳转到旧 tab"，备选"识别并关闭旧 tab + 启动新 tab"。
+
+**浏览器层硬限制（跨 OS 一致）**：
+1. **新 tab 一定会出现**：用户点链接是用户行为，浏览器必开新 tab，脚本不可阻止
+2. **脚本不能关用户输入 URL / 点链接打开的 tab**：`window.close()` 只能关脚本自己 `window.open()` 出来的窗口
+
+这两条意味着用户的两个理想方案**都不能做到 100% "无新 tab" 或 "自动关旧 tab"**。最接近的折中：
+
+- **跳到旧 tab（focus_old）**：旧 tab `window.focus()` 切前台（Chrome / Edge 多数情况下生效，user activation 通过 BroadcastChannel 短链传递）+ 接管 hash/drawer；新 tab 显示 2.5s 自动消失的提示，淡出后变白页（最接近"用户无感"）
+- **关旧 tab + 新 tab 接手**：旧 tab 不能被脚本 close，只能"自废"显示提示让用户手动关 —— 用户实际体验比"focus_old"更糟（旧 tab 还在，且写明已废，用户被迫做关 tab 操作），**所以这个模式直接砍掉**
+
+**R22 实现**：两档模式（focus_old / user_choice），Settings 切换，默认 focus_old：
+- `backend/config.py`：`DEFAULT_TAB_REUSE_MODE = "focus_old"` + 白名单 `TAB_REUSE_MODE_VALUES = {"focus_old", "user_choice"}`
+- `backend/app.py:update_config`：PUT `/api/config` 校验 `tab_reuse_mode` 白名单，非法值 400
+- `frontend/app.js`：仲裁后按 `loadTabReuseMode()` 决定遮罩；loadConfig 完成后回写 localStorage cache（首启没 cache 默认 focus_old）
+- `frontend/index.html`：Settings 弹窗加 `<fieldset id="tab-reuse-fieldset">` 两个 radio
+- `frontend/styles.css`：`.tab-auto` 全屏白页 + `.tab-auto-toast` 自动消失（fade-out 600ms）
+
+**关键设计决策**：
+1. **mode 缓存在 localStorage**：仲裁要在 main 函数最开头跑（loadConfig 之前），不能等后端 config。本地缓存兜底 + loadConfig 完成时同步真值。首启无 cache 走默认 focus_old。
+2. **focus_old 模式仍试 `window.close()`**：浏览器拒绝时 console.warn，但白页 + toast 已能让用户理解"此 tab 可关"，不会困惑
+3. **2.5s 显示 + 600ms 淡出**：足够用户瞄一眼"已跳到旧窗口"，不会久到烦人
+4. **不删 user_choice 模式**：用户偏好不同（开发场景可能就是要分屏看），保留作为 Settings 选项
+
+**教训本质**：
+1. **当浏览器/平台限制让"理想方案"做不到时，需要清楚分辨"做不到的本质"和"次优替代"**。R20 直接上"两按钮"看似稳妥，但本质上是把开发者的折中思考成本转嫁给用户。R22 改"自动 focus + 自动消失提示"才真正贴近用户原意（哪怕没法 100% "无新 tab"）
+2. **"用户选择"的 UI 模式应是兜底而非默认**：除非选项各有不可调和的 trade-off 且用户偏好真实分布是双峰的，否则强制选择 = UX 负担。R20 默认 user_choice 是错的，R22 默认 focus_old 才对
+3. **物理约束坦白比绕路"假装做到"重要**：跟用户讲清"新 tab 一定会出现 + 旧 tab 不能被关，能做的是最大化 focus 效果"，比硬上一个看似能"关 tab"实则用户被迫手动关的方案更诚实
+
+**回归保护**：puppeteer e2e 13/13
+- A（focus_old）：新 tab `.tab-auto` 显示、`.tab-takeover` 隐藏；主 tab hash + drawer 接管；toast 2.5s 后 fade
+- B（user_choice）：新 tab `.tab-takeover` 显示、`.tab-auto` 隐藏；stay 按钮恢复加载
+- C（backend API）：focus_old / user_choice 互切 OK，bogus 值返 400

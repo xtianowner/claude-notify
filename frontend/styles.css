@@ -1875,3 +1875,99 @@ main {
 @media (prefers-reduced-motion: reduce) {
   .urgency-badge.urgency-menu { animation: none; }
 }
+
+/* ───────── R20 / L45：tab 复用遮罩 ───────── */
+.tab-takeover {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in srgb, var(--c-bg, #fff) 92%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.tab-takeover.hidden { display: none; }
+.tab-takeover-card {
+  max-width: 420px;
+  width: 100%;
+  background: var(--c-card-bg, #fff);
+  border: 1px solid var(--c-border, #e1e4e8);
+  border-radius: 12px;
+  padding: 24px;
+  box-shadow: 0 12px 32px rgba(0,0,0,0.12);
+  text-align: center;
+}
+.tab-takeover-title {
+  font-size: var(--fs-lg, 16px);
+  font-weight: var(--fw-medium, 600);
+  margin-bottom: 8px;
+  color: var(--c-text, #1d2026);
+}
+.tab-takeover-sub {
+  font-size: var(--fs-sm, 13px);
+  color: var(--c-text-mute, #6a737d);
+  line-height: 1.5;
+  margin-bottom: 20px;
+}
+.tab-takeover-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+.tab-takeover-btn {
+  height: 32px;
+  padding: 0 16px;
+  border-radius: 6px;
+  border: 1px solid var(--c-border, #e1e4e8);
+  background: transparent;
+  color: var(--c-text, #1d2026);
+  font-size: var(--fs-sm, 13px);
+  cursor: pointer;
+}
+.tab-takeover-btn.primary {
+  background: var(--c-primary, #0969da);
+  color: #fff;
+  border-color: var(--c-primary, #0969da);
+}
+.tab-takeover-btn:hover { opacity: 0.85; }
+
+/* ───────── R22 / L45：focus_old 模式自动消失提示 ───────── */
+.tab-auto {
+  position: fixed;
+  inset: 0;
+  background: var(--c-bg, #fff);
+  z-index: 9999;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 80px;
+  pointer-events: none;
+}
+.tab-auto.hidden { display: none; }
+.tab-auto-toast {
+  pointer-events: auto;
+  max-width: 380px;
+  background: var(--c-card-bg, #fff);
+  border: 1px solid var(--c-border, #e1e4e8);
+  border-radius: 10px;
+  padding: 16px 20px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+  text-align: center;
+  transition: opacity 600ms ease-out;
+}
+.tab-auto-toast.fading { opacity: 0; }
+.tab-auto-title {
+  font-size: var(--fs-md, 14px);
+  font-weight: var(--fw-medium, 600);
+  margin-bottom: 4px;
+  color: var(--c-text, #1d2026);
+}
+.tab-auto-sub {
+  font-size: var(--fs-xs, 12px);
+  color: var(--c-text-mute, #6a737d);
+  line-height: 1.4;
+}

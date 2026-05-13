@@ -12,6 +12,7 @@
 - 复用入口：`from backend import config; config.load() / config.save(patch) / config.public_view(cfg)`
 - L14 per-session 静音：`set_session_mute(sid, until, scope, label)` / `clear_session_mute(sid)` / `prune_expired_session_mutes()`
   - 内部用 `_write_session_mutes` 绕过 save() 的深合并（dict set/del 语义需要整体替换）
+- L45 / R22 `tab_reuse_mode`：`DEFAULT_TAB_REUSE_MODE = "focus_old"`，白名单 `TAB_REUSE_MODE_VALUES = {"focus_old", "user_choice"}`。`update_config` 校验非法值返 400
 
 ## backend.event_store
 - 输入：`append_event(evt)` / 磁盘 `data/events.jsonl`（hot）+ `data/archive/*.jsonl.gz`（冷归档，L13）
@@ -21,6 +22,7 @@
   - `event_store.append_event(evt)` 跨进程安全 append（hot 文件）
   - `event_store.list_sessions(active_window_minutes, include_archive=False)` 返回带 status 的 session 列表
     - **R11 派生字段 `menu_detected: bool`（L35）**：Notification + `raw.menu_detected=true` → true；Stop → 清零；SubagentStop → 不清。属"UI hint 字段"语义，不是 status 状态机字段。
+  - `event_store.derive_status(s)` 派生 status。L44：接受 session dict 或旧 last_event 字符串；dict 模式应用"活动证据胜过静态等待"规则——`last_event ∈ {Notification, TimeoutSuspect}` 且 `last_event_unix > _last_status_event_unix + 1s` → 翻 `running`（覆盖 AskUserQuestion 答题 / 权限 y/n / 长任务 suspect 后继续跑等 hook 不可达场景）。`_last_status_event_unix` 在 append 写入 last_event 时同步刷新
   - `event_store.read_events_for(session_id, limit, include_archive=False)` 按 session 过滤事件
   - `event_store.normalize_incoming(payload)` 把 hook payload 规范化
   - `event_store.archive_if_needed()` 触发滚动归档（启动时调用；返回 stats）
@@ -154,7 +156,9 @@
 
 ## scripts.install-hooks
 - 入口：`python scripts/install-hooks.py [--uninstall|--dry-run]`
-- 行为：把 4 条 hook 注入 `~/.claude/settings.json`，备份原文件
+- 行为：把 7 条 hook 注入 `~/.claude/settings.json`，备份原文件
+- `EVENTS_NORMAL = [Notification, Stop, SubagentStop, SessionStart, SessionEnd, UserPromptSubmit]`（事件型）+ `PreToolUse`（heartbeat）。L43：UserPromptSubmit 覆盖"终端打字回复"的状态翻转；L44：AskUserQuestion / 权限请求 y/n 等 hook 不可达场景靠 `derive_status` 内"活动证据胜过静态等待"规则兜底翻 running
+- 幂等：按 `hook-notify.py` 关键字识别自家 hook → 已存在则更新 command，不破坏用户其它 hook
 - 依赖：标准库
 
 ## frontend (vanilla SPA)
@@ -162,7 +166,7 @@
 - 模块：
   - `api.js` — REST + WebSocket 客户端。L42 / R17：`connectWS` 接受 `getLastPushTs` 回调，重连时把 `lastPushTs` 编码进 `?since_ts=` query 让后端补发漏的 push_event
   - `format.js` — 时间相对化、状态徽章颜色映射；`stripMd` 卡片摘要清理 markdown 控制符
-  - `app.js` — 主控制器（session 网格 / 抽屉 / 配置弹窗 / 测试按钮）。L42 / R17：`state._lastPushTs` 在 `onWsEnvelope` 收到 push_event 时单调更新；`connectWS` 调用注入 `getLastPushTs`
+  - `app.js` — 主控制器（session 网格 / 抽屉 / 配置弹窗 / 测试按钮）。L42 / R17：`state._lastPushTs` 在 `onWsEnvelope` 收到 push_event 时单调更新；`connectWS` 调用注入 `getLastPushTs`。L45 / R20+R22：BroadcastChannel `claude-notify-tab` + 250ms PING_FOCUS/PONG 仲裁，飞书 `#s=<sid>` 链接复用已有 dashboard tab；按 `config.tab_reuse_mode` 分支：`focus_old`（默认，新 tab `#tab-auto` 自动消失提示）/ `user_choice`（新 tab `#tab-takeover` 两按钮）；mode 缓存在 `localStorage.cn.tabReuseMode`，loadConfig 完成时回写真值。L46 / R21：visibilitychange→visible 时立即 `loadSessions()` 修后台节流导致的 stale state
   - `notes.js` — 记事本面板（L28/L29/L31）
   - **`notify.js`（L41 / R16，L42 / R17 加固）— 浏览器桌面通知**：监听 WS `push_event` → 调 Notification API；顶部"启用桌面通知"条带管理 permission 授权；channel 开关跟随 `state.config.push_channels.browser`。L42 / R17：tag 改 `sid|ev_type|ts` 让多事件能堆栈（而非互相覆盖）；`(sid,ev_type,ts)` LRU dedupe Set（200 条）防 WS 补发重弹；入口 `console.info("[notify] push_event recv", {...})` + skip 原因日志（用户复现"飞书有浏览器没"时打开 console 立即可定位）
   - `styles.css` — 单文件样式

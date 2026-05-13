@@ -121,7 +121,7 @@ python3 scripts/install-hooks.py --uninstall  # 卸载
 
 **关于已有 hook 的冲突**：脚本只识别**自家** hook（按命令含 `hook-notify.py` 关键字判定）。你已有的其它 hook **会原样保留**，不会被删/改。每次写入前自动备份 `~/.claude/settings.json` 到 `~/.claude/settings.json.bak-<YYYYMMDD-HHMMSS>`。
 
-注册的 hook 共 6 条：`Notification` / `Stop` / `SubagentStop` / `SessionStart` / `SessionEnd`（事件型）+ `PreToolUse`（心跳型，加 `--heartbeat` 不推送）。
+注册的 hook 共 7 条：`Notification` / `Stop` / `SubagentStop` / `SessionStart` / `SessionEnd` / `UserPromptSubmit`（事件型）+ `PreToolUse`（心跳型，加 `--heartbeat` 不推送）。其中 `UserPromptSubmit` 是 dashboard 状态从"等输入"翻回"工作中"的唯一信号源 —— 缺它会导致回话后 dashboard 状态不更新（L43）。
 
 装完后任意 Claude Code 终端发一句话，dashboard 即应出现该 session 卡片。
 
@@ -155,6 +155,7 @@ dashboard ⚙ → 配置面板里有 LLM 段。三种 provider 选一：
 | 📝 记事本 | 右侧面板 | 800ms 自动存盘 + 多窗口同步，记 TODO / 调试线索 |
 | 视图切换 | topbar 列表/按项目 | 5+ 项目同时跑用「按项目」分组 |
 | 全局免打扰 | ⚙ → 免打扰时段 | 跨午夜支持 / 仅工作日 / 穿透白名单 |
+| 飞书 ↗ 链接 tab 复用 | ⚙ → 飞书 ↗ 链接 tab 复用 | 已开 dashboard 时点链接自动跳前台（默认）/ 弹两按钮让用户选（备选）—— L47 / R22 |
 
 完整操作语义（状态机 / 推送规则 / 别名 / 记事本） → [docs/user-guide.md](docs/user-guide.md)
 
@@ -250,7 +251,7 @@ rm -rf <claude-notify-repo>                    # 删 repo（含 data/）
 
 ```
    Claude Code (多 session 并行)
-        │  hooks: Notification / Stop / SubagentStop / PreToolUse(心跳) / SessionStart
+        │  hooks: Notification / Stop / SubagentStop / SessionStart / SessionEnd / UserPromptSubmit / PreToolUse(心跳)
         ▼
    scripts/hook-notify.py  ──flock──>  data/events.jsonl  (兜底，不挂)
         │  (异步 POST, fire-and-forget)

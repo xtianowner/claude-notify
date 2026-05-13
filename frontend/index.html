@@ -79,6 +79,26 @@
 
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
+  <!-- R20 / L45：tab 复用遮罩。user_choice 模式：两按钮让用户选 -->
+  <div id="tab-takeover" class="tab-takeover hidden" role="dialog" aria-modal="true" aria-labelledby="tab-takeover-title">
+    <div class="tab-takeover-card">
+      <div id="tab-takeover-title" class="tab-takeover-title">已切换到现有 dashboard 窗口</div>
+      <div class="tab-takeover-sub">飞书链接已交给已打开的 dashboard 处理；可以关闭此 tab。</div>
+      <div class="tab-takeover-actions">
+        <button id="tab-takeover-close" type="button" class="tab-takeover-btn primary">关闭此 tab</button>
+        <button id="tab-takeover-stay" type="button" class="tab-takeover-btn">仍在此 tab 加载</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- R22 / L45：focus_old 模式自动消失提示。新 tab 收 PONG 后显示 2.5s 后淡出，露出空白持久页 -->
+  <div id="tab-auto" class="tab-auto hidden" aria-live="polite">
+    <div class="tab-auto-toast" id="tab-auto-toast">
+      <div class="tab-auto-title">已切到现有 dashboard 窗口</div>
+      <div class="tab-auto-sub">飞书链接已交给已打开的 tab 处理。此 tab 可手动关闭（⌘W）。</div>
+    </div>
+  </div>
+
   <main>
     <div class="workspace">
       <section id="sessions" class="sessions-list">
@@ -167,6 +187,14 @@
           </p>
           <label class="row"><input type="checkbox" name="channel_feishu" /> 飞书 webhook 推送</label>
           <label class="row"><input type="checkbox" name="channel_browser" /> 浏览器桌面通知（需 dashboard 已打开）</label>
+        </fieldset>
+        <fieldset id="tab-reuse-fieldset">
+          <legend>飞书 ↗ 链接 tab 复用</legend>
+          <p class="muted small">
+            点飞书消息里的 dashboard 链接时，若已有 dashboard 窗口打开如何处理。浏览器一定会开新 tab、且脚本不能关用户打开的 tab —— 两种模式都是基于这两个硬限制的近似方案。
+          </p>
+          <label class="row"><input type="radio" name="tab_reuse_mode" value="focus_old" /> 自动跳到现有 dashboard（推荐）—— 旧 tab 切前台 + 接管，新 tab 显示自动消失提示后变白页</label>
+          <label class="row"><input type="radio" name="tab_reuse_mode" value="user_choice" /> 让我选 —— 新 tab 弹"关闭此 tab / 仍在此 tab 加载"两按钮</label>
         </fieldset>
         <label>
           飞书 webhook URL

@@ -17,7 +17,7 @@ from pathlib import Path
 SETTINGS = Path.home() / ".claude" / "settings.json"
 HOOK_PY = Path(__file__).resolve().parent / "hook-notify.py"
 
-EVENTS_NORMAL = ["Notification", "Stop", "SubagentStop", "SessionStart", "SessionEnd"]
+EVENTS_NORMAL = ["Notification", "Stop", "SubagentStop", "SessionStart", "SessionEnd", "UserPromptSubmit"]
 EVENT_HEARTBEAT = "PreToolUse"
 HEARTBEAT_FLAG = "--heartbeat"
 

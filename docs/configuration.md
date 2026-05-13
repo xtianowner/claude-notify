@@ -45,6 +45,16 @@
 
 > 想完全关闭飞书：建议改 `push_channels.feishu=false`（语义清晰，保留 webhook 备用）；清空 `feishu_webhook` 也能达到相同效果但语义弱（reason 会是 `no_webhook`）。
 
+### `tab_reuse_mode`（L45 / R22）
+
+飞书 ↗ 链接打开 dashboard 时的 tab 复用模式。
+
+| 字段 | 默认 | 取值 | 含义 |
+|---|---|---|---|
+| `tab_reuse_mode` | `"focus_old"` | `"focus_old"` \| `"user_choice"` | 已有 dashboard tab 打开时如何处理：`focus_old` 旧 tab 切前台 + 接管，新 tab 显示自动消失提示后变白页；`user_choice` 新 tab 弹遮罩两按钮让用户决定。详见 user-guide 飞书章节 |
+
+浏览器层硬限制（跨 OS 一致）：新 tab 一定会出现（脚本不能阻止用户点击行为）、脚本不能关用户打开的 tab（`window.close()` 仅限脚本自己 `window.open()` 出来的窗口）。所以"不出现新 tab"或"自动关旧 tab"做不到，本配置不提供。
+
 ---
 
 ## 2. 推送策略 `notify_policy`
@@ -62,6 +72,7 @@
 | `notify_policy.SessionDead` | `off` | 同上 | liveness watcher 判定会话已死。默认不推。 |
 | `notify_policy.Heartbeat` | `off` | 同上 | 心跳事件（活动信号，仅用于取消 silence 倒计时）。 |
 | `notify_policy.PreToolUse` | `off` | 同上 | 工具调用前。活动事件，会取消 silence 倒计时。 |
+| `notify_policy.UserPromptSubmit` | `off` | 同上 | 用户在终端按回车提交 prompt（dashboard 状态 waiting→running 翻转的事件源）。默认不推（避免每次回话都骚扰），但 hook 必须注册，否则状态机停在"等输入"翻不回来。详见 L43。 |
 | `notify_policy.PostToolUse` | `off` | 同上 | 工具调用后。活动事件。 |
 | `notify_policy.TestNotify` | `immediate` | 同上 | dashboard 「发送测试通知」按钮触发的事件。 |
 

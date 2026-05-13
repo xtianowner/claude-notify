@@ -535,6 +535,10 @@ async def update_config(request: Request):
         raise HTTPException(400, "config patch must be an object")
     if "feishu_webhook" in patch and isinstance(patch["feishu_webhook"], str):
         patch["feishu_webhook"] = patch["feishu_webhook"].strip()
+    # R22 / L45：tab_reuse_mode 白名单
+    if "tab_reuse_mode" in patch:
+        if patch["tab_reuse_mode"] not in cfg_mod.TAB_REUSE_MODE_VALUES:
+            raise HTTPException(400, f"tab_reuse_mode must be one of {sorted(cfg_mod.TAB_REUSE_MODE_VALUES)}")
     saved = cfg_mod.save(patch)
     return cfg_mod.public_view(saved)
 

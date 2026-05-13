@@ -173,17 +173,38 @@ def _is_idle_prompt_dup(evt: dict[str, Any], last_stop_unix: float) -> bool:
     return msg in _IDLE_PROMPT_FILLER_PHRASES
 
 
-def derive_status(last_event: str) -> str:
+def derive_status(arg: Any) -> str:
+    """派生 status。
+
+    L44：接受 session dict（推荐）或 last_event 字符串（旧签名兼容）。
+    dict 模式额外应用"活动证据胜过静态等待状态"规则：
+      - last_event ∈ {Notification, TimeoutSuspect} 时，
+        若 last_event_unix > _last_status_event_unix + 1s
+        （即状态事件之后还有 NON_STATUS 活动 Heartbeat / PreToolUse）→ 翻 running。
+    场景：AskUserQuestion 答题不走 UserPromptSubmit hook，Notification 后只有 Heartbeat
+    涌入；watcher 报 TimeoutSuspect 后 Claude 继续跑也只有 Heartbeat —— 这两类都靠活动
+    证据兜底翻 running，不依赖额外 hook 注册。
+    """
+    if isinstance(arg, dict):
+        s = arg
+        last_event = s.get("last_event") or ""
+    else:
+        s = None
+        last_event = arg or ""
+
     if last_event == "SessionEnd":
         return "ended"
     if last_event == "SessionDead":
         return "dead"
-    if last_event == "TimeoutSuspect":
-        return "suspect"
     if last_event == "Stop":
         return "idle"
-    if last_event == "Notification":
-        return "waiting"
+    if last_event in {"Notification", "TimeoutSuspect"}:
+        if s is not None:
+            last_status_ts = s.get("_last_status_event_unix") or 0.0
+            last_any_ts = s.get("last_event_unix") or 0.0
+            if last_any_ts > last_status_ts + 1.0:
+                return "running"
+        return "suspect" if last_event == "TimeoutSuspect" else "waiting"
     return "running"
 
 
@@ -526,6 +547,7 @@ def list_sessions(active_window_minutes: int = 30,
                 "_last_stop_ts": "",
                 "_last_stop_event_type": "",  # Stop / SubagentStop
                 "menu_detected": False,  # R11：最近一次 Notification 是否在菜单 prompt 上
+                "_last_status_event_unix": 0.0,  # L44：最近一次 status-changing 事件 unix ts
             }
             sessions[sid] = s
         ev_name = evt.get("event") or ""
@@ -549,9 +571,12 @@ def list_sessions(active_window_minutes: int = 30,
             is_idle_dup = False
         if ev_name and ev_name not in NON_STATUS_EVENTS and not is_idle_dup:
             s["last_event"] = ev_name
+            # L44：记录 status-changing 事件的 ts，供 derive_status 判活动证据
+            s["_last_status_event_unix"] = parse_iso(evt.get("ts", ""))
         elif s.get("last_event") is None:
             # 第一条事件如果是 NON_STATUS_EVENTS 类型（如 SessionStart），也得占个位
             s["last_event"] = ev_name
+            s["_last_status_event_unix"] = parse_iso(evt.get("ts", ""))
         if evt.get("message"):
             s["last_message"] = evt.get("message")
         if evt.get("last_assistant_message"):
@@ -658,7 +683,7 @@ def list_sessions(active_window_minutes: int = 30,
             s["task_topic_source"] = ""
         s["color_token"] = _color_token(s["session_id"])
         s["display_name"] = _display_name(s)
-        s["status"] = derive_status(s["last_event"])
+        s["status"] = derive_status(s)
         s["age_seconds"] = max(0, int(now - s["last_event_unix"]))
         s["active"] = s["age_seconds"] < active_window_minutes * 60
         s["terminal"] = s["status"] in {"ended", "dead"}
@@ -687,7 +712,8 @@ def list_sessions(active_window_minutes: int = 30,
         # 清理累积内部字段
         for k in ("_last_pretool_raw", "_last_notification_msg", "_last_notification_unix",
                   "_last_stop_assistant", "_last_stop_unix",
-                  "_last_stop_ts", "_last_stop_event_type"):
+                  "_last_stop_ts", "_last_stop_event_type",
+                  "_last_status_event_unix"):
             s.pop(k, None)
         out.append(s)
     out.sort(key=lambda x: x["last_event_unix"], reverse=True)
