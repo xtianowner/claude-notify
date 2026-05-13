@@ -1375,10 +1375,13 @@ function cssEscape(s) {
   return String(s).replace(/[^a-zA-Z0-9_-]/g, c => `\\${c}`);
 }
 
-function onHashChange() {
+async function onHashChange() {
   const m = (window.location.hash || "").match(/s=([^&]+)/);
   if (!m) return;
   const sid = decodeURIComponent(m[1]);
+  // L48 / R23：hash 跳转（飞书 ↗ 链接 / 浏览器通知点击 / 仲裁 PING_FOCUS）触发前先刷一次 sessions
+  // 避免主 tab 后台休眠导致 state.sessions stale → drawer 头部 status/alias/cwd 显示旧值
+  try { await loadSessions(); } catch (_) { /* fallback to existing state */ }
   openDrawer(sid);
   applyHashHighlight();
 }
@@ -1725,7 +1728,7 @@ function _initTabChannel() {
   return _tabBC;
 }
 
-function _onTabMessage(e) {
+async function _onTabMessage(e) {
   const m = (e && e.data) || {};
   if (_tabTakenOver) return;  // 已是遮罩状态，不响应任何 PING_FOCUS
   if (m.type === "PING_FOCUS") {
@@ -1734,8 +1737,10 @@ function _onTabMessage(e) {
       const targetHash = `s=${encodeURIComponent(m.sid)}`;
       if (window.location.hash !== `#${targetHash}`) {
         try { window.location.hash = targetHash; } catch (_) {}
+        // hashchange listener (onHashChange) 已带 L48 / R23 强制刷新逻辑
       } else {
-        // hash 已是该 sid → 手动触发一次（hashchange 不会再发）
+        // hash 已是该 sid → hashchange 不会再发，手动走一遍刷新+打开抽屉
+        try { await loadSessions(); } catch (_) {}
         try { openDrawer(m.sid); } catch (_) {}
         applyHashHighlight();
       }

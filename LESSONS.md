@@ -1,7 +1,7 @@
 <!-- purpose: 设计教训记录 — 删除/否定一个设计前先写一段简要总结，避免后续重复犯错 -->
 
 创建时间: 2026-05-09 16:25:00
-更新时间: 2026-05-13 12:00:00
+更新时间: 2026-05-13 12:30:00
 
 # 设计教训
 
@@ -1619,3 +1619,47 @@ document.addEventListener("visibilitychange", () => {
 - A（focus_old）：新 tab `.tab-auto` 显示、`.tab-takeover` 隐藏；主 tab hash + drawer 接管；toast 2.5s 后 fade
 - B（user_choice）：新 tab `.tab-takeover` 显示、`.tab-auto` 隐藏；stay 按钮恢复加载
 - C（backend API）：focus_old / user_choice 互切 OK，bogus 值返 400
+
+---
+
+## L48 — Hash 跳转打开 drawer 时强制刷新 sessions（已修）
+
+**触发**：用户点飞书 ↗ 链接或浏览器桌面通知，dashboard 打开/接管时 drawer 头部立刻显示 status badge / alias / cwd —— 这些**全部来自前端 `state.sessions.find(sid)`**。如果主 tab 后台休眠 / 节流，state.sessions 可能是几十秒到几分钟前的快照，drawer 显示就是旧值。
+
+**根因**：
+- `onHashChange` / `_onTabMessage`（主 tab 收 PING_FOCUS）原本只调 `openDrawer(sid)` + `applyHashHighlight()`，**不主动刷新 sessions**
+- `openDrawer` 内 `state.sessions.find(x => x.session_id === sid)` 用现存 state，无 fallback 拉取
+- L46 的 `visibilitychange` 监听虽然能补刷一次，但仅在 tab 真切前台时 fire；`window.focus()` 跨浏览器不保证生效；即便 fire 也是异步，drawer 已经先用旧 state 渲染完头部
+
+**修法**：把 loadSessions 内化到 hash 跳转入口，确保任何"通过通知/链接打开 drawer"的路径都先刷新：
+```javascript
+// onHashChange 改 async
+async function onHashChange() {
+  const m = (window.location.hash || "").match(/s=([^&]+)/);
+  if (!m) return;
+  const sid = decodeURIComponent(m[1]);
+  try { await loadSessions(); } catch (_) {}
+  openDrawer(sid);
+  applyHashHighlight();
+}
+// _onTabMessage 同 hash 路径（hashchange 不会再 fire）也补一次
+if (window.location.hash === `#s=...`) {
+  await loadSessions();
+  openDrawer(sid);
+}
+```
+
+**为什么不只靠 visibilitychange（L46）**：
+- `visibilitychange → visible` 是 tab 真切前台才 fire；`window.focus()` 跨浏览器不可靠
+- 即便 fire 也是异步：onHashChange 同步路径已经用旧 state 渲染完 drawer 头部
+- L48 是"用户主动跳转入口"的强约束（"我点了通知，我要看最新"），不依赖浏览器调度
+
+**教训本质**：
+1. **"用户主动行为"路径必须用最新数据**：60s 兜底 polling 适合后台监控，但用户点通知/链接的瞬间是"我要立刻知道最新状态"，绝不能用 stale state 应付。
+2. **每个"打开 drawer / 显示详情"的入口都要保证数据新鲜**：未来如果加新入口（比如键盘快捷键），统一在 openDrawer 之前 await loadSessions —— 或者更彻底，把 loadSessions 收编进 openDrawer 内（但这会让普通点卡片也多一次拉取，权衡）。
+3. **多层兜底设计要分清"主动入口"和"被动 fallback"**：visibilitychange / 60s polling 是被动 fallback，hash 跳转是主动入口。主动入口的兜底必须比被动更激进。
+
+**回归保护**：puppeteer e2e 3/3
+- A: hashchange → /api/sessions 触发 ✓
+- B: 仲裁主 tab 接管（hash 变化）→ /api/sessions 触发 ✓
+- C: 同 hash 二次 PING_FOCUS（hash 不变路径）→ /api/sessions 触发 ✓
