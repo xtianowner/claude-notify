@@ -1194,6 +1194,14 @@ main {
 @media (max-width: 480px) {
   .qh-row { grid-template-columns: 1fr 1fr; }
   .qh-row .qh-tz { grid-column: 1 / -1; }
+  /* R24 / B4 hardening：极窄屏（≤ 480px）给 topbar-actions 解开 flex-shrink:0 并允许换行，
+     防止内部 segment / pill / btn 累积宽度溢出超过视口（用户 hard rule：窄屏不变形） */
+  .topbar-actions {
+    flex-wrap: wrap;
+    min-width: 0;
+    flex-shrink: 1;
+    max-width: 100%;
+  }
 }
 
 /* notify policy 行：左右 grid，窄屏 wrap */

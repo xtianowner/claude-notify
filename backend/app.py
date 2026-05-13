@@ -195,8 +195,19 @@ app = FastAPI(title="claude-notify", lifespan=lifespan)
 
 @app.post("/api/event")
 async def post_event(request: Request):
-    raw = await request.json()
-    from_hook = bool(isinstance(raw, dict) and raw.pop("from_hook", False))
+    # R24 / L49：B1+B2 修复
+    # - 非法 JSON → 400（之前抛 500）
+    # - 必须是 dict 且带 session_id（之前空 body / 缺字段会写 session_id="unknown" 污染 events.jsonl）
+    try:
+        raw = await request.json()
+    except Exception:
+        raise HTTPException(400, "request body must be valid JSON")
+    if not isinstance(raw, dict):
+        raise HTTPException(400, "request body must be a JSON object")
+    sid = (raw.get("session_id") or "").strip() if isinstance(raw.get("session_id"), str) else raw.get("session_id")
+    if not sid:
+        raise HTTPException(400, "session_id is required")
+    from_hook = bool(raw.pop("from_hook", False))
     evt = event_store.normalize_incoming(raw)
     if not from_hook:
         event_store.append_event(evt)
@@ -530,7 +541,11 @@ def get_config():
 
 @app.post("/api/config")
 async def update_config(request: Request):
-    patch = await request.json()
+    # R24 / L49 / B2：非法 JSON → 400（之前抛 500）
+    try:
+        patch = await request.json()
+    except Exception:
+        raise HTTPException(400, "request body must be valid JSON")
     if not isinstance(patch, dict):
         raise HTTPException(400, "config patch must be an object")
     if "feishu_webhook" in patch and isinstance(patch["feishu_webhook"], str):
@@ -618,7 +633,9 @@ async def test_notify():
 def health_setup():
     cfg = cfg_mod.load()
     settings_path = Path.home() / ".claude" / "settings.json"
-    expected = ["Notification", "Stop", "SubagentStop", "PreToolUse"]
+    # R24 / B3：与 scripts/install-hooks.py 的 EVENTS_NORMAL + PreToolUse 心跳保持一致
+    expected = ["Notification", "Stop", "SubagentStop", "SessionStart", "SessionEnd",
+                "UserPromptSubmit", "PreToolUse"]
     detected: list[str] = []
     settings_exists = settings_path.exists()
     if settings_exists:
@@ -636,7 +653,8 @@ def health_setup():
                         break
         except Exception:
             log.exception("health_setup: settings.json parse failed")
-    # 至少 3/4 算装好（用户可能选择性启用）；全无 = 没装
+    # 至少 3 个核心 hook 装上算装好（用户可能选择性启用 / 老版本只装了前 4 个）
+    # 旧用户检测到 3-4/7 仍 hooks_registered=True；前端可显示"缺 N 个，重装 hook 生效完整"
     hooks_registered = len(detected) >= 3
     webhook_configured = bool((cfg.get("feishu_webhook") or "").strip())
     try:

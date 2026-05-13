@@ -1,7 +1,7 @@
 <!-- purpose: 设计教训记录 — 删除/否定一个设计前先写一段简要总结，避免后续重复犯错 -->
 
 创建时间: 2026-05-09 16:25:00
-更新时间: 2026-05-13 12:30:00
+更新时间: 2026-05-13 13:00:00
 
 # 设计教训
 
@@ -1663,3 +1663,47 @@ if (window.location.hash === `#s=...`) {
 - A: hashchange → /api/sessions 触发 ✓
 - B: 仲裁主 tab 接管（hash 变化）→ /api/sessions 触发 ✓
 - C: 同 hash 二次 PING_FOCUS（hash 不变路径）→ /api/sessions 触发 ✓
+
+---
+
+## L49 — QA 发现的 6 个 bug 批量修复（R24）
+
+QA 子 agent 全面跑了 R18-R23 + 基础回归，发现 6 个 bug（4 个功能 + 2 个 nit）。本 round 一次性修完。
+
+### B1（P1）— POST /api/event 接受空 body / 缺字段污染日志
+**位置**：`backend/app.py:196-204`
+**现象**：`curl -X POST /api/event -d '{}'` 返 200，往 events.jsonl 写入 `session_id:"unknown"` 假事件，污染 sessions 列表
+**修法**：endpoint 加 `dict` 校验 + `session_id` 必填，缺则 400
+**教训**：内部 hook 走 from_hook=True 路径，外部用户调用必须有完整字段。trust internal but validate external — 这条 endpoint 既是 hook 内部入口也是开放 HTTP，得按"开放"标准校验
+
+### B2（P2）— 非法 JSON 返 500
+**位置**：`backend/app.py:196, 533`
+**现象**：`request.json()` 抛错没捕获 → HTTP 500（应 400）
+**修法**：try/except 包 `await request.json()`，捕错 raise HTTPException(400)
+**教训**：FastAPI `request.json()` 不自动转 400，得显式 try。`/api/event` `/api/config` 两个 endpoint 都漏了
+
+### B3（P2）— `/api/health/setup` hooks_expected 漏 UserPromptSubmit
+**位置**：`backend/app.py:621`
+**现象**：R18 在 install-hooks.py 加了 UserPromptSubmit，但 health 检查仍是 4 项（Notification/Stop/SubagentStop/PreToolUse），新用户 health 报"装好"但实际缺关键 hook
+**修法**：expected 列表扩到 7 项与 install-hooks.py 一致
+**教训**：**hook 注册列表必须有单一权威源** —— scripts/install-hooks.py 改了，backend health 也得跟。可考虑后续把列表抽出来共享（但跨进程跨语言不容易，保持手动同步 + commit 注释提醒）
+
+### B4（P2）— 窄屏 ≤ 480px topbar-actions 可能 overflow
+**位置**：`frontend/styles.css` `.topbar-actions`
+**现象**：QA 环境下 320px 视口 body.scrollWidth=323，超 3px。我本地复现不出（scrollWidth=320），但 `.topbar-actions { flex-shrink: 0 }` 本身就是隐患
+**修法**：`@media (max-width: 480px)` 加 `.topbar-actions { flex-wrap: wrap; min-width: 0; flex-shrink: 1; max-width: 100%; }` 预防性 hardening
+**教训**：**`flex-shrink: 0` 是窄屏溢出的常见根因**。任何用了它的容器都该有"极窄屏解除"的 media query 兜底。用户 hard rule "窄屏不变形" 应作为所有 flex 元素的设计约束
+
+### B5（nit）— /favicon.ico 404 噪音
+**修法**：`<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,...">` 内嵌 SVG。无额外资源、无网络请求，console 干净
+**教训**：404 噪音会让真的 error log 被淹没。每个新前端项目第一天就该加 favicon
+
+### B6（nit）— loadSessions 无 dedup，并发触发 2-3 次
+**位置**：`frontend/app.js:1247`
+**现象**：visibilitychange + hashchange 同时 fire / 仲裁 PING_FOCUS 同 hash 路径 + WS upsert fallback 叠加时，最坏 3 次 `/api/sessions`（11ms 内）。当前数据量 OK 但 list_sessions 全量 jsonl 扫描成本不低
+**修法**：module-level `_loadSessionsInflight` promise，进行中的调用复用同一个 fetch，resolve 后才允许新 fetch
+**教训**：**"事件驱动 + 兜底定时 + 用户主动入口"三层触发模式天然容易并发**。任何状态拉取函数都该有 in-flight dedup（不是 debounce —— debounce 会延迟首次响应，dedup 不会）
+
+**回归保护**：
+- 后端 curl 7/7（4 个新返 400 + 2 个 regression 仍 200 + health hooks_expected 含 7 项）
+- 前端 puppeteer 4/4（favicon 0 次 404 + 三连击 1 次请求 dedup 生效 + 320px scrollW=320 + R20 仲裁回归）

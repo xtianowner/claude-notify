@@ -1244,14 +1244,24 @@ async function loadSetupHealth() {
 }
 
 // ───────────── 数据加载 ─────────────
+// R24 / B6：in-flight dedup —— 多个触发源（hashchange / visibilitychange / 60s 兜底 /
+// WS event upsert fallback）并发调用时复用同一个 fetch，避免短时间内 2-3 次重复请求。
+// 进行中时第 2 次调用返回同一 promise；resolve 后才允许新 fetch。
+let _loadSessionsInflight = null;
 async function loadSessions() {
-  try {
-    const list = await api.listSessions(true);
-    state.sessions = Array.isArray(list) ? list : [];
-    renderSessions();
-  } catch (e) {
-    $sessions.innerHTML = `<p class="empty">加载会话失败：${escapeHtml(e.message)}</p>`;
-  }
+  if (_loadSessionsInflight) return _loadSessionsInflight;
+  _loadSessionsInflight = (async () => {
+    try {
+      const list = await api.listSessions(true);
+      state.sessions = Array.isArray(list) ? list : [];
+      renderSessions();
+    } catch (e) {
+      $sessions.innerHTML = `<p class="empty">加载会话失败：${escapeHtml(e.message)}</p>`;
+    } finally {
+      _loadSessionsInflight = null;
+    }
+  })();
+  return _loadSessionsInflight;
 }
 
 async function loadConfig() {
