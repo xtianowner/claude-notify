@@ -301,11 +301,12 @@ HOST=0.0.0.0 python -m backend.app
 ## 开发
 
 ```bash
-# 跑测试套件（30+ 个测试脚本，按时间命名）
-python scripts/0511-1310-test-r12-ghost-session.py    # R12 liveness watcher
-python scripts/0511-1130-test-r11-hotfix.py           # R11 hotfix
-python scripts/0511-1047-test-round11-backend.py      # R11 menu detection
-# ... 见 scripts/ 目录
+# 历史 round 的测试脚本归档在 scripts/archive/（按时间命名 mmdd-hhmm-test-*.py）
+# 各测试对应的 round / LESSON 编号见 LESSONS.md
+python scripts/archive/0511-1310-test-r12-ghost-session.py    # R12 liveness watcher
+python scripts/archive/0511-1130-test-r11-hotfix.py           # R11 hotfix
+python scripts/archive/0511-1047-test-round11-backend.py      # R11 menu detection
+# ... 见 scripts/archive/ 目录
 ```
 
 模块化原则、设计取舍详见 [docs/modules.md](docs/modules.md) 和 [LESSONS.md](LESSONS.md)。

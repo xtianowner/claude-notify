@@ -256,7 +256,17 @@ def _format_text(evt: dict[str, Any], summary: dict[str, Any] | None, cfg: dict[
     if cwd_short:
         tail_bits.append(cwd_short)
     if sid:
-        tail_bits.append(f"↗ http://127.0.0.1:8787/#s={sid}")
+        # R27 / L52：链接走 backend /o/<sid> 专用入口。backend 调 osascript 把 Chrome 现有
+        # dashboard tab 切前台 + WS 广播 open_intent，dashboard 自动 openDrawer(sid)。
+        # 解 Chrome "只看最右匹配 host tab，不向前扫描" 的痛 —— 不管 dashboard tab 在
+        # tab 栏什么位置都能精准切过去。
+        # 历史教训：
+        # - R25 / L50：原 hash URL `/#s={sid}` 的 `#` 在 OS URL handler 链路上被吞，
+        #   导致 URL 整段消失。
+        # - R26 / L51：改成 query URL `/?s={sid}` 解决了 `#` 问题，但 Chrome 仍按
+        #   "最右匹配"开/复用 tab，前面位置的 dashboard tab 拿不到焦点。
+        # - R27 / L52：彻底改走 backend endpoint，osascript 接管 tab 切换。
+        tail_bits.append(f"↗ http://127.0.0.1:8787/o/{sid}")
     if tail_bits:
         lines.append(" · ".join(tail_bits))
 

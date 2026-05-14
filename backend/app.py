@@ -628,6 +628,135 @@ async def test_notify():
     return result
 
 
+# R27 / L52：飞书 ↗ 链接专用入口。Chrome 接收外部 URL 时的 tab 选择策略是它自己定的
+# （它只看最右匹配 host 的 tab，不向前扫描），dashboard JS 没机会干预。改走 osascript
+# 主动控制 Chrome：扫所有 window 找 dashboard tab → activate + 切 window 前台；同时
+# 通过 WS 广播 open_intent 让那个 dashboard 自动 openDrawer(sid)。
+# 找不到 dashboard tab 时退化为 HTML meta redirect 到 /?s=<sid>，让 Chrome 走正常加载。
+def _build_chrome_focus_script() -> str:
+    """扫 Chrome 所有 window/tab 找 dashboard tab → activate。
+
+    匹配规则：URL starts with `http://127.0.0.1:8787/`，且**不是** `/o/...` 这种 endpoint。
+    后者是飞书 ↗ 链接刚打开的那个 tab 自身（backend 正在处理它的请求），把它当 dashboard
+    会让 osascript 误返回 OK，backend 回"已切到 dashboard"页，dashboard JS 根本没加载
+    （L53 / R28 bug）。
+
+    返回 "OK" 表示找到并激活；"NOT_FOUND" 表示没现成 dashboard tab。
+    需要 Chrome Automation 权限（第一次调用时 macOS 弹"Python wants to control Chrome"）。
+    不依赖 System Events（教训 L02：System Events 要 Accessibility，Python backend 没权限会挂死）。
+    """
+    return (
+        'try\n'
+        '  tell application "Google Chrome"\n'
+        '    repeat with w in (every window)\n'
+        '      set tabIndex to 1\n'
+        '      repeat with t in (every tab of w)\n'
+        '        try\n'
+        '          set theURL to URL of t\n'
+        '          if (theURL starts with "http://127.0.0.1:8787/") and (not (theURL starts with "http://127.0.0.1:8787/o/")) then\n'
+        '            set active tab index of w to tabIndex\n'
+        '            set index of w to 1\n'
+        '            activate\n'
+        '            return "OK"\n'
+        '          end if\n'
+        '        end try\n'
+        '        set tabIndex to tabIndex + 1\n'
+        '      end repeat\n'
+        '    end repeat\n'
+        '    return "NOT_FOUND"\n'
+        '  end tell\n'
+        'end try\n'
+        'return "ERROR"\n'
+    )
+
+
+async def _osascript_focus_chrome_dashboard() -> tuple[bool, str]:
+    """成功返回 (True, "OK")。失败返回 (False, reason)。reason 用于日志。"""
+    script = _build_chrome_focus_script()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "osascript", "-e", script,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return False, "timeout"
+        result = (stdout or b"").decode("utf-8").strip()
+        err_text = (stderr or b"").decode("utf-8")[:200]
+        if result == "OK":
+            return True, "OK"
+        if result == "NOT_FOUND":
+            return False, "not_found"
+        return False, f"failed:{result}:{err_text}"
+    except FileNotFoundError:
+        return False, "no_osascript"
+    except Exception as e:
+        log.warning("osascript chrome focus exception: %s", e)
+        return False, f"exception:{e!s}"
+
+
+@app.get("/o/{sid}", response_class=HTMLResponse)
+async def open_via_chrome(sid: str):
+    """飞书 ↗ 链接打开 dashboard 的入口（R27 / L52）。
+
+    流程：
+      1. 调 osascript 把 Chrome 现有 dashboard tab 切前台（解 Chrome 不向前扫匹配 tab 的痛）
+      2. 通过 WS 广播 open_intent，dashboard 自动 openDrawer(sid)（保证 drawer 同步）
+      3. osascript 成功 → 返回轻量 close 页（Chrome 多半不让脚本 close 用户开的 tab，留着等用户 ⌘W）
+         osascript 失败/无 dashboard tab → meta refresh 到 /?s=<sid> 兜底，让 Chrome 加载 dashboard
+    """
+    sid = (sid or "").strip()
+    if not sid:
+        return HTMLResponse("<p>missing sid</p>", status_code=400)
+
+    # 1. osascript 切 Chrome dashboard tab
+    activated, reason = await _osascript_focus_chrome_dashboard()
+    log.info("open_via_chrome sid=%s activated=%s reason=%s", sid[:8], activated, reason)
+
+    # 2. WS 广播 open_intent（不依赖 osascript 成功；dashboard 收到就 openDrawer）
+    try:
+        await hub.broadcast({"type": "open_intent", "sid": sid})
+    except Exception:
+        log.exception("open_intent broadcast failed")
+
+    # 3. 返回 HTML
+    if activated:
+        # 成功路径：Chrome 已切到 dashboard tab，这个新 tab 是被点击产生的副产物
+        # 试图 window.close（多半被 Chrome 拒绝），失败时显示提示让用户手动 ⌘W
+        return HTMLResponse(
+            "<!doctype html><html lang=zh><head><meta charset=utf-8>"
+            "<title>已切到 dashboard</title>"
+            "<style>body{font-family:-apple-system,system-ui;padding:2em;color:#333;line-height:1.5}"
+            ".muted{color:#777;font-size:.9em}</style></head>"
+            "<body>"
+            "<h3>✓ 已切到 dashboard</h3>"
+            "<p>已让现有 dashboard 窗口接管，drawer 会自动打开对应 session。</p>"
+            "<p class='muted'>此 tab 可关闭：<kbd>⌘W</kbd>（Chrome 不让脚本静默关用户打开的 tab）。</p>"
+            "<script>setTimeout(()=>{try{window.close()}catch(e){}}, 100);</script>"
+            "</body></html>"
+        )
+    else:
+        # Fallback：osascript 失败 / 无现成 dashboard tab → 走正常 dashboard 加载
+        # 用 meta refresh 而非 HTTP 302 是为了让 URL bar 最终落到 /?s=<sid>，避免 Chrome 把
+        # /o/<sid> 当历史保留
+        # 反正 dashboard 加载后 main() 会把 ?s= 转写为 #s= 走 BroadcastChannel 仲裁
+        from html import escape as _html_escape
+        sid_safe = _html_escape(sid)
+        return HTMLResponse(
+            f"<!doctype html><html lang=zh><head><meta charset=utf-8>"
+            f"<title>正在打开 dashboard…</title>"
+            f"<meta http-equiv='refresh' content='0;url=/?s={sid_safe}'>"
+            f"</head><body>"
+            f"<p>正在加载 dashboard… (<a href='/?s={sid_safe}'>未跳转点这里</a>)</p>"
+            f"</body></html>"
+        )
+
+
 # Round 9 (L27)：首次接入引导用的健康检查。0 sessions 时前端渲染检查清单卡。
 @app.get("/api/health/setup")
 def health_setup():

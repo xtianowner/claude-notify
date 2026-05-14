@@ -1400,6 +1400,27 @@ async function onHashChange() {
 function onWsEnvelope(env) {
   if (!env || typeof env !== "object") return;
   if (env.type === "notes_updated") { onNotesWS(env); return; }
+  // R27 / L52：backend /o/<sid> endpoint 收到飞书 ↗ 链接请求 → 广播 open_intent →
+  // 所有 dashboard tab 收到 → 跳 hash + openDrawer。配合 backend 的 osascript Chrome
+  // tab 切换，实现"不管 dashboard tab 在 tab 栏哪个位置都能精准跳过去"。
+  if (env.type === "open_intent") {
+    if (env.sid) {
+      const sid = String(env.sid);
+      const targetHash = `s=${encodeURIComponent(sid)}`;
+      if (window.location.hash !== `#${targetHash}`) {
+        try { window.location.hash = targetHash; } catch (_) {}
+        // hashchange → onHashChange 自带 loadSessions + openDrawer + 高亮
+      } else {
+        // hash 已是该 sid（用户刚才看过）→ hashchange 不会再发，手动刷一遍
+        (async () => {
+          try { await loadSessions(); } catch (_) {}
+          try { openDrawer(sid); } catch (_) {}
+          applyHashHighlight();
+        })();
+      }
+    }
+    return;
+  }
   // L41 / R16 + L42 / R17：后端决定推送 → 弹浏览器桌面通知（飞书与否独立）
   // 记 lastPushTs 给 WS 重连补发用；notifyOnPush 内部按 (sid,ev_type,ts) dedupe 防补发重复弹
   if (env.type === "push_event") {
@@ -1852,6 +1873,29 @@ document.addEventListener("visibilitychange", () => {
 // 60s 刷新静音徽章（过期自动隐藏）
 setInterval(renderSnoozeBadge, 60 * 1000);
 
+// R25 / L50：Service Worker 通知点击 → SW postMessage NOTIFICATION_CLICK → 主 tab 跳 hash
+// SW 已经在它的 notificationclick handler 里调 client.focus() 把这个 tab 切到前台；
+// 这里只负责把 UI 状态（hash / drawer / sessions 刷新）切到目标 session。
+if (typeof navigator !== "undefined" && navigator.serviceWorker) {
+  navigator.serviceWorker.addEventListener("message", (e) => {
+    const m = (e && e.data) || {};
+    if (m.type !== "NOTIFICATION_CLICK") return;
+    if (!m.sid) return;
+    const targetHash = `s=${encodeURIComponent(m.sid)}`;
+    if (window.location.hash !== `#${targetHash}`) {
+      // 走 hashchange 路径：onHashChange 自带 loadSessions + openDrawer + 高亮
+      try { window.location.hash = targetHash; } catch (_) {}
+    } else {
+      // hash 已是该 sid → hashchange 不触发，手动刷一遍
+      (async () => {
+        try { await loadSessions(); } catch (_) {}
+        try { openDrawer(m.sid); } catch (_) {}
+        applyHashHighlight();
+      })();
+    }
+  });
+}
+
 // 启动
 (async function main() {
   setWsStatus("connecting");
@@ -1861,6 +1905,20 @@ setInterval(renderSnoozeBadge, 60 * 1000);
     b.classList.toggle("is-active", active);
     b.setAttribute("aria-selected", active ? "true" : "false");
   });
+
+  // R26 / L51：飞书外链改用 ?s=<sid> query（`#` 在 OS URL handler 链路上不稳定，实测被吞）。
+  // 这里把入站 ?s=<sid> 转写为 #s=<sid>，复用下面所有 hash 导航 / BroadcastChannel 仲裁逻辑。
+  // history.replaceState：URL bar 不显示 ?s=，地址栏看到 #s=<sid>，前进/后退不留多余条目。
+  // 同时保留对历史已发出的 #s=<sid> 旧链接的兼容（hash 直接被下面 hashMatch 命中）。
+  const _qm = (window.location.search || "").match(/[?&]s=([^&]+)/);
+  if (_qm) {
+    const _qsid = _qm[1];
+    try {
+      history.replaceState(null, "", window.location.pathname + `#s=${_qsid}`);
+    } catch (_) { /* 兜底：直接写 hash，多一条 history entry 也能用 */
+      try { window.location.hash = `s=${_qsid}`; } catch (__) {}
+    }
+  }
 
   // R20 / R22 / L45：BroadcastChannel 仲裁 — 仅当 URL 含 #s=<sid> 时启动竞争
   // 收到 PONG 表明已有主 dashboard tab 接管。根据本地缓存 tab_reuse_mode 选遮罩样式：
