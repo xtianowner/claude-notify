@@ -1710,6 +1710,13 @@ main {
   background: rgba(110, 100, 180, 0.08);
   color: #4a4080;
 }
+/* R45：合并卡（AX 视角 + hook 视角融合）— ✦ 标记 + 更深的蓝 */
+.source-badge.source-desktop.source-merged {
+  border-color: rgba(60, 110, 200, 0.50);
+  background: rgba(60, 110, 200, 0.12);
+  color: #1c4a99;
+  font-weight: 600;
+}
 
 /* ════════════════════════════════════════════════════════════════════
    0511 Phase 2 响应式补强：中段断点 / container query / workspace grid

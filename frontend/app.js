@@ -267,6 +267,9 @@ function renderListWithSections(visible) {
     if (!buckets[cat]) buckets[cat] = [];
     buckets[cat].push(s);
   }
+  // R45：desktop 段去重 — active hook 视角 + active AX 视角合并成一张以 AX 为主的卡
+  buckets["desktop-code"] = mergeDesktopViews(buckets["desktop-code"]);
+  buckets["desktop-cowork"] = mergeDesktopViews(buckets["desktop-cowork"]);
   const parts = [];
   for (const key of LIST_SECTION_ORDER) {
     const arr = buckets[key] || [];
@@ -276,6 +279,32 @@ function renderListWithSections(visible) {
     parts.push(`<div class="list-section-body">${arr.map(sessionCardHTML).join("")}</div>`);
   }
   return parts.join("");
+}
+
+// R45：把"同一 UI 会话"的两个视角（AX bridge + hook 嵌入 CLI）合并成 1 张卡。
+// 合并条件（保守）：当前 active 的 ax session 唯一 && 当前 active 的 hook session 唯一
+//   → 合并到 ax，hook 的 cwd/工具调用/transcript 等元数据塞进 merged_hook 副字段
+// 否则保留原样（多 session 时不合并避免错配）。
+function mergeDesktopViews(items) {
+  if (!items || items.length < 2) return items || [];
+  const isActiveAlive = s => s && !["dead", "ended"].includes(s.status);
+  const activeAx = items.filter(s => s.source === "desktop_app" && isActiveAlive(s));
+  const activeHook = items.filter(s => s.desktop_embedded && s.source !== "desktop_app" && isActiveAlive(s));
+  if (activeAx.length !== 1 || activeHook.length !== 1) return items;
+  const ax = activeAx[0];
+  const hook = activeHook[0];
+  const merged = { ...ax };
+  merged.merged_hook = hook;
+  // hook 视角的有用字段补给 ax（ax 没有 transcript / tool 调用）
+  if (hook.last_assistant_message && !ax.last_assistant_message) merged.last_assistant_message = hook.last_assistant_message;
+  if (hook.turn_summary && !ax.turn_summary) merged.turn_summary = hook.turn_summary;
+  if (hook.last_milestone && !ax.last_milestone) merged.last_milestone = hook.last_milestone;
+  if (hook.first_user_prompt && !ax.first_user_prompt) merged.first_user_prompt = hook.first_user_prompt;
+  if (hook.cwd_short && !ax.cwd_short) merged.cwd_short = hook.cwd_short;
+  if (hook.cwd && !ax.cwd) merged.cwd = hook.cwd;
+  if (hook.tty && !ax.tty) merged.tty = hook.tty;
+  // 替换 items：去掉 hook 和原 ax，加 merged
+  return items.filter(s => s !== hook && s !== ax).concat([merged]);
 }
 
 // ───────────── L24：按项目（cwd_short）分组视图 ─────────────
@@ -547,6 +576,10 @@ function sessionCardHTML(s) {
     sourceBadgeHtml = `<span class="source-badge source-desktop" title="${escapeHtml(title)}">🖥 Desktop${escapeHtml(modeSuffix)}</span>`;
   } else if (s.desktop_embedded) {
     sourceBadgeHtml = `<span class="source-badge source-desktop-cli" title="Claude Desktop Code 当前会话（hook 链路视角，含工具调用 / cwd 等 CLI 元数据）">🖥 Desktop · Code</span>`;
+  }
+  // R45：合并卡用 ax 的徽章；但 title 加一句标识已合并 hook 元数据
+  if (s.merged_hook) {
+    sourceBadgeHtml = `<span class="source-badge source-desktop source-merged" title="Claude Desktop · ${escapeHtml(s.mode || 'Code')}（已合并 hook 视角：含 cwd / 工具调用 / transcript）">🖥 Desktop · ${escapeHtml(s.mode || 'Code')} ✦</span>`;
   }
 
   const metaLeftBits = escapeHtml(s.cwd_short || "");
@@ -850,8 +883,22 @@ async function openDrawer(sessionId) {
   $drawer.classList.remove("hidden");
   $drawerBody.innerHTML = `<p class="empty">加载中…</p>`;
   try {
-    const events = await api.listEvents(sessionId, 50);
-    state.drawerEvents = Array.isArray(events) ? events : [];
+    let events = await api.listEvents(sessionId, 50);
+    events = Array.isArray(events) ? events : [];
+    // R45：合并卡 → 同时拉 hook session 的 events，按 ts 合并
+    if (s && s.merged_hook && s.merged_hook.session_id) {
+      try {
+        const hookEvents = await api.listEvents(s.merged_hook.session_id, 50);
+        if (Array.isArray(hookEvents) && hookEvents.length) {
+          events = events.concat(hookEvents).sort((a, b) => {
+            const ta = new Date(a.ts || 0).getTime();
+            const tb = new Date(b.ts || 0).getTime();
+            return tb - ta;
+          });
+        }
+      } catch (_) {}
+    }
+    state.drawerEvents = events;
     renderDrawerEvents();
   } catch (e) {
     $drawerBody.innerHTML = `<p class="empty">加载失败：${escapeHtml(e.message)}</p>`;
