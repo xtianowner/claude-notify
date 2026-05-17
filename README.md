@@ -135,6 +135,33 @@ python3 scripts/desktop_ax_dump.py | head -30   # 应该能看到 [window 0] 节
 
 桥接事件 `source = desktop_app`，与 `claude_code` 共用 dashboard / 推送策略 / 静音 / 配置面板。卡片项目名固定 `Claude Desktop`，标题取自 Claude 窗口标题。
 
+### 3d. （可选）让 Claude Desktop 自报家门 — MCP 辅助通道
+
+R30 的 AX 桥接能感知"生成中 / 等输入"等 UI 状态，但拿不到对话语义。`scripts/mcp_notify_server.py` 提供一个 MCP server，暴露 `notify_progress(title, summary, level)` 工具：Claude 在 system prompt 引导下完成里程碑或卡决策点时**主动调用**，补足 AX 的语义盲区。
+
+**安装步骤**：
+
+1. `pip install mcp`
+2. 编辑 `~/Library/Application Support/Claude/claude_desktop_config.json`，在 `mcpServers` 段加：
+   ```json
+   {
+     "mcpServers": {
+       "claude-notify": {
+         "command": "/绝对路径/python3",
+         "args": ["/绝对路径/claude-notify/scripts/mcp_notify_server.py"]
+       }
+     }
+   }
+   ```
+   `command` 用 `which python3` 查；`args` 路径用 `realpath scripts/mcp_notify_server.py` 查。
+3. 重启 Claude Desktop。
+4. 在 Claude Desktop 对话开头加一段引导：
+   > 每次完成一个里程碑、卡在用户决策点、或刚启动一段长任务时，调用 `notify_progress` 工具向 dashboard 汇报。title 一句话主题，summary 一句话进度，level 用 `info`/`milestone`/`blocked`。
+
+**事件映射**：`level=blocked` → Notification 必推；`milestone`/`info` → Stop（12s 静默合并，按默认推送策略）。session_id 以 `mcp-<conversation_id>` 编排，多轮汇报会聚合到同一张卡片。
+
+MCP 与 AX 桥接互补不互斥：AX 抓 UI 状态，MCP 拿语义摘要，dashboard 用 source=desktop_app 统一展示。
+
 ### 4. 注册 Hook（让 Claude Code 把事件投给本地后端）
 
 ```bash
