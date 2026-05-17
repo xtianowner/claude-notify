@@ -1,0 +1,7 @@
+# Claude Desktop 桥接（macOS only）依赖
+# 安装：pip install -r backend/requirements-desktop.txt
+# 然后去 系统设置 → 隐私与安全 → 辅助功能 把当前 python 解释器加进去
+# 再去 dashboard ⚙ → 配置 → desktop_bridge.enabled=true，重启 backend
+
+# AXUIElement* API：枚举 Claude.app 窗口、读 Stop 按钮 / 输入框状态
+pyobjc-framework-ApplicationServices>=10.0

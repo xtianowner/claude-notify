@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg_mod
-from . import aliases, decision_log, enrichments, event_store, feishu, liveness_watcher, notes, notify_policy
+from . import aliases, decision_log, desktop_bridge, enrichments, event_store, feishu, liveness_watcher, notes, notify_policy
 from . import llm as llm_mod
 from . import transcript_reader
 
@@ -121,6 +121,20 @@ async def _on_watcher_event(evt: dict[str, Any]):
     await notify_policy.get_dispatcher().submit(evt)
 
 
+async def _on_desktop_event(evt: dict[str, Any]):
+    """desktop_bridge 合成的 AX 事件 → 走 hook POST 一致的归一化 + 落盘 + 派发链路。
+    与 /api/event 不同：桥接直接在进程内，省去 HTTP；但落盘 / dispatch 行为完全一致。
+    """
+    try:
+        normalized = event_store.normalize_incoming(evt)
+        event_store.append_event(normalized)
+        summary = _session_summary(normalized.get("session_id", ""))
+        await hub.broadcast({"type": "event", "event": normalized, "session": summary})
+        await notify_policy.get_dispatcher().submit(normalized)
+    except Exception:
+        log.exception("desktop_bridge event dispatch failed: %s", evt.get("event"))
+
+
 async def _on_push_for_browser(evt: dict[str, Any], reason: str):
     """notify_policy dispatcher 决定推送时调（飞书开关无关）。
     给 dashboard 广播一条 push_event，前端按 push_channels.browser 决定是否弹 toast。
@@ -176,6 +190,31 @@ async def lifespan(app: FastAPI):
     except Exception:
         log.exception("startup prune session_mutes failed")
     task = asyncio.create_task(liveness_watcher.watch_loop(_on_watcher_event, interval_seconds=interval))
+    # R30：Claude Desktop AX 桥接（macOS only；默认 off，dashboard 开启）。
+    # 桥接 emit 的事件通过 _on_desktop_event 走与 hook POST 同样的归一化 + 派发链路。
+    dsk_cfg = cfg.get("desktop_bridge") or {}
+    desktop_task: asyncio.Task | None = None
+    if dsk_cfg.get("enabled"):
+        try:
+            running_loop = asyncio.get_running_loop()
+
+            def _bridge_post(evt: dict[str, Any]) -> None:
+                # 桥接 tick() 在 asyncio.to_thread 里跑，post_event 也是 worker thread 调用 —— 必须 thread-safe 回 loop
+                running_loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(_on_desktop_event(evt))
+                )
+
+            bridge = desktop_bridge.DesktopBridge(
+                post_event=_bridge_post,
+                poll_interval=float(dsk_cfg.get("poll_interval_seconds") or 1.0),
+                debug=False,
+            )
+            desktop_task = asyncio.create_task(bridge.run_forever())
+            app.state.desktop_bridge = bridge
+            log.info("desktop_bridge enabled poll=%.1fs",
+                     float(dsk_cfg.get("poll_interval_seconds") or 1.0))
+        except Exception:
+            log.exception("desktop_bridge start failed; continuing without it")
     # L41 / R16：注入浏览器推送 listener，让 notify_policy 在每次决定 push 时
     # 给 dashboard WS 广播一条 push_event。前端按 push_channels.browser 决定是否弹通知。
     notify_policy.get_dispatcher().set_push_listener(_on_push_for_browser)
@@ -188,6 +227,16 @@ async def lifespan(app: FastAPI):
             await task
         except Exception:
             pass
+        if desktop_task is not None:
+            try:
+                app.state.desktop_bridge.stop()
+            except Exception:
+                pass
+            desktop_task.cancel()
+            try:
+                await desktop_task
+            except Exception:
+                pass
 
 
 app = FastAPI(title="claude-notify", lifespan=lifespan)

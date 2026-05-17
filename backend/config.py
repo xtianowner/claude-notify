@@ -141,9 +141,18 @@ DEFAULT_PUSH_CHANNELS = {
 DEFAULT_TAB_REUSE_MODE = "focus_old"
 TAB_REUSE_MODE_VALUES = {"focus_old", "user_choice"}
 
+DEFAULT_DESKTOP_BRIDGE = {
+    # R30：Claude Desktop（macOS Electron app）通过 Accessibility API 监控会话。
+    # 不影响 Claude Code CLI hook 链路。AX 权限未授时安全 noop。
+    "enabled": False,             # 默认关；用户授权后在 dashboard 打开
+    "poll_interval_seconds": 1.0,
+    "waiting_debounce_seconds": 1.5,
+}
+
 DEFAULTS: dict[str, Any] = {
     "push_channels": DEFAULT_PUSH_CHANNELS,
     "tab_reuse_mode": DEFAULT_TAB_REUSE_MODE,
+    "desktop_bridge": DEFAULT_DESKTOP_BRIDGE,
     "feishu_webhook": "",
     "feishu_secret": "",
     "timeout_minutes": 5,

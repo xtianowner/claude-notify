@@ -1,6 +1,8 @@
 # claude-notify
 
-> 给 Claude Code 用户的本地通知系统：监控所有会话的 hook 事件，关键节点（等输入 / 等授权 / 任务结束 / 长任务疑挂）推飞书 / 浏览器桌面通知 + 本地 dashboard 实时展示。多会话并行不漏看。
+> 给 Claude Code / Claude Desktop 用户的本地通知系统：监控所有会话的事件，关键节点（等输入 / 等授权 / 任务结束 / 长任务疑挂）推飞书 / 浏览器桌面通知 + 本地 dashboard 实时展示。多会话并行不漏看。
+>
+> **R30+**：除 Claude Code CLI 的 hook 链路，新增 **Claude Desktop**（macOS Electron app）的 Accessibility 桥接，能监控桌面端会话窗口的「生成中 / 等输入 / 确认对话框」状态。详见 [docs/desktop-bridge/design.md](docs/desktop-bridge/design.md)。
 
 ## 它解决什么问题
 
@@ -110,6 +112,28 @@ curl -X POST http://127.0.0.1:8787/api/test-notify
 
 - 这条都没弹 → macOS 系统层拦着，按上面 1-2-3 排查
 - 这条弹了但 curl 不弹 → tab 没切到后台 / Web 渠道 toggle 没勾 / 后端没重启
+
+### 3c. （可选）启用 Claude Desktop 桥接（macOS）
+
+如果你也用 **Claude Desktop**（`/Applications/Claude.app`，对应 claude.ai SPA），claude-notify 可以监控桌面端会话窗口的「生成中 / 等输入 / 等确认」状态。原理是 macOS Accessibility API 轮询 Claude.app 的窗口树，不依赖 hook，不需要改 Claude Desktop 启动参数。
+
+**三步开启**：
+
+1. 装额外依赖（pyobjc 的 AX 模块）：
+   ```bash
+   pip install -r backend/requirements-desktop.txt
+   ```
+2. **授权辅助功能**：苹果菜单 → 系统设置 → **隐私与安全** → **辅助功能** → 把当前运行 backend 的 python 解释器拖进去（路径用 `which python3` 查），打钩。
+3. dashboard ⚙ → 配置 → 把 `desktop_bridge.enabled` 改为 `true` → 保存 → 重启 backend。
+
+验证：
+```bash
+python3 scripts/desktop_ax_dump.py | head -30   # 应该能看到 [window 0] 节点输出
+```
+
+如果输出 `[warn] 当前 python 没有辅助功能权限` → 第 2 步没生效，常见原因：把 `/usr/bin/python3` 加了但 backend 跑的是 conda env / venv 里的另一个 python。**实际跑 backend 的解释器**才是需要授权的那个。
+
+桥接事件 `source = desktop_app`，与 `claude_code` 共用 dashboard / 推送策略 / 静音 / 配置面板。卡片项目名固定 `Claude Desktop`，标题取自 Claude 窗口标题。
 
 ### 4. 注册 Hook（让 Claude Code 把事件投给本地后端）
 

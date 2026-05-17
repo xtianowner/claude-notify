@@ -322,6 +322,7 @@ def clean_summary(raw: str, max_len: int = 80) -> str:
 
 CLAUDE_CODE = "claude_code"
 CODEX = "codex"
+DESKTOP_APP = "desktop_app"  # R29+：Claude Desktop（macOS Electron app）通过 AX 桥接
 GENERIC = "generic"
 
 # 教训 L08：Claude Code Notification hook payload 没有原生 sidechain / parent_session 字段。
@@ -405,6 +406,55 @@ def _normalize_codex(raw: dict[str, Any]) -> dict[str, Any]:
     return _normalize_generic(raw, source=CODEX)
 
 
+def _normalize_desktop_app(raw: dict[str, Any]) -> dict[str, Any]:
+    """Claude Desktop AX 桥接事件 → 内部统一字段。
+
+    与 claude_code 不同：没有 cwd/tty/transcript_path，对应字段空。
+    project 固定 'Claude Desktop'，cwd_short 取 window_title（dashboard 展示位）。
+    session_id 由 watcher 端按 (pid + AX window stable id) 派生。
+    raw 中的关键扩展字段：window_title / window_id / conversation_id（如能解析）。
+    """
+    raw_extra = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
+    window_title = raw.get("window_title") or raw_extra.get("window_title") or ""
+    msg = raw.get("message") or _summarize_desktop(raw, window_title)
+    return {
+        "source": DESKTOP_APP,
+        "session_id": raw.get("session_id") or "desktop-unknown",
+        "event": raw.get("event") or "Unknown",
+        "cwd": "",
+        "cwd_short": window_title[:48],
+        "project": raw.get("project") or "Claude Desktop",
+        "message": msg,
+        "transcript_path": "",
+        "claude_pid": raw.get("claude_pid"),
+        "hook_pid": raw.get("hook_pid"),
+        "tty": "",
+        "permission_mode": None,
+        "effort_level": None,
+        "last_assistant_message": raw.get("last_assistant_message") or "",
+        "reason": raw.get("reason"),
+        "is_sidechain": False,
+        "window_title": window_title,
+        "window_id": raw.get("window_id") or raw_extra.get("window_id") or "",
+        "conversation_id": raw.get("conversation_id") or raw_extra.get("conversation_id") or "",
+        "raw": raw_extra or raw,
+    }
+
+
+def _summarize_desktop(raw: dict[str, Any], window_title: str) -> str:
+    ev = raw.get("event") or ""
+    title = window_title or "Claude Desktop"
+    if ev == "Notification":
+        return f"{title} 等输入"
+    if ev == "Stop":
+        return f"{title} 回合结束"
+    if ev == "SessionStart":
+        return f"{title} 会话开始"
+    if ev == "SessionEnd":
+        return f"{title} 关闭"
+    return f"{title} {ev}" if ev else title
+
+
 def _normalize_generic(raw: dict[str, Any], source: str = GENERIC) -> dict[str, Any]:
     cwd = raw.get("cwd") or ""
     return {
@@ -429,6 +479,7 @@ def _normalize_generic(raw: dict[str, Any], source: str = GENERIC) -> dict[str, 
 _REGISTRY: dict[str, Callable[[dict], dict]] = {
     CLAUDE_CODE: _normalize_claude_code,
     CODEX: _normalize_codex,
+    DESKTOP_APP: _normalize_desktop_app,
     GENERIC: _normalize_generic,
 }
 
