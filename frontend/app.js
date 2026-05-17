@@ -240,11 +240,16 @@ function renderSessions() {
   applyHashHighlight();
 }
 
-// ───────────── R37：列表视图按 source / mode 分段 ─────────────
-// 终端会话 / Desktop·Code / Desktop·Cowork 三段，桶间不混放
+// ───────────── R37/R43：列表视图按 source / mode 分段 ─────────────
+// 终端 / Desktop·Code / Desktop·Cowork 三段，桶间不混放
+// R43：source=claude_code 且 desktop_embedded=true 的 session 是 Claude Desktop
+// Code mode 嵌入的 CLI 子进程，也归到 Desktop·Code 段（与 AX bridge 视角共一段）
 function categorizeSession(s) {
   if (s.source === "desktop_app") {
     return s.mode === "Cowork" ? "desktop-cowork" : "desktop-code";
+  }
+  if (s.desktop_embedded) {
+    return "desktop-code";
   }
   return "terminal";
 }
@@ -530,13 +535,18 @@ function sessionCardHTML(s) {
     ? `<span class="urgency-badge urgency-menu" title="Claude 等你做选择">🔥 指令选择·待响应</span>`
     : "";
 
-  // R31/R36：source 来源徽章（claude_code 隐式默认不渲染；desktop_app 显式标 + mode 后缀）
+  // R31/R36/R43：source 来源徽章
+  // - source=desktop_app（AX bridge 视角）→ "🖥 Desktop · <mode>"
+  // - source=claude_code + desktop_embedded（嵌入 CLI 视角）→ "🖥 Desktop · Code (CLI)"
+  // - 其它 source=claude_code → 无徽章（隐式默认 = 终端）
   let sourceBadgeHtml = "";
   if (s.source === "desktop_app") {
     const mode = s.mode || "";
     const modeSuffix = mode ? ` · ${mode}` : "";
     const title = `Claude Desktop${mode ? ` · ${mode} 板块` : ""}`;
     sourceBadgeHtml = `<span class="source-badge source-desktop" title="${escapeHtml(title)}">🖥 Desktop${escapeHtml(modeSuffix)}</span>`;
+  } else if (s.desktop_embedded) {
+    sourceBadgeHtml = `<span class="source-badge source-desktop-cli" title="Claude Desktop Code mode 内嵌的 CLI 子进程（走 hook 链路）">🖥 Desktop · Code (CLI)</span>`;
   }
 
   const metaLeftBits = escapeHtml(s.cwd_short || "");

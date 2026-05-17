@@ -554,6 +554,7 @@ def list_sessions(active_window_minutes: int = 30,
                 "menu_detected": False,  # R11：最近一次 Notification 是否在菜单 prompt 上
                 "_last_status_event_unix": 0.0,  # L44：最近一次 status-changing 事件 unix ts
                 "mode": evt.get("mode") or "",   # R36：Desktop session 的 tab（Code/Cowork）
+                "desktop_embedded": False,       # R43：CLI 跑在 Claude Desktop Code mode 内
             }
             sessions[sid] = s
         ev_name = evt.get("event") or ""
@@ -605,6 +606,9 @@ def list_sessions(active_window_minutes: int = 30,
             s["source"] = evt.get("source")
         if evt.get("mode") and not s.get("mode"):
             s["mode"] = evt.get("mode")
+        # R43：任何一条 event 标 desktop_embedded → 整个 session 都算嵌入
+        if evt.get("desktop_embedded"):
+            s["desktop_embedded"] = True
         s["event_count"] += 1
         et = evt.get("event") or "unknown"
         s["events_by_type"][et] = s["events_by_type"].get(et, 0) + 1
@@ -725,7 +729,56 @@ def list_sessions(active_window_minutes: int = 30,
             s.pop(k, None)
         out.append(s)
     out.sort(key=lambda x: x["last_event_unix"], reverse=True)
+    # R43：对没有 desktop_embedded 标记的 alive CLI session 做一次 PID 探测兜底
+    # （历史 events.jsonl 写入时 hook 还没加这字段；让用户不用等下一个 hook 触发就能看到分类）
+    _backfill_desktop_embedded(out)
     return out
+
+
+# R43 PID 探测缓存：30s 内同 PID 不重复查 ps
+_desktop_embedded_cache: dict[int, tuple[float, bool]] = {}
+_DESKTOP_EMBEDDED_TTL = 30.0
+
+
+def _is_pid_desktop_embedded(pid: int) -> bool:
+    if not pid or pid <= 0:
+        return False
+    now = time.time()
+    cached = _desktop_embedded_cache.get(pid)
+    if cached and (now - cached[0]) < _DESKTOP_EMBEDDED_TTL:
+        return cached[1]
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["ps", "-p", str(pid), "-ww", "-o", "command="],
+            stderr=subprocess.DEVNULL, text=True, timeout=0.3,
+        ).strip()
+        result = (
+            "Library/Application Support/Claude/claude-code" in out
+            or "local-agent-mode-sessions" in out
+        )
+    except Exception:
+        result = False
+    _desktop_embedded_cache[pid] = (now, result)
+    return result
+
+
+def _backfill_desktop_embedded(sessions: list[dict[str, Any]]) -> None:
+    """对历史事件未带 desktop_embedded 字段的 alive claude_code session，
+    用 PID 在线探测兜底（30s 缓存）。仅 active session 跑，避免遍历所有死 session。
+    """
+    for s in sessions:
+        if s.get("desktop_embedded"):
+            continue
+        if (s.get("source") or "") != "claude_code":
+            continue
+        if not s.get("active"):
+            continue
+        pid = s.get("claude_pid")
+        if not pid:
+            continue
+        if _is_pid_desktop_embedded(int(pid)):
+            s["desktop_embedded"] = True
 
 
 def get_session(session_id: str) -> dict[str, Any] | None:

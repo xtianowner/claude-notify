@@ -397,6 +397,7 @@ def _normalize_claude_code(raw: dict[str, Any]) -> dict[str, Any]:
             or raw.get("last_assistant_message"),
         "reason": (raw.get("raw") or {}).get("reason") or raw.get("reason"),
         "is_sidechain": is_sidechain,
+        "desktop_embedded": bool(raw.get("desktop_embedded")),  # R43：CLI 跑在 Claude Desktop Code mode 内
         "raw": raw.get("raw") if isinstance(raw.get("raw"), dict) else raw,
     }
 

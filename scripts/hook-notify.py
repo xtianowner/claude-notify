@@ -112,6 +112,9 @@ def main() -> int:
     claude_pid = os.getppid()
     # payload 可显式带 tty（测试 / 非 claude_code source 自行上报）；否则用 ps 查 ppid
     tty = (payload.get("tty") or "").strip() or _get_tty(claude_pid)
+    # R43：检测当前 Claude CLI 是否由 Claude Desktop 嵌入启动（Code mode 内部用 CLI 跑）。
+    # 若是 → 标 desktop_embedded=True，dashboard 将把它归到 Desktop·Code 段而非终端段。
+    desktop_embedded = _is_claude_desktop_embedded(claude_pid)
 
     evt = {
         "ts": now_iso(),
@@ -130,6 +133,7 @@ def main() -> int:
         "effort_level": effort_level,
         "last_assistant_message": payload.get("last_assistant_message"),
         "reason": payload.get("reason"),
+        "desktop_embedded": desktop_embedded,  # R43：Claude Desktop Code mode 嵌入的 CLI
         "raw": payload,
     }
 
@@ -208,6 +212,27 @@ def _cwd_tail(cwd: str, n: int = 2) -> str:
         return ""
     parts = [p for p in Path(cwd).parts if p not in ("/", "")]
     return "/".join(parts[-n:]) if parts else ""
+
+
+def _is_claude_desktop_embedded(claude_pid: int) -> bool:
+    """R43：判断当前 Claude CLI 是否由 Claude Desktop（Code mode）作为子进程嵌入启动。
+
+    判据：进程 binary 路径在 ~/Library/Application Support/Claude/claude-code/ 下。
+    Claude Desktop 把每个 Code session 的 CLI 沙盒装在那里；用户自己起的终端 CLI
+    通常 binary 在 /usr/local/bin/、~/.local/bin/、~/.claude/bin/、nvm 路径下。
+    """
+    try:
+        out = subprocess.check_output(
+            ["ps", "-p", str(claude_pid), "-ww", "-o", "command="],
+            stderr=subprocess.DEVNULL, text=True, timeout=0.5,
+        ).strip()
+        # 兜底：路径或参数里出现 local-agent-mode-sessions 也算（Claude Desktop 特有）
+        return (
+            "Library/Application Support/Claude/claude-code" in out
+            or "local-agent-mode-sessions" in out
+        )
+    except Exception:
+        return False
 
 
 def _get_tty(pid: int) -> str:

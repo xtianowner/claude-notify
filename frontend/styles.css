@@ -1704,6 +1704,12 @@ main {
   background: rgba(80, 130, 200, 0.08);
   color: #2c5a99;
 }
+/* R43：source=claude_code + desktop_embedded=true (Claude Desktop Code mode 内嵌的 CLI) */
+.source-badge.source-desktop-cli {
+  border-color: rgba(110, 100, 180, 0.32);
+  background: rgba(110, 100, 180, 0.08);
+  color: #4a4080;
+}
 
 /* ════════════════════════════════════════════════════════════════════
    0511 Phase 2 响应式补强：中段断点 / container query / workspace grid
