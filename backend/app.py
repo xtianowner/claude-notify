@@ -211,6 +211,28 @@ async def lifespan(app: FastAPI):
             )
             desktop_task = asyncio.create_task(bridge.run_forever())
             app.state.desktop_bridge = bridge
+            # R39：从 events.jsonl 恢复用户 mark-dead 的 desktop_app sid（跨重启稳定）
+            # 取每个 sid 的最后一条 status-changing 事件；若是 user_marked SessionDead → forget
+            try:
+                forgotten_sids = []
+                last_status: dict[str, dict] = {}
+                NON_STATUS = {"Heartbeat", "PreToolUse", "PostToolUse", "SessionStart"}
+                for evt in event_store.iter_events():
+                    if (evt.get("source") or "") != "desktop_app":
+                        continue
+                    sid = evt.get("session_id")
+                    ev = evt.get("event") or ""
+                    if not sid or ev in NON_STATUS:
+                        continue
+                    last_status[sid] = evt  # 后写覆盖前写 → 自然得到最后一条
+                for sid, evt in last_status.items():
+                    if evt.get("event") == "SessionDead" and evt.get("reason") == "user_marked":
+                        forgotten_sids.append(sid)
+                if forgotten_sids:
+                    n = bridge.restore_forgotten_from_events(forgotten_sids)
+                    log.info("desktop_bridge: restored %d forgotten sid(s) from events.jsonl", n)
+            except Exception:
+                log.exception("desktop_bridge: restore_forgotten failed (non-fatal)")
             log.info("desktop_bridge enabled poll=%.1fs",
                      float(dsk_cfg.get("poll_interval_seconds") or 1.0))
         except Exception:

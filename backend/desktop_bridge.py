@@ -460,14 +460,11 @@ class DesktopBridge:
                 t, "SessionEnd", f"Claude Desktop 会话从列表消失: {t.name}"
             ))
 
-        # 周期 Heartbeat：保活 + 让 liveness_watcher 不把 session 算 dead
+        # R39：Heartbeat 已撤掉。
+        # 原意是保活，但 backend derive_status 的"活动证据胜过等待"规则（L44）会因 Heartbeat
+        # 把 Notification 后状态翻成 running，污染 dashboard。
+        # liveness_watcher 已跳过 desktop_app source（R33 改动），不发 Heartbeat 也不会被算 dead。
         self._tick_count += 1
-        if self._tick_count % HEARTBEAT_EVERY_TICKS == 0:
-            for sid in seen_sids:
-                t = self.tracks.get(sid)
-                if not t:
-                    continue
-                self._emit(self._build_event(t, "Heartbeat", f"{t.name} alive"))
 
     def _on_state_change(self, track: SessionTrack, prev: str, curr: str,
                           snap: SessionSnapshot) -> None:
@@ -508,6 +505,16 @@ class DesktopBridge:
 
     def stop(self) -> None:
         self._stop = True
+
+    def restore_forgotten_from_events(self, sids: list[str]) -> int:
+        """R39：backend 启动时把"events.jsonl 里最近被用户 mark-dead 的 desktop_app sid"
+        注入 _forgotten，让 mark-dead 跨 backend 重启稳定。"""
+        n = 0
+        for sid in sids:
+            if sid and sid not in self._forgotten:
+                self._forgotten.add(sid)
+                n += 1
+        return n
 
     def forget_session(self, session_id: str) -> bool:
         """R38：用户 mark-dead 后调用，让 bridge 抑制后续对此 sid 的事件。
