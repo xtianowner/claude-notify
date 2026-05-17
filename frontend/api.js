@@ -42,6 +42,16 @@ export const api = {
     jsonFetch(`/api/sessions/${encodeURIComponent(sessionId)}/mark-dead`, {
       method: "POST",
     }),
+  // R40：彻底删除 session（从 dashboard 移除；events.jsonl 保留供审计）
+  deleteSession: (sessionId) =>
+    jsonFetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "DELETE",
+    }),
+  restoreSession: (sessionId) =>
+    jsonFetch(`/api/sessions/${encodeURIComponent(sessionId)}/restore`, {
+      method: "POST",
+    }),
+  listHidden: () => jsonFetch(`/api/sessions/hidden`),
   // L14: per-session 静音
   // minutes: number (分钟) | null（永久）；scope: "all" | "stop_only"
   muteSession: (sessionId, { minutes = null, scope = "all", label = "" } = {}) =>

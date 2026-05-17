@@ -506,10 +506,15 @@ def _display_name(s: dict[str, Any]) -> str:
 
 def list_sessions(active_window_minutes: int = 30,
                   include_archive: bool = False) -> list[dict[str, Any]]:
+    # R40：跳过被用户主动删除的 sid（hidden_sessions.json 持久化）
+    from . import hidden_sessions
+    hidden = hidden_sessions.hidden_ids()
     sessions: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
     for evt in iter_events(include_archive=include_archive):
         sid = evt.get("session_id")
         if not sid:
+            continue
+        if sid in hidden:
             continue
         s = sessions.get(sid)
         if s is None:

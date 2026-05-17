@@ -112,6 +112,7 @@ const $drawerTitle    = $("drawer-title");
 const $drawerStatus   = $("drawer-status");
 const $drawerSub      = $("drawer-sub");
 const $drawerMarkDead = $("drawer-mark-dead");
+const $drawerDelete   = $("drawer-delete");
 const $drawerMeta     = $("drawer-meta");
 const $drawerMetaToggle = $("drawer-meta-toggle");
 const $drawerMetaBody = $("drawer-meta-body");
@@ -773,6 +774,11 @@ async function openDrawer(sessionId) {
       $drawerMarkDead.disabled = terminal;
       $drawerMarkDead.textContent = terminal ? "已结束" : "标记已结束";
     }
+    // R40：delete 按钮（不限 status，总是允许彻底删除）
+    if ($drawerDelete) {
+      $drawerDelete.dataset.sid = sessionId;
+      $drawerDelete.disabled = false;
+    }
   } else {
     $drawerDot.style.background = "var(--c-idle-solid)";
     $drawerTitle.textContent = sessionId;
@@ -786,6 +792,10 @@ async function openDrawer(sessionId) {
       $drawerMarkDead.disabled = true;
       $drawerMarkDead.dataset.sid = sessionId;
       $drawerMarkDead.textContent = "标记已结束";
+    }
+    if ($drawerDelete) {
+      $drawerDelete.dataset.sid = sessionId;
+      $drawerDelete.disabled = false;  // session 找不到也允许删（前端 state 残留）
     }
   }
 
@@ -884,17 +894,43 @@ async function onFocusDesktop(sessionId) {
     const r = await api.activateDesktop(sessionId);
     if (r && r.ok) {
       showToast(`已切到 Claude Desktop（${r.session_name}）`, "ok");
-    } else {
-      const reasonMap = {
-        session_not_tracked: "桥接还没追踪到这个会话；等一秒再试",
-        claude_app_not_running: "Claude.app 没运行；先打开它再试",
-        button_not_found: r.hint || "侧栏 Recents 找不到该会话（侧栏可能折叠了，按 ⌘B 展开后重试）",
-        ax_unavailable: r.detail || "AX 不可用（辅助功能权限或依赖缺失）",
-        ax_press_failed: `AXPress 调用失败 err=${r.err}`,
-        ax_press_exception: r.detail || "AXPress 异常",
-      };
-      showToast(reasonMap[r.reason] || r.reason || "未知错误", "err");
+      return;
     }
+    // R41：button_not_found / session_not_tracked 都多半因为用户已在 Claude.app 内
+    // 删除/归档了该 session → 直接问是否从 dashboard 清掉，省去手动操作
+    if (r && (r.reason === "button_not_found" || r.reason === "session_not_tracked")) {
+      const msg = r.reason === "button_not_found"
+        ? ("在 Claude Desktop 的 Recents 列表找不到这个会话了。\n\n" +
+           "可能：1) 侧栏被折叠（⌘B 展开后再试）；2) 已在 Claude.app 中删除/归档。\n\n" +
+           "是否从 dashboard 也删除这条卡片？")
+        : ("桥接已不再追踪这个会话（多半已在 Claude.app 中删除/归档；或被标记已结束）。\n\n" +
+           "是否从 dashboard 也删除这条卡片？");
+      const ok = confirm(msg);
+      if (ok) {
+        try {
+          const dr = await api.deleteSession(sessionId);
+          if (dr && dr.ok) {
+            showToast(`已删除：${dr.name || sessionId.slice(0, 8)}`, "ok");
+            state.sessions = (state.sessions || []).filter(s => s.session_id !== sessionId);
+            if (state.drawerSessionId === sessionId) closeDrawer();
+            renderSessions();
+          } else {
+            showToast("删除失败", "err");
+          }
+        } catch (err) {
+          showToast("删除失败：" + err.message, "err");
+        }
+      }
+      return;
+    }
+    const reasonMap = {
+      session_not_tracked: "桥接还没追踪到这个会话；等一秒再试",
+      claude_app_not_running: "Claude.app 没运行；先打开它再试",
+      ax_unavailable: r.detail || "AX 不可用（辅助功能权限或依赖缺失）",
+      ax_press_failed: `AXPress 调用失败 err=${r.err}`,
+      ax_press_exception: r.detail || "AXPress 异常",
+    };
+    showToast(reasonMap[r.reason] || r.reason || "未知错误", "err");
   } catch (e) {
     showToast(`切到 Desktop 失败：${e.message}`, "err");
   }
@@ -1546,6 +1582,21 @@ function onWsEnvelope(env) {
     renderSessions();
     return;
   }
+  if (env.type === "session_deleted") {
+    // R40：别处 dashboard 或 API 删除了 session → 这里同步移除卡片
+    const sid = env.session_id;
+    if (sid) {
+      state.sessions = (state.sessions || []).filter(s => s.session_id !== sid);
+      if (state.drawerSessionId === sid) closeDrawer();
+      renderSessions();
+    }
+    return;
+  }
+  if (env.type === "session_restored") {
+    // R40：撤销删除 → 拉一次 sessions 把它捞回来
+    loadSessions();
+    return;
+  }
   if (env.type === "enrichment_updated") {
     // LLM 摘要补到位（topic 或 event）；更新对应 session + 抽屉事件流
     if (env.session && env.session.session_id) {
@@ -1821,6 +1872,31 @@ if ($drawerFocus) {
     }
   });
 }
+// R40：drawer 内"删除"按钮 — DELETE /api/sessions/{sid}
+if ($drawerDelete) {
+  $drawerDelete.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    if ($drawerDelete.disabled) return;
+    const sid = $drawerDelete.dataset.sid;
+    if (!sid) return;
+    if (!confirm("从 dashboard 彻底删除这个 session？\n(events.jsonl 仍保留事件历史；如需恢复可在『已删除』面板还原)")) return;
+    try {
+      const r = await api.deleteSession(sid);
+      if (r && r.ok) {
+        showToast(`已删除：${r.name || sid.slice(0, 8)}`, "ok");
+        // 立即从前端 state 移除 + 关 drawer + 重渲染
+        state.sessions = (state.sessions || []).filter(s => s.session_id !== sid);
+        closeDrawer();
+        renderSessions();
+      } else {
+        showToast("删除失败：" + (r && (r.detail || r.reason) || "未知"), "err");
+      }
+    } catch (err) {
+      showToast("删除失败：" + err.message, "err");
+    }
+  });
+}
+
 // R38：drawer 内"标记已结束"按钮 — 调 /api/sessions/{sid}/mark-dead
 if ($drawerMarkDead) {
   $drawerMarkDead.addEventListener("click", async (e) => {

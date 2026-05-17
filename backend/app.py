@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg_mod
-from . import aliases, decision_log, desktop_bridge, enrichments, event_store, feishu, liveness_watcher, notes, notify_policy
+from . import aliases, decision_log, desktop_bridge, enrichments, event_store, feishu, hidden_sessions, liveness_watcher, notes, notify_policy
 from . import llm as llm_mod
 from . import transcript_reader
 
@@ -546,6 +546,52 @@ def _build_focus_script(tty: str) -> str:
         'end try\n'
         'return "not_found"\n'
     )
+
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """R40：彻底删除 session（从 dashboard 移除）。
+    与 mark-dead 区别：mark-dead 只改 status=dead 卡片仍在；delete 让 list_sessions 跳过该 sid。
+    events.jsonl 中的事件**保留**（审计 / 调试），只是 dashboard 不展示。
+    desktop_app source 还会同步通知 bridge.forget_session（防止 bridge 重新追踪）。
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        raise HTTPException(400, "session_id required")
+    summary = _session_summary(sid)
+    name = (summary or {}).get("display_name") or (summary or {}).get("cwd_short") or sid[:8]
+    source = (summary or {}).get("source") or ""
+    hidden_sessions.add(sid, name=name, source=source)
+    # 通知 bridge（如果是 desktop_app）
+    if source == "desktop_app":
+        bridge = getattr(app.state, "desktop_bridge", None)
+        if bridge:
+            try:
+                bridge.forget_session(sid)
+            except Exception:
+                log.exception("bridge.forget_session failed during delete")
+    # WS 广播让 dashboard 立即移除卡片
+    await hub.broadcast({"type": "session_deleted", "session_id": sid})
+    return {"ok": True, "session_id": sid, "name": name}
+
+
+@app.post("/api/sessions/{session_id}/restore")
+async def restore_session(session_id: str):
+    """R40：撤销删除（unhide）。事件回到 dashboard。"""
+    sid = (session_id or "").strip()
+    if not sid:
+        raise HTTPException(400, "session_id required")
+    removed = hidden_sessions.remove(sid)
+    if not removed:
+        return {"ok": False, "reason": "not_hidden"}
+    await hub.broadcast({"type": "session_restored", "session_id": sid})
+    return {"ok": True, "session_id": sid}
+
+
+@app.get("/api/sessions/hidden")
+def list_hidden():
+    """R40：列出已删除的 sid 列表（dashboard 设置面板可显示恢复入口）。"""
+    return hidden_sessions.load_all()
 
 
 @app.post("/api/sessions/{session_id}/mark-dead")

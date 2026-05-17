@@ -60,11 +60,11 @@ RECENTS_ANCHOR_TITLE = ("recents", "最近")  # 侧栏 "Recents" 按钮的 title
 
 # 状态翻转判定阈值
 DEFAULT_POLL_INTERVAL = 1.0
-# R34 注：Claude Desktop 的 sidebar Recents 列表 a11y 暴露不稳定 ——
-# Chromium virtual scroll 离屏元素不暴露 / 用户折叠 sidebar / 切换不同区段时 AX tree 抖动。
-# 这里用大窗口避免误 reap：会话从 Recents 列表消失超过 N 秒才 SessionEnd。
-WINDOW_DEAD_TIMEOUT_SEC = 60.0
-HEARTBEAT_EVERY_TICKS = 30     # 每 30 个 tick (≈30s) 发一次 Heartbeat 保 session 不被算 dead
+# R41：reap timeout 60→5s。
+# 用户在 Claude.app 内删除某个 session 后期待 dashboard 立即清掉，60s 太慢。
+# R36 已修"reap 只 kill 同 mode 失踪 track"，切 tab 抖动不会误杀；5s 是兼顾的下限。
+WINDOW_DEAD_TIMEOUT_SEC = 5.0
+HEARTBEAT_EVERY_TICKS = 30     # （已废，R39 撤掉 Heartbeat，保留常量避免误用）
 
 
 # ───────── AX 适配层 ─────────

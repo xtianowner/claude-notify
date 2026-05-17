@@ -809,6 +809,26 @@ main {
   gap: var(--sp-2);
   flex-shrink: 0;
 }
+/* R40：drawer 内"删除"按钮（红色 destructive） */
+.btn-delete {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(180, 30, 30, 0.45);
+  background: rgba(220, 50, 50, 0.10);
+  color: #8a0e0e;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.btn-delete:hover:not(:disabled) {
+  background: rgba(220, 50, 50, 0.20);
+}
+.btn-delete:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 /* R38：drawer 内"标记已结束"按钮（warning 色），与 → 终端 / → Desktop / 关闭 并排 */
 .btn-mark-dead {
   font-size: 12px;
