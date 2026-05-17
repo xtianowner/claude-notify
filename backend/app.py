@@ -943,13 +943,30 @@ async def ws_endpoint(ws: WebSocket):
         await hub.remove(ws)
 
 
+class _NoCacheStaticFiles(StaticFiles):
+    """R34：dev 改动浏览器立即生效。
+    FastAPI/Starlette StaticFiles 默认带 etag + last-modified，浏览器会 304 复用旧版本。
+    我们这是无构建步骤的纯 vanilla 前端，热改文件后用户必然期望刷新就拿到新版；
+    全量 no-cache + must-revalidate 强制每次回源。代价：每次刷新多走一次 200，可忽略。
+    """
+    async def get_response(self, path, scope):
+        resp = await super().get_response(path, scope)
+        try:
+            resp.headers["cache-control"] = "no-cache, no-store, must-revalidate"
+            resp.headers["pragma"] = "no-cache"
+            resp.headers["expires"] = "0"
+        except Exception:
+            pass
+        return resp
+
+
 def _mount_frontend():
     if FRONTEND_DIST.is_dir() and (FRONTEND_DIST / "index.html").exists():
-        app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")
+        app.mount("/", _NoCacheStaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")
         log.info("mounted frontend dist: %s", FRONTEND_DIST)
         return
     if (FRONTEND_SRC / "index.html").exists():
-        app.mount("/", StaticFiles(directory=str(FRONTEND_SRC), html=True), name="frontend")
+        app.mount("/", _NoCacheStaticFiles(directory=str(FRONTEND_SRC), html=True), name="frontend")
         log.info("mounted frontend src: %s", FRONTEND_SRC)
         return
 
