@@ -641,14 +641,32 @@ async def mark_dead(session_id: str):
 
 @app.post("/api/sessions/{session_id}/activate-desktop")
 async def activate_desktop(session_id: str):
-    """R34：dashboard 卡片点 "→ Desktop" 时调。
-    通过 AXPress 模拟点击 Claude Desktop 侧栏 Recents 列表里对应 session button +
-    open -a Claude 把 app 切前台。
+    """R34/R44：dashboard 卡片点 "→ Desktop" 时调。
+    - source=desktop_app session（bridge.tracks 内）：AXPress 模拟点击侧栏 + open -a Claude
+    - desktop_embedded session（hook 视角，bridge.tracks 中没有该 sid）：仅 open -a Claude
+      把 app 拉前台；Claude Desktop 的 Code mode 当前 session 就是该卡片对应的会话，
+      不需要点击侧栏切换
     """
     bridge = getattr(app.state, "desktop_bridge", None)
     if not bridge:
         raise HTTPException(503, "desktop_bridge 未启用（cfg.desktop_bridge.enabled=false）")
-    # AX 调用是同步 + subprocess，扔给 worker thread 避免阻塞 event loop
+    # 先看 bridge 有没有 track 这个 sid，没有 → 走 desktop_embedded 简化路径
+    if session_id not in bridge.tracks:
+        summary = _session_summary(session_id)
+        if summary and summary.get("desktop_embedded"):
+            try:
+                import subprocess
+                subprocess.Popen(["open", "-a", "Claude"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return {
+                    "ok": True,
+                    "session_name": summary.get("display_name") or session_id[:8],
+                    "mode": "Code",
+                    "via": "open_app_only",
+                }
+            except Exception as e:
+                return {"ok": False, "reason": "open_app_failed", "detail": str(e)}
+    # AX 调用同步 + subprocess，扔给 worker thread 避免阻塞 event loop
     return await asyncio.to_thread(bridge.activate_session, session_id)
 
 

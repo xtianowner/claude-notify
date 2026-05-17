@@ -514,8 +514,8 @@ function sessionCardHTML(s) {
 
   const summaryHtml = `<div class="item-summary" title="${escapeHtml(summaryRaw || summary)}"><span class="item-summary-label">${escapeHtml(summaryLabel)}</span><span class="item-summary-text">${escapeHtml(summary)}</span></div>`;
 
-  // R34：desktop_app 显示 "→ Desktop" 调 AXPress 模拟点击侧栏会话；其它 source 显示 "→ 终端"
-  const isDesktop = s.source === "desktop_app";
+  // R34/R44：source=desktop_app 或 desktop_embedded → "→ Desktop"；其它 → "→ 终端"
+  const isDesktop = s.source === "desktop_app" || !!s.desktop_embedded;
   let focusBtnHtml;
   if (isDesktop) {
     focusBtnHtml = `<button class="btn-focus btn-focus-desktop" data-sid="${escapeHtml(sid)}" type="button" title="切到 Claude Desktop 该会话" aria-label="打开 Desktop 会话">→ Desktop</button>`;
@@ -535,18 +535,18 @@ function sessionCardHTML(s) {
     ? `<span class="urgency-badge urgency-menu" title="Claude 等你做选择">🔥 指令选择·待响应</span>`
     : "";
 
-  // R31/R36/R43：source 来源徽章
-  // - source=desktop_app（AX bridge 视角）→ "🖥 Desktop · <mode>"
-  // - source=claude_code + desktop_embedded（嵌入 CLI 视角）→ "🖥 Desktop · Code (CLI)"
+  // R31/R36/R43/R44：source 徽章统一文案 "🖥 Desktop · <mode>"，按颜色区分数据来源
+  // - source=desktop_app（AX bridge 视角，蓝色）
+  // - source=claude_code + desktop_embedded（嵌入 hook 视角，紫色，hover 才看到说明）
   // - 其它 source=claude_code → 无徽章（隐式默认 = 终端）
   let sourceBadgeHtml = "";
   if (s.source === "desktop_app") {
     const mode = s.mode || "";
     const modeSuffix = mode ? ` · ${mode}` : "";
-    const title = `Claude Desktop${mode ? ` · ${mode} 板块` : ""}`;
+    const title = `Claude Desktop${mode ? ` · ${mode} 板块` : ""}（AX 桥接视角）`;
     sourceBadgeHtml = `<span class="source-badge source-desktop" title="${escapeHtml(title)}">🖥 Desktop${escapeHtml(modeSuffix)}</span>`;
   } else if (s.desktop_embedded) {
-    sourceBadgeHtml = `<span class="source-badge source-desktop-cli" title="Claude Desktop Code mode 内嵌的 CLI 子进程（走 hook 链路）">🖥 Desktop · Code (CLI)</span>`;
+    sourceBadgeHtml = `<span class="source-badge source-desktop-cli" title="Claude Desktop Code 当前会话（hook 链路视角，含工具调用 / cwd 等 CLI 元数据）">🖥 Desktop · Code</span>`;
   }
 
   const metaLeftBits = escapeHtml(s.cwd_short || "");
@@ -763,8 +763,9 @@ async function openDrawer(sessionId) {
     // → 终端按钮：根据 source 决定文案 + 调用路径
     if ($drawerFocus) {
       $drawerFocus.dataset.sid = sessionId;
-      $drawerFocus.classList.toggle("btn-focus-desktop", s.source === "desktop_app");
-      if (s.source === "desktop_app") {
+      const isDsk = s.source === "desktop_app" || !!s.desktop_embedded;
+      $drawerFocus.classList.toggle("btn-focus-desktop", isDsk);
+      if (isDsk) {
         $drawerFocus.textContent = "→ Desktop";
         $drawerFocus.disabled = false;
         $drawerFocus.title = "切到 Claude Desktop 该会话";
