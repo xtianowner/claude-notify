@@ -387,6 +387,53 @@ def _read_transcript_tail(path: str, max_chars: int = 800) -> str:
         return ""
 
 
+@app.get("/api/desktop-bridge/status")
+def desktop_bridge_status():
+    """R31：dashboard 诊断面板用。报告 desktop_bridge 当前状态：
+    - configured: cfg.desktop_bridge.enabled
+    - running: lifespan task 真的起来了
+    - ax_available / ax_trusted: AX 框架可用 + 当前 python 有辅助功能权限
+    - claude_pid: 探测到的 Claude.app 主进程 PID
+    - tracked_windows: 当前追踪的窗口数（含 title / state）
+    """
+    cfg = cfg_mod.load()
+    dsk_cfg = cfg.get("desktop_bridge") or {}
+    info: dict[str, Any] = {
+        "configured": bool(dsk_cfg.get("enabled")),
+        "poll_interval_seconds": float(dsk_cfg.get("poll_interval_seconds") or 1.0),
+        "running": False,
+        "ax_available": False,
+        "ax_trusted": False,
+        "ax_error": "",
+        "claude_pid": None,
+        "tracked_windows": [],
+        "python_executable": __import__("sys").executable,
+    }
+    try:
+        ax = desktop_bridge._load_ax()
+        info["ax_available"] = True
+        info["ax_trusted"] = bool(ax["trusted"]())
+    except desktop_bridge.AXUnavailable as e:
+        info["ax_error"] = f"ApplicationServices 模块未安装: {e}（pip install -r backend/requirements-desktop.txt）"
+    info["claude_pid"] = desktop_bridge._find_claude_pid()
+    bridge = getattr(app.state, "desktop_bridge", None)
+    if bridge:
+        info["running"] = True
+        if bridge._ax_error:
+            info["ax_error"] = bridge._ax_error
+        info["tracked_windows"] = [
+            {
+                "session_id": t.session_id,
+                "window_id": t.window_id,
+                "title": t.title,
+                "state": t.state,
+                "last_event": t.last_event_emitted,
+            }
+            for t in bridge.tracks.values()
+        ]
+    return info
+
+
 @app.get("/api/sessions")
 def list_sessions(include_terminal: bool = True, include_archive: bool = False):
     cfg = cfg_mod.load()

@@ -9,6 +9,29 @@
 
 ---
 
+## A. Claude Desktop 桥接 `desktop_bridge`（R30+，macOS only）
+
+通过 macOS Accessibility API 监控 Claude Desktop（`/Applications/Claude.app`）的窗口状态，把"生成中 / 等输入 / 等确认"映射成 Stop / Notification 事件，复用现有推送链路。
+
+| 字段 | 默认 | 取值/类型 | 含义 |
+|---|---|---|---|
+| `desktop_bridge.enabled` | `false` | bool | 启用 AX 桥接 task。**改完必须重启 backend** 才生效（lifespan 起停） |
+| `desktop_bridge.poll_interval_seconds` | `1.0` | float | 轮询间隔，1.0 平衡灵敏度与 CPU；UI 改版调试时可临时降到 0.5 |
+| `desktop_bridge.waiting_debounce_seconds` | `1.5` | float | generating → idle 翻转后多久才视为"真等输入"（避免渲染抖动误报） |
+
+**前置**：
+1. `pip install -r backend/requirements-desktop.txt`
+2. 系统设置 → 隐私与安全 → 辅助功能 → 加入 backend 运行的 python 解释器
+3. dashboard 改 `desktop_bridge.enabled=true` → 重启 backend
+
+**诊断**：
+- `curl http://127.0.0.1:8787/api/desktop-bridge/status` 一次看清 configured / running / ax_trusted / claude_pid / 当前追踪窗口
+- `python3 scripts/desktop_ax_dump.py` 离线 dump Claude.app 完整 AX 树（用于 label 漂移排查）
+
+**事件 source**：桥接产出的事件 `source="desktop_app"`，dashboard 卡片右上多一个 🖥 Desktop 蓝色徽章；其余字段（status / urgency / mute / quiet_hours）与 CLI 完全共用。
+
+---
+
 ## 0. 推送渠道 `push_channels`（L41 / R16）
 
 两条独立渠道。可只开 browser 完全脱离飞书使用。

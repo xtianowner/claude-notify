@@ -1609,6 +1609,27 @@ main {
   font-weight: 700;
 }
 
+/* R31：source 来源徽章（Claude Desktop / 未来其它桥接） */
+.source-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  border: 1px solid rgba(120, 100, 200, 0.30);
+  background: rgba(120, 100, 200, 0.08);
+  color: #5a4a99;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+.source-badge.source-desktop {
+  border-color: rgba(80, 130, 200, 0.32);
+  background: rgba(80, 130, 200, 0.08);
+  color: #2c5a99;
+}
+
 /* ════════════════════════════════════════════════════════════════════
    0511 Phase 2 响应式补强：中段断点 / container query / workspace grid
    决策见 docs/ui/0511-1018-phase2-responsive-decisions.md

@@ -484,6 +484,11 @@ function sessionCardHTML(s) {
     ? `<span class="urgency-badge urgency-menu" title="Claude 等你做选择">🔥 指令选择·待响应</span>`
     : "";
 
+  // R31：source 来源徽章（claude_code 是隐式默认不渲染，desktop_app 显式标）
+  const sourceBadgeHtml = s.source === "desktop_app"
+    ? `<span class="source-badge source-desktop" title="Claude Desktop（macOS app）">🖥 Desktop</span>`
+    : "";
+
   const metaLeftBits = escapeHtml(s.cwd_short || "");
   const fullTitle = fullTimeShanghai(s.last_event_ts);
   const metaRightBits = `<span title="${escapeHtml(fullTitle)}">${escapeHtml(relTime(s.last_event_ts))}</span>`;
@@ -502,6 +507,7 @@ function sessionCardHTML(s) {
         <span class="name" title="${escapeHtml(sid)}">${name}</span>
         <button class="alias-edit" data-sid="${escapeHtml(sid)}" type="button" title="起别名/备注" aria-label="起别名">✎</button>
         <span class="${statusBadgeClass(status)}">${escapeHtml(statusLabel(status))}</span>
+        ${sourceBadgeHtml}
         ${menuBadgeHtml}
         ${mutedBadge}
       </div>
