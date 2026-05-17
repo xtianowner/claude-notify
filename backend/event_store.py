@@ -548,6 +548,7 @@ def list_sessions(active_window_minutes: int = 30,
                 "_last_stop_event_type": "",  # Stop / SubagentStop
                 "menu_detected": False,  # R11：最近一次 Notification 是否在菜单 prompt 上
                 "_last_status_event_unix": 0.0,  # L44：最近一次 status-changing 事件 unix ts
+                "mode": evt.get("mode") or "",   # R36：Desktop session 的 tab（Code/Cowork）
             }
             sessions[sid] = s
         ev_name = evt.get("event") or ""
@@ -597,6 +598,8 @@ def list_sessions(active_window_minutes: int = 30,
             s["cwd_short"] = evt.get("cwd_short")
         if not s.get("source") and evt.get("source"):
             s["source"] = evt.get("source")
+        if evt.get("mode") and not s.get("mode"):
+            s["mode"] = evt.get("mode")
         s["event_count"] += 1
         et = evt.get("event") or "unknown"
         s["events_by_type"][et] = s["events_by_type"].get(et, 0) + 1

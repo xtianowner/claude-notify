@@ -37,6 +37,11 @@ export const api = {
     jsonFetch(`/api/sessions/${encodeURIComponent(sessionId)}/activate-desktop`, {
       method: "POST",
     }),
+  // R38：用户手动标记 session 为已结束（dead）
+  markDead: (sessionId) =>
+    jsonFetch(`/api/sessions/${encodeURIComponent(sessionId)}/mark-dead`, {
+      method: "POST",
+    }),
   // L14: per-session 静音
   // minutes: number (分钟) | null（永久）；scope: "all" | "stop_only"
   muteSession: (sessionId, { minutes = null, scope = "all", label = "" } = {}) =>

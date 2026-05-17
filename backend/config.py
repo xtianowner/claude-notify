@@ -156,7 +156,7 @@ DEFAULTS: dict[str, Any] = {
     "feishu_webhook": "",
     "feishu_secret": "",
     "timeout_minutes": 5,
-    "dead_threshold_minutes": 30,
+    "dead_threshold_minutes": 180,   # R38：3 小时；之前 30min 对长任务过激（误标 dead）
     "active_window_minutes": 30,
     "liveness_per_state_timeout": DEFAULT_LIVENESS_PER_STATE_TIMEOUT,
     "archival": DEFAULT_ARCHIVAL,

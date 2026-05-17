@@ -526,6 +526,51 @@ def _build_focus_script(tty: str) -> str:
     )
 
 
+@app.post("/api/sessions/{session_id}/mark-dead")
+async def mark_dead(session_id: str):
+    """R38：用户手动把某个 session 标记为已结束。
+    用途：watcher 没及时识别 / desktop session 被滚出 Recents 列表 / 桥接误判等场景。
+    实现：append 一条 SessionDead 事件，复用 derive_status 让 status="dead"。
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        raise HTTPException(400, "session_id required")
+    summary = _session_summary(sid)
+    if not summary:
+        raise HTTPException(404, "session not found")
+    if summary.get("status") in ("dead", "ended"):
+        return {"ok": True, "already": True, "status": summary.get("status")}
+    evt = {
+        "ts": event_store.now_iso(),
+        "source": summary.get("source") or "claude_code",
+        "session_id": sid,
+        "event": "SessionDead",
+        "cwd": summary.get("cwd", ""),
+        "cwd_short": summary.get("cwd_short", ""),
+        "project": summary.get("project", ""),
+        "transcript_path": summary.get("transcript_path", ""),
+        "claude_pid": summary.get("claude_pid"),
+        "message": "用户手动标记为已结束",
+        "reason": "user_marked",
+        "raw": {
+            "detector": "user_action",
+            "user_marked": True,
+        },
+    }
+    event_store.append_event(evt)
+    # R38：desktop_app source → 通知 bridge 别再 emit 该 sid（否则下个 tick 重新翻活 status）
+    if (summary.get("source") or "") == "desktop_app":
+        bridge = getattr(app.state, "desktop_bridge", None)
+        if bridge:
+            try:
+                bridge.forget_session(sid)
+            except Exception:
+                log.exception("bridge.forget_session failed")
+    # 派发：广播 WS + push 决策（mute / quiet hour 仍然适用，user 主动操作不强推飞书）
+    asyncio.create_task(_dispatch(evt))
+    return {"ok": True, "session_id": sid, "marked_at": evt["ts"]}
+
+
 @app.post("/api/sessions/{session_id}/activate-desktop")
 async def activate_desktop(session_id: str):
     """R34：dashboard 卡片点 "→ Desktop" 时调。

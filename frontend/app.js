@@ -111,6 +111,7 @@ const $drawerDot      = $("drawer-dot");
 const $drawerTitle    = $("drawer-title");
 const $drawerStatus   = $("drawer-status");
 const $drawerSub      = $("drawer-sub");
+const $drawerMarkDead = $("drawer-mark-dead");
 const $drawerMeta     = $("drawer-meta");
 const $drawerMetaToggle = $("drawer-meta-toggle");
 const $drawerMetaBody = $("drawer-meta-body");
@@ -182,12 +183,12 @@ function renderSessions() {
     renderSummaryPill();
     return;
   }
-  // L24：grouped 视图按 cwd_short 分桶；list 视图保持平坦
+  // L24：grouped 视图按 cwd_short 分桶；list 视图按 source/mode 分段（R37：终端 / Desktop·Code / Desktop·Cowork 不混放）
   if (state.viewMode === "grouped") {
     $sessions.innerHTML = renderGroupedHTML(visible);
     bindGroupHeaderEvents();
   } else {
-    $sessions.innerHTML = visible.map(sessionCardHTML).join("");
+    $sessions.innerHTML = renderListWithSections(visible);
   }
   $sessions.querySelectorAll(".session-item").forEach(el => {
     el.addEventListener("click", (e) => {
@@ -236,6 +237,39 @@ function renderSessions() {
   renderSummaryPill();
   // 若 URL hash 命中，应用高亮
   applyHashHighlight();
+}
+
+// ───────────── R37：列表视图按 source / mode 分段 ─────────────
+// 终端会话 / Desktop·Code / Desktop·Cowork 三段，桶间不混放
+function categorizeSession(s) {
+  if (s.source === "desktop_app") {
+    return s.mode === "Cowork" ? "desktop-cowork" : "desktop-code";
+  }
+  return "terminal";
+}
+const LIST_SECTION_ORDER = ["terminal", "desktop-code", "desktop-cowork"];
+const LIST_SECTION_LABEL = {
+  "terminal": "终端 (Claude Code CLI)",
+  "desktop-code": "Claude Desktop · Code",
+  "desktop-cowork": "Claude Desktop · Cowork",
+};
+
+function renderListWithSections(visible) {
+  const buckets = { "terminal": [], "desktop-code": [], "desktop-cowork": [] };
+  for (const s of visible) {
+    const cat = categorizeSession(s);
+    if (!buckets[cat]) buckets[cat] = [];
+    buckets[cat].push(s);
+  }
+  const parts = [];
+  for (const key of LIST_SECTION_ORDER) {
+    const arr = buckets[key] || [];
+    if (arr.length === 0) continue;
+    const label = LIST_SECTION_LABEL[key];
+    parts.push(`<div class="list-section-head">${escapeHtml(label)} <span class="list-section-count">${arr.length}</span></div>`);
+    parts.push(`<div class="list-section-body">${arr.map(sessionCardHTML).join("")}</div>`);
+  }
+  return parts.join("");
 }
 
 // ───────────── L24：按项目（cwd_short）分组视图 ─────────────
@@ -495,10 +529,14 @@ function sessionCardHTML(s) {
     ? `<span class="urgency-badge urgency-menu" title="Claude 等你做选择">🔥 指令选择·待响应</span>`
     : "";
 
-  // R31：source 来源徽章（claude_code 是隐式默认不渲染，desktop_app 显式标）
-  const sourceBadgeHtml = s.source === "desktop_app"
-    ? `<span class="source-badge source-desktop" title="Claude Desktop（macOS app）">🖥 Desktop</span>`
-    : "";
+  // R31/R36：source 来源徽章（claude_code 隐式默认不渲染；desktop_app 显式标 + mode 后缀）
+  let sourceBadgeHtml = "";
+  if (s.source === "desktop_app") {
+    const mode = s.mode || "";
+    const modeSuffix = mode ? ` · ${mode}` : "";
+    const title = `Claude Desktop${mode ? ` · ${mode} 板块` : ""}`;
+    sourceBadgeHtml = `<span class="source-badge source-desktop" title="${escapeHtml(title)}">🖥 Desktop${escapeHtml(modeSuffix)}</span>`;
+  }
 
   const metaLeftBits = escapeHtml(s.cwd_short || "");
   const fullTitle = fullTimeShanghai(s.last_event_ts);
@@ -711,14 +749,29 @@ async function openDrawer(sessionId) {
     $drawerStatus.className = statusBadgeClass(status);
     $drawerStatus.textContent = statusLabel(status);
     $drawerStatus.classList.remove("hidden");
-    // → 终端按钮：根据 tty 是否存在决定 disabled
+    // → 终端按钮：根据 source 决定文案 + 调用路径
     if ($drawerFocus) {
-      const hasTty = !!(s.tty && String(s.tty).trim());
-      $drawerFocus.disabled = !hasTty;
       $drawerFocus.dataset.sid = sessionId;
-      $drawerFocus.title = hasTty
-        ? "在终端中打开（切到对应 tab）"
-        : "该 session 还没记录到 tty（再触发一次 hook 即可）";
+      $drawerFocus.classList.toggle("btn-focus-desktop", s.source === "desktop_app");
+      if (s.source === "desktop_app") {
+        $drawerFocus.textContent = "→ Desktop";
+        $drawerFocus.disabled = false;
+        $drawerFocus.title = "切到 Claude Desktop 该会话";
+      } else {
+        const hasTty = !!(s.tty && String(s.tty).trim());
+        $drawerFocus.textContent = "→ 终端";
+        $drawerFocus.disabled = !hasTty;
+        $drawerFocus.title = hasTty
+          ? "在终端中打开（切到对应 tab）"
+          : "该 session 还没记录到 tty（再触发一次 hook 即可）";
+      }
+    }
+    // R38：mark-dead 按钮（已 dead / ended 时禁用 + 改文案）
+    if ($drawerMarkDead) {
+      $drawerMarkDead.dataset.sid = sessionId;
+      const terminal = s.status === "dead" || s.status === "ended";
+      $drawerMarkDead.disabled = terminal;
+      $drawerMarkDead.textContent = terminal ? "已结束" : "标记已结束";
     }
   } else {
     $drawerDot.style.background = "var(--c-idle-solid)";
@@ -728,6 +781,11 @@ async function openDrawer(sessionId) {
     if ($drawerFocus) {
       $drawerFocus.disabled = true;
       $drawerFocus.dataset.sid = sessionId;
+    }
+    if ($drawerMarkDead) {
+      $drawerMarkDead.disabled = true;
+      $drawerMarkDead.dataset.sid = sessionId;
+      $drawerMarkDead.textContent = "标记已结束";
     }
   }
 
@@ -1754,7 +1812,37 @@ if ($drawerFocus) {
     e.stopPropagation();
     if ($drawerFocus.disabled) return;
     const sid = $drawerFocus.dataset.sid;
-    if (sid) onFocusTerminal(sid);
+    if (!sid) return;
+    // R38：按 source 分流（desktop_app → AXPress 跳转；其它 → osascript 切终端）
+    if ($drawerFocus.classList.contains("btn-focus-desktop")) {
+      onFocusDesktop(sid);
+    } else {
+      onFocusTerminal(sid);
+    }
+  });
+}
+// R38：drawer 内"标记已结束"按钮 — 调 /api/sessions/{sid}/mark-dead
+if ($drawerMarkDead) {
+  $drawerMarkDead.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    if ($drawerMarkDead.disabled) return;
+    const sid = $drawerMarkDead.dataset.sid;
+    if (!sid) return;
+    if (!confirm("把这个 session 标记为已结束？\n(已结束后会从默认列表筛选掉，但仍可在事件流里看历史)")) return;
+    try {
+      const r = await api.markDead(sid);
+      if (r && r.ok) {
+        showToast(r.already ? "已经是结束状态" : "已标记为已结束", "ok");
+        // 立即禁用按钮 + 刷新数据（WS 也会推一条 SessionDead 事件）
+        $drawerMarkDead.disabled = true;
+        $drawerMarkDead.textContent = "已结束";
+        loadSessions();
+      } else {
+        showToast("标记失败：" + (r && (r.detail || r.reason) || "未知"), "err");
+      }
+    } catch (err) {
+      showToast("标记失败：" + err.message, "err");
+    }
   });
 }
 

@@ -416,6 +416,7 @@ def _normalize_desktop_app(raw: dict[str, Any]) -> dict[str, Any]:
     """
     raw_extra = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
     window_title = raw.get("window_title") or raw_extra.get("window_title") or ""
+    mode = raw.get("mode") or raw_extra.get("mode") or ""   # R36：Code / Cowork
     msg = raw.get("message") or _summarize_desktop(raw, window_title)
     return {
         "source": DESKTOP_APP,
@@ -423,7 +424,7 @@ def _normalize_desktop_app(raw: dict[str, Any]) -> dict[str, Any]:
         "event": raw.get("event") or "Unknown",
         "cwd": "",
         "cwd_short": window_title[:48],
-        "project": raw.get("project") or "Claude Desktop",
+        "project": raw.get("project") or ("Claude Desktop · " + mode if mode else "Claude Desktop"),
         "message": msg,
         "transcript_path": "",
         "claude_pid": raw.get("claude_pid"),
@@ -437,6 +438,7 @@ def _normalize_desktop_app(raw: dict[str, Any]) -> dict[str, Any]:
         "window_title": window_title,
         "window_id": raw.get("window_id") or raw_extra.get("window_id") or "",
         "conversation_id": raw.get("conversation_id") or raw_extra.get("conversation_id") or "",
+        "mode": mode,   # R36：透传到 events.jsonl，event_store list_sessions 后由 dashboard 渲染
         "raw": raw_extra or raw,
     }
 

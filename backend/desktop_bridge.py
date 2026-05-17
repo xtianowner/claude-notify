@@ -50,6 +50,11 @@ RUNNING_KEYWORDS = ("running", "generating", "thinking", "working", "进行中",
 BLOCKED_KEYWORDS = ("blocked", "waiting", "needs input", "needs review", "waiting for", "等输入", "等待", "需要", "需要您")
 # 其它（idle / done / completed / 空）→ idle
 
+# R36 Claude Desktop 顶部 Mode 切换：Chat / Cowork / Code 三个 button
+# 实测唯一信号：当前激活 tab 的 button 有 AXARIACurrent='page'（aria-current=page）
+ALLOWED_MODES = ("Code", "Cowork")   # 我们只采这两个；Chat 完全忽略
+ALL_MODES = ("Chat", "Cowork", "Code")
+
 # Recents 容器识别（来自 sidebar landmark）
 RECENTS_ANCHOR_TITLE = ("recents", "最近")  # 侧栏 "Recents" 按钮的 title 关键字
 
@@ -133,7 +138,8 @@ class SessionSnapshot:
     status_raw: str         # AX 原始状态字（"Running" / "Idle" / ...）
     state: str              # 映射后："generating" / "idle" / "waiting_input"
     pid: int
-    # name + pid 复合 hash 作为稳定 session_id
+    mode: str = ""          # R36：所属 tab — "Code" / "Cowork"
+    # (pid, mode, name) 复合 hash 作为稳定 session_id
 
 
 def _classify_state(status_raw: str) -> str:
@@ -147,9 +153,40 @@ def _classify_state(status_raw: str) -> str:
     return "idle"
 
 
-def _stable_session_id(pid: int, name: str) -> str:
-    h = hashlib.md5(f"desktop:{pid}:{name}".encode("utf-8")).hexdigest()
+def _stable_session_id(pid: int, name: str, mode: str = "") -> str:
+    # R36：mode 进入 hash，让 Code 与 Cowork 同名 session 互不串
+    h = hashlib.md5(f"desktop:{pid}:{mode}:{name}".encode("utf-8")).hexdigest()
     return f"dsk-{h[:12]}"
+
+
+def _detect_active_mode(ax, app_el) -> Optional[str]:
+    """R36：从顶部 Mode 切换按钮组找当前激活的 tab。
+    AX 信号：选中的 button 有 AXARIACurrent='page'；未选中的没这个属性。
+    返回 "Chat"/"Cowork"/"Code" 之一；找不到返回 None（采集器应跳过该 tick）。
+    """
+    found: dict[str, bool] = {}
+
+    def visit(el, depth):
+        if depth > 18:
+            return
+        role = _ax_attr(ax, el, "AXRole") or ""
+        if role == "AXButton":
+            desc = _ax_attr(ax, el, "AXDescription") or ""
+            if desc in ALL_MODES:
+                cur = _ax_attr(ax, el, "AXARIACurrent")
+                # AXARIACurrent 非 None 即视为激活；实测值是 'page'
+                found[desc] = bool(cur)
+                return  # 不下钻 Mode button
+        for k in (_ax_attr(ax, el, "AXChildren") or []):
+            visit(k, depth + 1)
+
+    for w in (_ax_attr(ax, app_el, "AXWindows") or []):
+        visit(w, 0)
+
+    for label, active in found.items():
+        if active:
+            return label
+    return None
 
 
 def _now_iso() -> str:
@@ -218,15 +255,24 @@ def _extract_session_items(ax, root) -> list[SessionSnapshot]:
     return results
 
 
-def _enumerate_sessions(ax, pid: int) -> list[SessionSnapshot]:
+def _enumerate_sessions(ax, pid: int) -> tuple[Optional[str], list[SessionSnapshot]]:
+    """R36：返回 (active_mode, sessions)。
+    active_mode is None：找不到激活 tab → 跳过这一轮（保持现有 tracks 不动）
+    active_mode == "Chat"：明确丢弃这一轮 Recents（用户在浏览 chat，不采）
+    active_mode in ALLOWED_MODES：采 Recents 并打 mode 标签
+    """
     app = ax["app"](pid)
     # R33 关键：先唤醒 Chromium a11y（每个 tick 都 set 无副作用，幂等）
     _ax_set(ax, app, "AXManualAccessibility", True)
+    active_mode = _detect_active_mode(ax, app)
+    if active_mode not in ALLOWED_MODES:
+        return active_mode, []
     sessions: list[SessionSnapshot] = []
     for w in (_ax_attr(ax, app, "AXWindows") or []):
         snaps = _extract_session_items(ax, w)
         for s in snaps:
             s.pid = pid
+            s.mode = active_mode
             sessions.append(s)
     # 去重（同名 session 可能在 Recents 出现多次）
     seen = set()
@@ -236,7 +282,7 @@ def _enumerate_sessions(ax, pid: int) -> list[SessionSnapshot]:
             continue
         seen.add(s.name)
         unique.append(s)
-    return unique
+    return active_mode, unique
 
 
 # ───────── 状态机 track ─────────
@@ -245,6 +291,7 @@ class SessionTrack:
     session_id: str
     pid: int
     name: str
+    mode: str = ""           # R36：所属 tab
     state: str = "unknown"
     state_since: float = 0.0
     last_seen: float = 0.0
@@ -265,6 +312,12 @@ class DesktopBridge:
         self._ax_error: str = ""
         self._stop = False
         self._tick_count = 0
+        # R38：用户在 dashboard 手动 mark-dead 一个 desktop session 后，bridge 仍能在
+        # Recents 看到它（毕竟 UI 还在）。若不抑制，下一个 tick 重新 SessionStart 会把
+        # status 翻回 idle/running，抵消 mark-dead 操作。
+        # 解决：把被 mark-dead 的 sid 放进 _forgotten，tick 跳过；只有 AX 上看到该 session
+        # 状态翻成 generating（用户在 Claude.app 里重新提问）时解除 forgotten。
+        self._forgotten: set[str] = set()
         self.last_status_values: set[str] = set()  # 诊断用：累计观察到的所有 raw 状态字
 
     def _ensure_ax(self) -> bool:
@@ -294,20 +347,25 @@ class DesktopBridge:
 
     def _build_event(self, track: SessionTrack, event_name: str, message: str = "",
                      status_raw: str = "") -> dict:
+        # R36：project 字段按 mode 分组（"Claude Desktop · Code" / "...Cowork"），
+        # dashboard 的"按项目"分组视图自然把 Desktop 卡片按 mode 拆开，与 CLI 也不会混。
+        project = f"Claude Desktop · {track.mode}" if track.mode else "Claude Desktop"
         return {
             "ts": _now_iso(),
             "source": "desktop_app",
             "session_id": track.session_id,
             "event": event_name,
-            "project": "Claude Desktop",
+            "project": project,
             "window_title": track.name,
             "window_id": track.session_id,
             "conversation_id": track.name,
             "message": message or f"{track.name} {event_name}",
             "last_assistant_message": message or track.name,
             "claude_pid": track.pid,
+            "mode": track.mode,
             "raw": {
                 "name": track.name,
+                "mode": track.mode,
                 "status_raw": status_raw,
                 "history_tail": track.history[-6:],
             },
@@ -321,21 +379,33 @@ class DesktopBridge:
             self._reap_all("claude_app_not_running")
             return
         try:
-            snaps = _enumerate_sessions(self._ax, pid)
+            active_mode, snaps = _enumerate_sessions(self._ax, pid)
         except Exception as e:
             log.warning("enumerate_sessions 异常：%s", e)
+            return
+
+        # R36：active_mode 不在白名单（None / Chat）→ 不更新 seen，也不 reap，保持现状
+        if active_mode not in ALLOWED_MODES:
+            self._tick_count += 1
             return
 
         now = time.time()
         seen_sids: set[str] = set()
         for snap in snaps:
-            sid = _stable_session_id(snap.pid, snap.name)
+            sid = _stable_session_id(snap.pid, snap.name, snap.mode)
+            # R38：被用户 mark-dead 过的 sid，只有"重新开始生成"才能复活
+            if sid in self._forgotten:
+                if snap.state == "generating":
+                    self._forgotten.discard(sid)
+                else:
+                    # 仍然 skip：不创建 track，不 emit
+                    continue
             seen_sids.add(sid)
             self.last_status_values.add(snap.status_raw)
             track = self.tracks.get(sid)
             if track is None:
                 track = SessionTrack(
-                    session_id=sid, pid=snap.pid, name=snap.name,
+                    session_id=sid, pid=snap.pid, name=snap.name, mode=snap.mode,
                     state="unknown", state_since=now,
                 )
                 self.tracks[sid] = track
@@ -374,9 +444,13 @@ class DesktopBridge:
                 track.state_since = now
 
         # 消失超时 → SessionEnd
+        # R36：只 reap 与当前 active_mode 相同的 tracks
+        # （否则用户切到 Code 时，Cowork 的 tracks 会被错杀；反之亦然）
         dead = []
         for sid, t in self.tracks.items():
             if sid in seen_sids:
+                continue
+            if t.mode != active_mode:
                 continue
             if (now - t.last_seen) >= WINDOW_DEAD_TIMEOUT_SEC:
                 dead.append(sid)
@@ -435,6 +509,14 @@ class DesktopBridge:
     def stop(self) -> None:
         self._stop = True
 
+    def forget_session(self, session_id: str) -> bool:
+        """R38：用户 mark-dead 后调用，让 bridge 抑制后续对此 sid 的事件。
+        直到 AX 上看到该 session 状态变 generating（用户重新提问）才解除。"""
+        existed = session_id in self.tracks
+        self.tracks.pop(session_id, None)
+        self._forgotten.add(session_id)
+        return existed
+
     # ───────── R34：点击跳转（dashboard "→ Desktop" 按钮调用） ─────────
     def _find_session_button(self, app_el, target_name: str):
         """重扫 AX 树定位匹配 name 的 sidebar Recents AXButton。
@@ -485,11 +567,33 @@ class DesktopBridge:
             visit(w, 0)
         return found[0]
 
+    def _find_mode_button(self, app_el, mode: str):
+        """找 Mode 切换 button（Chat/Cowork/Code）。"""
+        if not mode:
+            return None
+        found = [None]
+
+        def visit(el, depth):
+            if depth > 18 or found[0] is not None:
+                return
+            role = _ax_attr(self._ax, el, "AXRole") or ""
+            if role == "AXButton":
+                desc = _ax_attr(self._ax, el, "AXDescription") or ""
+                if desc == mode:
+                    found[0] = el
+                    return
+            for k in (_ax_attr(self._ax, el, "AXChildren") or []):
+                visit(k, depth + 1)
+
+        for w in (_ax_attr(self._ax, app_el, "AXWindows") or []):
+            visit(w, 0)
+        return found[0]
+
     def activate_session(self, session_id: str) -> dict:
         """切到 Claude Desktop + 点击侧栏对应会话项。
 
-        前置：bridge 已 track 该 session（即 tick 见过它）；Claude.app 在跑；侧栏 Recents
-        没被折叠（折叠时 a11y 树里没 button → 走 ⌘B 提示）。
+        R36：若 track.mode 与当前 active_mode 不一致，先 AXPress 对应 Mode tab
+        切过去，再 AXPress session button。
         """
         if not self._ensure_ax():
             return {"ok": False, "reason": "ax_unavailable", "detail": self._ax_error}
@@ -509,9 +613,19 @@ class DesktopBridge:
             pass
 
         app_el = self._ax["app"](pid)
-        # 唤醒 a11y + 给 Chromium 重建一点时间（侧栏可能刚展开）
         _ax_set(self._ax, app_el, "AXManualAccessibility", True)
         time.sleep(0.4)
+
+        # R36：当前 active_mode 与 track.mode 不一致 → 先切 tab
+        active_mode = _detect_active_mode(self._ax, app_el)
+        if track.mode and active_mode != track.mode:
+            mode_btn = self._find_mode_button(app_el, track.mode)
+            if mode_btn is not None:
+                try:
+                    self._ax["press"](mode_btn, "AXPress")
+                    time.sleep(0.4)  # 等 Recents 列表重渲染
+                except Exception:
+                    pass
 
         btn = self._find_session_button(app_el, track.name)
         if btn is None:
@@ -521,6 +635,7 @@ class DesktopBridge:
                          "2) 该会话已被滚出 Recents 列表（Claude Desktop 只显示最近的几条）；"
                          "3) 会话名改了，bridge 下个 tick 会重新对齐"),
                 "session_name": track.name,
+                "mode": track.mode,
             }
         try:
             err = self._ax["press"](btn, "AXPress")
@@ -530,7 +645,8 @@ class DesktopBridge:
         except Exception as e:
             return {"ok": False, "reason": "ax_press_exception", "detail": str(e)}
 
-        return {"ok": True, "session_name": track.name, "session_id": session_id}
+        return {"ok": True, "session_name": track.name,
+                "session_id": session_id, "mode": track.mode}
 
 
 # ───────── CLI 调试入口 ─────────
