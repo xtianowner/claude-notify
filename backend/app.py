@@ -406,7 +406,6 @@ def desktop_bridge_status():
         "ax_trusted": False,
         "ax_error": "",
         "claude_pid": None,
-        "tracked_windows": [],
         "python_executable": __import__("sys").executable,
     }
     try:
@@ -421,16 +420,18 @@ def desktop_bridge_status():
         info["running"] = True
         if bridge._ax_error:
             info["ax_error"] = bridge._ax_error
-        info["tracked_windows"] = [
+        # R33 字段重命名：window_id/title → session_id/name；新增 observed_status_values
+        info["tracked_sessions"] = [
             {
                 "session_id": t.session_id,
-                "window_id": t.window_id,
-                "title": t.title,
+                "name": t.name,
                 "state": t.state,
                 "last_event": t.last_event_emitted,
+                "history_tail": t.history[-4:],
             }
             for t in bridge.tracks.values()
         ]
+        info["observed_status_values"] = sorted(bridge.last_status_values)
     return info
 
 

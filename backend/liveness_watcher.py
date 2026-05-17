@@ -117,6 +117,11 @@ async def watch_loop(on_event: OnEvent, interval_seconds: int = 30):
             for s in sessions:
                 if s["status"] in {"ended", "dead"}:
                     continue
+                # R33：desktop_app source 没有 transcript 也没有可探的 PID（共享 Claude.app
+                # 主进程 PID 跨所有 session），liveness_watcher 的 pid/transcript 启发式
+                # 完全不适用。desktop_bridge 自己已经在做活性判定 + emit SessionEnd，跳过。
+                if (s.get("source") or "") == "desktop_app":
+                    continue
 
                 last_evt_age = now - s["last_event_unix"]
                 tx_age = _transcript_age(s.get("transcript_path", ""))

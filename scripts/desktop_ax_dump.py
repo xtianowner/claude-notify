@@ -26,6 +26,7 @@ try:
         AXUIElementCopyAttributeNames,
         AXUIElementCopyAttributeValue,
         AXUIElementCopyActionNames,
+        AXUIElementSetAttributeValue,
     )
 except ImportError as e:
     print(f"[fatal] pyobjc-framework-ApplicationServices 未安装：{e}", file=sys.stderr)
@@ -165,6 +166,14 @@ def main():
     print(f"[info] Claude.app pid = {pid}")
 
     app = AXUIElementCreateApplication(pid)
+    # R33：Claude.app 是 Electron + Chromium，默认不暴露 web 内容到 AX。
+    # 必须先 set AXManualAccessibility=True 唤醒 Chromium a11y 子系统。
+    try:
+        AXUIElementSetAttributeValue(app, "AXManualAccessibility", True)
+    except Exception:
+        pass
+    import time as _t
+    _t.sleep(1.5)  # 给 Chromium 时间构建 a11y 树
     windows = ax_attr(app, "AXWindows") or []
     print(f"[info] windows = {len(windows)}")
     if not windows:
