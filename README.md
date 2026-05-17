@@ -2,7 +2,11 @@
 
 > 给 Claude Code / Claude Desktop 用户的本地通知系统：监控所有会话的事件，关键节点（等输入 / 等授权 / 任务结束 / 长任务疑挂）推飞书 / 浏览器桌面通知 + 本地 dashboard 实时展示。多会话并行不漏看。
 >
-> **R30+**：除 Claude Code CLI 的 hook 链路，新增 **Claude Desktop**（macOS Electron app）的 Accessibility 桥接，能监控桌面端会话窗口的「生成中 / 等输入 / 确认对话框」状态。详见 [docs/desktop-bridge/design.md](docs/desktop-bridge/design.md)。
+> **覆盖面**：
+> - **Claude Code CLI**（任意 OS）→ 走 `~/.claude/settings.json` 的 hook 体系
+> - **Claude Desktop**（macOS Electron app，R29-R45）→ 走 macOS Accessibility API 桥接 + 可选 MCP server 辅助通道
+>
+> Dashboard 列表按板块分三段不混放：终端 (CLI) / Claude Desktop · Code / Claude Desktop · Cowork（Chat 板块不采集）。同一会话两个观测视角自动合并为一张卡。设计细节见 [docs/desktop-bridge/design.md](docs/desktop-bridge/design.md)，版本演进见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 它解决什么问题
 
@@ -191,6 +195,48 @@ dashboard ⚙ → 配置面板里有 LLM 段。三种 provider 选一：
 > **local_cli binary 自动探测顺序**：`reclaude` → `claude`（PATH 内）。若你用 nvm/asdf 装的 Claude，PATH 在 systemd / launchd 子进程里可能缺，**建议直接把 `binary` 填绝对路径**。
 
 完整 LLM 字段说明 → [docs/configuration.md](docs/configuration.md#7-llm-摘要-llm)
+
+## 更新到最新版本
+
+老版本 → 最新一键升级：
+
+```bash
+cd <claude-notify-repo>
+python3 scripts/update.py            # 标准升级（不动 backend）
+python3 scripts/update.py --restart  # 升级 + 自动重启 backend
+python3 scripts/update.py --dry-run  # 只打印命令不执行（先看一眼）
+```
+
+脚本做的事：
+1. 检查 `git status` — 有 modified/staged 改动会拒绝（避免覆盖你的本地修改；untracked 文件 OK，pull 不会动它们）
+2. `git pull --ff-only origin main`
+3. `pip install -r backend/requirements.txt`
+4. **macOS 自动加装** `pip install -r backend/requirements-desktop.txt`（Linux 跳过）
+5. 提示你重启 backend（或 `--restart` 自动重启）
+6. 打印从旧 HEAD 到新 HEAD 的 commit 列表，一眼看清改了什么
+
+**数据 / 配置 / hook 都不动**：
+- `data/` 在 `.gitignore` 内，pull 不会动你的 webhook / events 历史 / 别名
+- `backend/config.py` 用 `_merge(DEFAULTS, 用户 config.json)` 自动 merge 新字段，老用户配置无需手工迁移（任何字段你显式改过的都保留，没改过的跟 DEFAULTS）
+- `~/.claude/settings.json` 里的 hook 注册不动（如有 hook 协议变更会在 CHANGELOG 标注，需手动跑 `python3 scripts/install-hooks.py` 重装）
+
+如果脚本有任何环节出错或你想全手动：
+
+```bash
+git stash                            # 如有本地改动
+git pull --ff-only origin main
+pip install -r backend/requirements.txt
+[ "$(uname)" = "Darwin" ] && pip install -r backend/requirements-desktop.txt
+pkill -f 'uvicorn backend.app'
+nohup python3 -m uvicorn backend.app:app --host 127.0.0.1 --port 8787 > /tmp/claude-notify.log 2>&1 &
+git stash pop                        # 恢复本地改动
+```
+
+完整版本演进记录见 [CHANGELOG.md](CHANGELOG.md)。回滚到 R28 之前（CLI-only 版本）：
+
+```bash
+git reset --hard pre-desktop-bridge-R29
+```
 
 ## Dashboard 操作概览
 
