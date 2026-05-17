@@ -526,6 +526,19 @@ def _build_focus_script(tty: str) -> str:
     )
 
 
+@app.post("/api/sessions/{session_id}/activate-desktop")
+async def activate_desktop(session_id: str):
+    """R34：dashboard 卡片点 "→ Desktop" 时调。
+    通过 AXPress 模拟点击 Claude Desktop 侧栏 Recents 列表里对应 session button +
+    open -a Claude 把 app 切前台。
+    """
+    bridge = getattr(app.state, "desktop_bridge", None)
+    if not bridge:
+        raise HTTPException(503, "desktop_bridge 未启用（cfg.desktop_bridge.enabled=false）")
+    # AX 调用是同步 + subprocess，扔给 worker thread 避免阻塞 event loop
+    return await asyncio.to_thread(bridge.activate_session, session_id)
+
+
 @app.post("/api/sessions/{session_id}/focus-terminal")
 async def focus_terminal(session_id: str):
     summary = _session_summary(session_id)

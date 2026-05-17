@@ -32,6 +32,11 @@ export const api = {
     jsonFetch(`/api/sessions/${encodeURIComponent(sessionId)}/focus-terminal`, {
       method: "POST",
     }),
+  // R34：Claude Desktop 会话点击跳转（AXPress 模拟点击侧栏 Recents 项）
+  activateDesktop: (sessionId) =>
+    jsonFetch(`/api/sessions/${encodeURIComponent(sessionId)}/activate-desktop`, {
+      method: "POST",
+    }),
   // L14: per-session 静音
   // minutes: number (分钟) | null（永久）；scope: "all" | "stop_only"
   muteSession: (sessionId, { minutes = null, scope = "all", label = "" } = {}) =>

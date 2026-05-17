@@ -216,7 +216,11 @@ function renderSessions() {
     el.addEventListener("click", (e) => {
       e.stopPropagation();
       if (el.disabled) return;
-      onFocusTerminal(el.dataset.sid);
+      if (el.classList.contains("btn-focus-desktop")) {
+        onFocusDesktop(el.dataset.sid);
+      } else {
+        onFocusTerminal(el.dataset.sid);
+      }
     });
   });
   // 卡片键盘可达：Enter / Space 打开抽屉
@@ -470,8 +474,15 @@ function sessionCardHTML(s) {
 
   const summaryHtml = `<div class="item-summary" title="${escapeHtml(summaryRaw || summary)}"><span class="item-summary-label">${escapeHtml(summaryLabel)}</span><span class="item-summary-text">${escapeHtml(summary)}</span></div>`;
 
-  const hasTty = !!(s.tty && String(s.tty).trim());
-  const focusBtnHtml = `<button class="btn-focus" data-sid="${escapeHtml(sid)}" type="button" ${hasTty ? "" : "disabled"} title="${hasTty ? "在终端中打开（切到对应 tab）" : "该 session 还没记录到 tty（再触发一次 hook 即可）"}" aria-label="打开终端">→ 终端</button>`;
+  // R34：desktop_app 显示 "→ Desktop" 调 AXPress 模拟点击侧栏会话；其它 source 显示 "→ 终端"
+  const isDesktop = s.source === "desktop_app";
+  let focusBtnHtml;
+  if (isDesktop) {
+    focusBtnHtml = `<button class="btn-focus btn-focus-desktop" data-sid="${escapeHtml(sid)}" type="button" title="切到 Claude Desktop 该会话" aria-label="打开 Desktop 会话">→ Desktop</button>`;
+  } else {
+    const hasTty = !!(s.tty && String(s.tty).trim());
+    focusBtnHtml = `<button class="btn-focus" data-sid="${escapeHtml(sid)}" type="button" ${hasTty ? "" : "disabled"} title="${hasTty ? "在终端中打开（切到对应 tab）" : "该 session 还没记录到 tty（再触发一次 hook 即可）"}" aria-label="打开终端">→ 终端</button>`;
+  }
 
   // L14：per-session 静音按钮
   const muteBtnHtml = renderMuteButton(s);
@@ -808,6 +819,29 @@ function closeDrawer() {
 }
 
 // ───────────── alias 编辑 ─────────────
+// R34：点击 desktop 卡片的 "→ Desktop" 按钮：后端 AXPress 模拟点击侧栏会话项 + open -a Claude
+async function onFocusDesktop(sessionId) {
+  if (!sessionId) return;
+  try {
+    const r = await api.activateDesktop(sessionId);
+    if (r && r.ok) {
+      showToast(`已切到 Claude Desktop（${r.session_name}）`, "ok");
+    } else {
+      const reasonMap = {
+        session_not_tracked: "桥接还没追踪到这个会话；等一秒再试",
+        claude_app_not_running: "Claude.app 没运行；先打开它再试",
+        button_not_found: r.hint || "侧栏 Recents 找不到该会话（侧栏可能折叠了，按 ⌘B 展开后重试）",
+        ax_unavailable: r.detail || "AX 不可用（辅助功能权限或依赖缺失）",
+        ax_press_failed: `AXPress 调用失败 err=${r.err}`,
+        ax_press_exception: r.detail || "AXPress 异常",
+      };
+      showToast(reasonMap[r.reason] || r.reason || "未知错误", "err");
+    }
+  } catch (e) {
+    showToast(`切到 Desktop 失败：${e.message}`, "err");
+  }
+}
+
 async function onFocusTerminal(sessionId) {
   if (!sessionId) return;
   try {

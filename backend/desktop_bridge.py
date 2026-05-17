@@ -55,7 +55,10 @@ RECENTS_ANCHOR_TITLE = ("recents", "最近")  # 侧栏 "Recents" 按钮的 title
 
 # 状态翻转判定阈值
 DEFAULT_POLL_INTERVAL = 1.0
-WINDOW_DEAD_TIMEOUT_SEC = 8.0  # 会话从 Recents 列表消失超过 N 秒 → SessionEnd
+# R34 注：Claude Desktop 的 sidebar Recents 列表 a11y 暴露不稳定 ——
+# Chromium virtual scroll 离屏元素不暴露 / 用户折叠 sidebar / 切换不同区段时 AX tree 抖动。
+# 这里用大窗口避免误 reap：会话从 Recents 列表消失超过 N 秒才 SessionEnd。
+WINDOW_DEAD_TIMEOUT_SEC = 60.0
 HEARTBEAT_EVERY_TICKS = 30     # 每 30 个 tick (≈30s) 发一次 Heartbeat 保 session 不被算 dead
 
 
@@ -71,12 +74,14 @@ def _load_ax():
             AXUIElementCreateApplication,
             AXUIElementCopyAttributeValue,
             AXUIElementSetAttributeValue,
+            AXUIElementPerformAction,
         )
         return {
             "trusted": AXIsProcessTrusted,
             "app": AXUIElementCreateApplication,
             "value": AXUIElementCopyAttributeValue,
             "set": AXUIElementSetAttributeValue,
+            "press": AXUIElementPerformAction,
         }
     except ImportError as e:
         raise AXUnavailable(str(e))
@@ -429,6 +434,103 @@ class DesktopBridge:
 
     def stop(self) -> None:
         self._stop = True
+
+    # ───────── R34：点击跳转（dashboard "→ Desktop" 按钮调用） ─────────
+    def _find_session_button(self, app_el, target_name: str):
+        """重扫 AX 树定位匹配 name 的 sidebar Recents AXButton。
+
+        启发式：AXButton 子节点含 AXApplicationStatus（或 AXImage 描述是状态字），
+        且某个 AXStaticText 子节点的 AXValue 等于 target_name。
+        """
+        ax = self._ax
+        found: list = [None]
+
+        def looks_like_session_button(el) -> Optional[str]:
+            """返回 button 内 AXStaticText 拼出的 name；非 session 按钮返回 None。"""
+            kids = list(_ax_attr(ax, el, "AXChildren") or [])
+            has_status = False
+            text_value = ""
+            for k in kids:
+                sub = _ax_attr(ax, k, "AXSubrole") or ""
+                role = _ax_attr(ax, k, "AXRole") or ""
+                if sub == "AXApplicationStatus":
+                    has_status = True
+                elif role == "AXImage":
+                    desc = _ax_attr(ax, k, "AXDescription") or ""
+                    # 实测 idle 用 AXImage d='Idle'；running 走 AXApplicationStatus
+                    if desc and len(desc) < 20:
+                        has_status = True
+                elif role == "AXStaticText":
+                    v = _ax_attr(ax, k, "AXValue") or ""
+                    if v and len(v) > len(text_value):
+                        text_value = v
+            return text_value if (has_status and text_value) else None
+
+        def visit(el, depth):
+            if depth > 18 or found[0] is not None:
+                return
+            role = _ax_attr(ax, el, "AXRole") or ""
+            if role == "AXButton":
+                name = looks_like_session_button(el)
+                if name and name.strip() == target_name.strip():
+                    found[0] = el
+                    return
+                # 如果是 session button 但 name 不匹配，不再下钻（性能）
+                if name:
+                    return
+            for k in (_ax_attr(ax, el, "AXChildren") or []):
+                visit(k, depth + 1)
+
+        for w in (_ax_attr(ax, app_el, "AXWindows") or []):
+            visit(w, 0)
+        return found[0]
+
+    def activate_session(self, session_id: str) -> dict:
+        """切到 Claude Desktop + 点击侧栏对应会话项。
+
+        前置：bridge 已 track 该 session（即 tick 见过它）；Claude.app 在跑；侧栏 Recents
+        没被折叠（折叠时 a11y 树里没 button → 走 ⌘B 提示）。
+        """
+        if not self._ensure_ax():
+            return {"ok": False, "reason": "ax_unavailable", "detail": self._ax_error}
+        track = self.tracks.get(session_id)
+        if not track:
+            return {"ok": False, "reason": "session_not_tracked",
+                    "hint": "bridge 还没追踪到这个 session；等一个 poll cycle 后再试"}
+        pid = _find_claude_pid()
+        if not pid:
+            return {"ok": False, "reason": "claude_app_not_running"}
+
+        # 先把 Claude.app 拉到前台（不阻塞）
+        try:
+            subprocess.Popen(["open", "-a", "Claude"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+        app_el = self._ax["app"](pid)
+        # 唤醒 a11y + 给 Chromium 重建一点时间（侧栏可能刚展开）
+        _ax_set(self._ax, app_el, "AXManualAccessibility", True)
+        time.sleep(0.4)
+
+        btn = self._find_session_button(app_el, track.name)
+        if btn is None:
+            return {
+                "ok": False, "reason": "button_not_found",
+                "hint": ("侧栏 Recents 找不到该会话项。可能：1) 侧栏被折叠了 → 按 ⌘B 展开后再试；"
+                         "2) 该会话已被滚出 Recents 列表（Claude Desktop 只显示最近的几条）；"
+                         "3) 会话名改了，bridge 下个 tick 会重新对齐"),
+                "session_name": track.name,
+            }
+        try:
+            err = self._ax["press"](btn, "AXPress")
+            if err != 0:
+                return {"ok": False, "reason": "ax_press_failed", "err": int(err),
+                        "session_name": track.name}
+        except Exception as e:
+            return {"ok": False, "reason": "ax_press_exception", "detail": str(e)}
+
+        return {"ok": True, "session_name": track.name, "session_id": session_id}
 
 
 # ───────── CLI 调试入口 ─────────
