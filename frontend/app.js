@@ -240,13 +240,20 @@ function renderSessions() {
   applyHashHighlight();
 }
 
-// ───────────── R37/R43：列表视图按 source / mode 分段 ─────────────
+// ───────────── R37/R43/R48：列表视图按 source / mode 分段 ─────────────
 // 终端 / Desktop·Code / Desktop·Cowork 三段，桶间不混放
 // R43：source=claude_code 且 desktop_embedded=true 的 session 是 Claude Desktop
 // Code mode 嵌入的 CLI 子进程，也归到 Desktop·Code 段（与 AX bridge 视角共一段）
+// R48：但真实 TTY (`/dev/ttys*`) 是真终端铁证，优先于 desktop_embedded 启发式。
+// backend 的 _backfill_desktop_embedded 通过 ppid 探测有假阳性（祖先树长得像
+// Desktop 就标 embedded），导致真终端 CLI 被错归到 Desktop·Code，又被 R47
+// filter 隐去 → 用户的终端 session 直接从面板消失。TTY 兜底解决这条链。
 function categorizeSession(s) {
   if (s.source === "desktop_app") {
     return s.mode === "Cowork" ? "desktop-cowork" : "desktop-code";
+  }
+  if (s.tty && String(s.tty).startsWith("/dev/")) {
+    return "terminal";
   }
   if (s.desktop_embedded) {
     return "desktop-code";

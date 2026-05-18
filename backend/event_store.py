@@ -606,9 +606,14 @@ def list_sessions(active_window_minutes: int = 30,
             s["source"] = evt.get("source")
         if evt.get("mode") and not s.get("mode"):
             s["mode"] = evt.get("mode")
-        # R43：任何一条 event 标 desktop_embedded → 整个 session 都算嵌入
-        if evt.get("desktop_embedded"):
-            s["desktop_embedded"] = True
+        # R48：desktop_embedded 改 latest-wins（覆盖 R43 的 sticky True 规则）。
+        # 原因：用户在 Claude Desktop 起了一个 session（写了 desktop_embedded=True），
+        # 之后用 `claude --resume <sid>` 在真终端接着跑（hook 写 desktop_embedded=False）。
+        # 老 sticky 规则永远锁在 True，dashboard 一直挂 "Desktop · Code" badge 误导用户。
+        # 现取最新事件值；显式 None（老事件没该字段）不改变现状。
+        de = evt.get("desktop_embedded")
+        if de is not None:
+            s["desktop_embedded"] = bool(de)
         s["event_count"] += 1
         et = evt.get("event") or "unknown"
         s["events_by_type"][et] = s["events_by_type"].get(et, 0) + 1
