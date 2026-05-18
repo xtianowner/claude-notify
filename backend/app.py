@@ -1114,11 +1114,15 @@ _mount_frontend()
 
 
 def main():
+    import os
     import uvicorn
+    # HOST / PORT env vars override defaults — README §高级用法/§换端口 都承诺过
+    host = (os.environ.get("HOST") or "127.0.0.1").strip() or "127.0.0.1"
+    port = int(os.environ.get("PORT") or 8787)
     uvicorn.run(
         "backend.app:app",
-        host="127.0.0.1",
-        port=8787,
+        host=host,
+        port=port,
         log_level="info",
         reload=False,
     )

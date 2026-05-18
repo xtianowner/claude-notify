@@ -2,9 +2,22 @@
 
 > 用户视角的功能演进。每个 round 对应一个 git commit，可在 `git log` 找到完整 diff。
 
-## R29-R45 · Claude Desktop 桥接（macOS）
+## R29-R47 · Claude Desktop 桥接（macOS）
 
 把 claude-notify 从"只监控 Claude Code CLI"扩展到"也能监控 Claude Desktop"。详细方案见 [docs/desktop-bridge/design.md](docs/desktop-bridge/design.md)。
+
+### R47 · Desktop 段去重 — N 个 chat = N 张卡 (2026-05-18)
+
+之前 R45 只在"AX 1 张 + hook 1 张"恰好各 1 的情况合并；用户开 ≥2 chat 时，每个 chat 仍被算 2 张卡（AX 视角 + hook 嵌入式 CLI 视角），3 chat → dashboard 6 张卡，污染面板。
+
+新规则（纯前端，`frontend/app.js`）：在 `desktop-code` / `desktop-cowork` 段，**只要有任何 dsk-\* 卡（AX 视角），就隐去所有同段的 embedded UUID 卡**。AX 桥拿到的 chat title 信息更对用户友好，hook 数据通过 R45 已经塞到 AX 卡的副字段里。
+
+兜底：若该段完全没 dsk-\*（罕见，AX 桥失活），原样不过滤，避免段空掉。
+
+### 配套修复（2026-05-18）
+
+- **backend HOST/PORT env 支持**：`backend/app.py main()` 现在读 `HOST` / `PORT` 环境变量，对齐 README §高级用法（`PORT=9000 python -m backend.app`）和 §LAN 访问（`HOST=0.0.0.0`）承诺。先前 README 写了但代码没实现。
+- **README desktop_bridge 启用说明修正**：dashboard config UI 并未暴露 `desktop_bridge.enabled` 控件，README 行 131 之前误导。改为明确指引"编辑 `data/config.json` 加该字段"，附 oneliner 命令。
 
 ### R45 · 同一会话两个视角自动合并 (2026-05-17)
 

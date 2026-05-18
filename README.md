@@ -128,7 +128,11 @@ curl -X POST http://127.0.0.1:8787/api/test-notify
    pip install -r backend/requirements-desktop.txt
    ```
 2. **授权辅助功能**：苹果菜单 → 系统设置 → **隐私与安全** → **辅助功能** → 把当前运行 backend 的 python 解释器拖进去（路径用 `which python3` 查），打钩。
-3. dashboard ⚙ → 配置 → 把 `desktop_bridge.enabled` 改为 `true` → 保存 → 重启 backend。
+3. 编辑 `data/config.json`，把 `desktop_bridge.enabled` 改为 `true`，重启 backend：
+   ```bash
+   python -c "import json; from pathlib import Path; p=Path('data/config.json'); c=json.loads(p.read_text() or '{}'); c.setdefault('desktop_bridge',{})['enabled']=True; p.write_text(json.dumps(c, indent=2, ensure_ascii=False))"
+   ```
+   > Dashboard config 面板暂未暴露此开关（[TODO](https://github.com/xtianowner/claude-notify/issues)），目前需直接编辑 config.json。
 
 验证：
 ```bash

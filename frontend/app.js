@@ -270,6 +270,11 @@ function renderListWithSections(visible) {
   // R45：desktop 段去重 — active hook 视角 + active AX 视角合并成一张以 AX 为主的卡
   buckets["desktop-code"] = mergeDesktopViews(buckets["desktop-code"]);
   buckets["desktop-cowork"] = mergeDesktopViews(buckets["desktop-cowork"]);
+  // R47：dsk-* 才是用户认知的"一个 chat"，embedded UUID 只是该 chat 内部的 CLI 子进程
+  // 视角。dsk-* 存在的段里，把 embedded UUID 直接隐去 —— 让"N 个 chat = N 张卡"。
+  // 若该段没有 dsk-*（罕见：CLI 嵌入跑但 AX 桥没采到），不过滤，避免完全空段。
+  buckets["desktop-code"] = filterEmbeddedWhenAxPresent(buckets["desktop-code"]);
+  buckets["desktop-cowork"] = filterEmbeddedWhenAxPresent(buckets["desktop-cowork"]);
   const parts = [];
   for (const key of LIST_SECTION_ORDER) {
     const arr = buckets[key] || [];
@@ -279,6 +284,17 @@ function renderListWithSections(visible) {
     parts.push(`<div class="list-section-body">${arr.map(sessionCardHTML).join("")}</div>`);
   }
   return parts.join("");
+}
+
+// R47：当一个 desktop 段里有至少一张 dsk-* 卡（AX 视角，代表一个真实的 Claude Desktop chat tab），
+// 隐去同段所有 embedded UUID 卡（hook 视角，每个 chat 内部 CLI 子进程会单独生成 session_id）。
+// 用户视角 = "N 个 chat = N 张卡"，不被 hook 副产物污染。
+// 兜底：若该段没有任何 dsk-*（罕见，AX 桥没采到），返回原样不过滤，避免段彻底空掉。
+function filterEmbeddedWhenAxPresent(items) {
+  if (!items || items.length === 0) return items || [];
+  const hasAx = items.some(s => s && s.source === "desktop_app");
+  if (!hasAx) return items;
+  return items.filter(s => s.source === "desktop_app");
 }
 
 // R45：把"同一 UI 会话"的两个视角（AX bridge + hook 嵌入 CLI）合并成 1 张卡。
