@@ -290,7 +290,7 @@ dashboard ⚙ → 配置可手动调整。除上述 5 个事件开关外，还�
    - 飞书没收到 → webhook URL 错 / 关键字白名单未设 / 签名校验失败。看 `data/config.json` 的 `feishu_webhook`，确认与飞书后台一致；关键字最简方案是设 `claude`。
 2. **dashboard 上能看到 session 卡片吗？**
    - 看不到 → hook 没装上。重跑 `python3 scripts/install-hooks.py`，并 `cat ~/.claude/settings.json | grep hook-notify` 确认。
-   - 看得到 → 事件流到 backend 了。看是不是被过滤吞了（卡片底部 trace 行点开 → reason 列）。常见 reason：`silence_then_merge_skip` / `policy_off` / `quiet_hours_in_window` / `session_muted` / `stop_sensitivity_strict`。
+   - 看得到 → 事件流到 backend 了。看是不是被过滤吞了 → `tail -20 data/push_decisions.jsonl` 或 `curl http://127.0.0.1:8787/api/sessions/<sid>/decisions`（dashboard trace UI 已下线 L38）。常见 reason：`silence_then_merge_skip` / `policy_off` / `quiet_hours_in_window` / `session_muted` / `stop_sensitivity_strict`。
 3. **后端日志**：`tail -f /tmp/claude-notify.log`（nohup 启动）或前台终端输出。
 
 ### 浏览器桌面通知不弹？
@@ -322,7 +322,7 @@ dashboard ⚙ → 配置可手动调整。除上述 5 个事件开关外，还�
 
 ### Dashboard 一直显示 "运行中" 但其实那个终端早关了
 
-正常等 1-2 分钟内 watcher 应该会把它标 `dead`（pid 不在 + transcript 文件没了）。如果 30 分钟还没翻 → 看 `data/events.jsonl` 末尾是否有该 sid 的 `SessionDead` 事件。也可手动改 `data/config.json` 的 `dead_threshold_minutes` 降低阈值（默认 30min）。
+正常等 1-2 分钟内 watcher 应该会把它标 `dead`（pid 不在 + transcript 文件没了）。慢路径（PID 仍在但 transcript 不动）走 `dead_threshold_minutes`（默认 180min / 3h，R38 之后从 30min 调大以容纳长任务）。要更激进地标 dead → 改 `data/config.json` 的 `dead_threshold_minutes` 到 60；或在 dashboard 卡片上手动点"标记已结束"（R38 新增）。详见 [docs/configuration.md §5](docs/configuration.md#5-会话存活判定-liveness)。
 
 ### 端口 8787 被占用
 
@@ -336,7 +336,7 @@ PORT=9000 python -m backend.app  # 自定义端口
 
 - 所有事件流：`data/events.jsonl`（flock 串写，可放心 `tail -f`）
 - 归档：`data/archive/*.jsonl.gz`（events 超过 50MB 自动滚动）
-- 推送决策 50 条历史：dashboard 卡片底部 trace 行点开
+- 推送决策 50 条历史：`tail data/push_decisions.jsonl` 或 `curl http://127.0.0.1:8787/api/sessions/<sid>/decisions`（dashboard 内 trace UI 已下线 L38）
 
 ## 卸载
 
@@ -385,7 +385,7 @@ rm -rf <claude-notify-repo>                    # 删 repo（含 data/）
 - `data/config.json`：含飞书 webhook + 可选 API key，**不进版本控制**（.gitignore 已配）
 - `data/events.jsonl`：所有 hook 事件，flock 串写，重启不丢
 - `data/enrichments.jsonl`：LLM 摘要缓存（按 transcript path + mtime 复用）
-- `data/aliases.json` / `data/notes.json` / `data/decisions.jsonl`：你的 alias / 记事本 / 推送决策历史
+- `data/aliases.json` / `data/notes.md` / `data/push_decisions.jsonl` / `data/hidden_sessions.json` / `data/idle_reminder.json`：你的 alias / 记事本（markdown） / 推送决策历史 / 已删除 session 集合 / idle reminder 计数
 - 全部数据**只在本机**，不上报，不联网（除你自己配的飞书 webhook 和可选 LLM endpoint）
 - 凭据**不写入任何 .md / commit / 日志 / 文件名**
 
@@ -398,6 +398,8 @@ HOST=0.0.0.0 python -m backend.app
 ```
 
 **但要意识到 backend 没有 auth**，开 `0.0.0.0` 等于把 webhook URL 暴露给 LAN 内所有人（任何能访问 `:8787` 的设备都能拿到 config 接口里 mask 后的 webhook 前后位 + 删改你的 alias）。生产用建议套 reverse proxy + basic auth，或绑 tailscale 内网。
+
+**飞书 ↗ 链接 / OS-level dashboard 跳转**（F6）：改 `HOST` / `PORT` 后 ↗ 链接和 osascript Chrome tab 匹配会自动跟随实际监听地址（`HOST=0.0.0.0` 时浏览器侧退化为 `127.0.0.1`）。如果 backend 与浏览器访问 URL 不同（如反向代理、Tailscale 域名、Cloudflare Tunnel），在 `data/config.json` 设 `public_url` 显式覆盖（例：`"public_url": "https://notify.mydomain.com"`）—— 飞书消息里的 ↗ 链接会用它拼接。
 
 ## 开发
 

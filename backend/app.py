@@ -168,8 +168,36 @@ async def _on_push_for_browser(evt: dict[str, Any], reason: str):
     await hub.broadcast(payload)
 
 
+def _inject_runtime_public_url(source: str) -> str:
+    """F6 / R52：从 HOST / PORT env 推导 default_public_url，写 app.state + config module-level。
+
+    两条启动路径都需要它：
+      - main() 路径（python -m backend.app）：main() 自己也调一次，幂等
+      - uvicorn 直起路径（python -m uvicorn backend.app:app --host ... --port ...）：
+        main() 不跑，只能靠 lifespan 注入，否则 feishu ↗ 链接拼出 8787 → 404
+    HOST=0.0.0.0 / :: → browser 视角退化成 127.0.0.1（外部访问让用户在 cfg.public_url 显式覆盖）。
+    """
+    import os
+    host_env = (os.environ.get("HOST") or "127.0.0.1").strip() or "127.0.0.1"
+    try:
+        port_env = int(os.environ.get("PORT") or 8787)
+    except ValueError:
+        port_env = 8787
+    browser_host = "127.0.0.1" if host_env in ("0.0.0.0", "::") else host_env
+    default_url = f"http://{browser_host}:{port_env}"
+    cfg_mod.set_runtime_default_public_url(default_url)
+    app.state.default_public_url = default_url
+    log.info("F6 %s: default_public_url=%s (HOST=%s PORT=%s)",
+             source, default_url, host_env, port_env)
+    return default_url
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # F6 / R52：lifespan 在两种启动姿势下都会跑（main() / uvicorn 直起）。
+    # main() 路径已经注入过，这里幂等覆盖；uvicorn 直起路径只走 lifespan，必须靠这里注入，
+    # 否则 feishu.py 拿 _RUNTIME_DEFAULT_PUBLIC_URL 拼 ↗ 链接会用初值 :8787 → 用户 PORT=9000 时 404。
+    _inject_runtime_public_url("lifespan")
     cfg = cfg_mod.load()
     interval = int(cfg.get("liveness_interval_seconds") or 30)
     # 教训 L13：启动时尝试一次滚动归档（events.jsonl 太大就把老事件 gzip 落到 data/archive/）
@@ -874,18 +902,26 @@ async def test_notify():
 # 主动控制 Chrome：扫所有 window 找 dashboard tab → activate + 切 window 前台；同时
 # 通过 WS 广播 open_intent 让那个 dashboard 自动 openDrawer(sid)。
 # 找不到 dashboard tab 时退化为 HTML meta redirect 到 /?s=<sid>，让 Chrome 走正常加载。
-def _build_chrome_focus_script() -> str:
+def _build_chrome_focus_script(base_url: str) -> str:
     """扫 Chrome 所有 window/tab 找 dashboard tab → activate。
 
-    匹配规则：URL starts with `http://127.0.0.1:8787/`，且**不是** `/o/...` 这种 endpoint。
+    匹配规则：URL starts with `{base_url}/`，且**不是** `{base_url}/o/...` 这种 endpoint。
     后者是飞书 ↗ 链接刚打开的那个 tab 自身（backend 正在处理它的请求），把它当 dashboard
     会让 osascript 误返回 OK，backend 回"已切到 dashboard"页，dashboard JS 根本没加载
     （L53 / R28 bug）。
+
+    F6：base_url 跟随 cfg.public_url / HOST:PORT 推导，不再硬编码 127.0.0.1:8787。
+    base_url 由 get_public_url() 保证 no trailing slash，下面手动 + "/" 用于 starts-with。
 
     返回 "OK" 表示找到并激活；"NOT_FOUND" 表示没现成 dashboard tab。
     需要 Chrome Automation 权限（第一次调用时 macOS 弹"Python wants to control Chrome"）。
     不依赖 System Events（教训 L02：System Events 要 Accessibility，Python backend 没权限会挂死）。
     """
+    base = (base_url or "").rstrip("/")
+    # AppleScript 字符串字面量转义：双引号 + 反斜杠
+    base_esc = base.replace("\\", "\\\\").replace('"', '\\"')
+    prefix = f'{base_esc}/'
+    self_prefix = f'{base_esc}/o/'
     return (
         'try\n'
         '  tell application "Google Chrome"\n'
@@ -894,7 +930,7 @@ def _build_chrome_focus_script() -> str:
         '      repeat with t in (every tab of w)\n'
         '        try\n'
         '          set theURL to URL of t\n'
-        '          if (theURL starts with "http://127.0.0.1:8787/") and (not (theURL starts with "http://127.0.0.1:8787/o/")) then\n'
+        f'          if (theURL starts with "{prefix}") and (not (theURL starts with "{self_prefix}")) then\n'
         '            set active tab index of w to tabIndex\n'
         '            set index of w to 1\n'
         '            activate\n'
@@ -913,7 +949,10 @@ def _build_chrome_focus_script() -> str:
 
 async def _osascript_focus_chrome_dashboard() -> tuple[bool, str]:
     """成功返回 (True, "OK")。失败返回 (False, reason)。reason 用于日志。"""
-    script = _build_chrome_focus_script()
+    cfg = cfg_mod.load()
+    default = getattr(app.state, "default_public_url", "") or "http://127.0.0.1:8787"
+    base_url = cfg_mod.get_public_url(cfg, default=default)
+    script = _build_chrome_focus_script(base_url)
     try:
         proc = await asyncio.create_subprocess_exec(
             "osascript", "-e", script,
@@ -960,8 +999,13 @@ async def open_via_chrome(sid: str):
     log.info("open_via_chrome sid=%s activated=%s reason=%s", sid[:8], activated, reason)
 
     # 2. WS 广播 open_intent（不依赖 osascript 成功；dashboard 收到就 openDrawer）
+    #    F5：同步写 push_buffer，覆盖 Chrome Memory Saver 把 dashboard tab 休眠的场景 ——
+    #    osascript 唤前台后 tab 重连 WS 走 since_ts replay；没入 buffer 的 open_intent 会丢失，drawer 不打开。
+    intent_payload = {"type": "open_intent", "sid": sid, "_unix": time.time()}
     try:
-        await hub.broadcast({"type": "open_intent", "sid": sid})
+        await push_buffer.add(dict(intent_payload))
+        intent_payload.pop("_unix", None)
+        await hub.broadcast(intent_payload)
     except Exception:
         log.exception("open_intent broadcast failed")
 
@@ -1119,6 +1163,9 @@ def main():
     # HOST / PORT env vars override defaults — README §高级用法/§换端口 都承诺过
     host = (os.environ.get("HOST") or "127.0.0.1").strip() or "127.0.0.1"
     port = int(os.environ.get("PORT") or 8787)
+    # F6 / R52：复用 _inject_runtime_public_url helper，逻辑与 lifespan 完全一致。
+    # 理论上 lifespan 也会再注入一次（幂等），保留这次的好处是 uvicorn.run 之前 log 就能看到 URL。
+    _inject_runtime_public_url("main")
     uvicorn.run(
         "backend.app:app",
         host=host,

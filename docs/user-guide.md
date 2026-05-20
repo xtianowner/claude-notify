@@ -3,9 +3,9 @@
 # claude-notify 用户使用指南
 
 创建时间: 2026-05-09 22:53:31
-更新时间: 2026-05-11 11:00:00
+更新时间: 2026-05-20 11:30:00
 
-claude-notify 监控你本机的 Claude Code 所有 session，把"任务完成 / 等输入 / 疑似挂起"等关键时刻同步到飞书和 dashboard。本文写给使用者，不讲实现细节。
+claude-notify 监控你本机的 Claude Code CLI 所有 session（macOS / Linux）+ 可选监控 Claude Desktop 桌面客户端的会话（macOS only，R29+），把"任务完成 / 等输入 / 疑似挂起"等关键时刻同步到飞书和 dashboard。本文写给使用者，不讲实现细节。
 
 ---
 
@@ -67,7 +67,7 @@ dashboard 每张卡片右上角都有一个状态标签。它告诉你：**这�
 | waiting | 等输入 | 🟡 | Claude 真的在阻塞等你（权限请求 / 多次提醒后） | **必须立即看**（很可能在等你按 y 授权） |
 | suspect | 疑挂起 | 🟠 | 长时间没有任何活动，可能挂了 | 切到该终端确认；不一定真挂，也可能 tool 跑很慢 |
 | ended | 已退出 | ⚫ | 你正常关掉了那个 Claude Code 窗口 | 不用管 |
-| dead | 已死亡 | 🔴 | 进程没了 / transcript 30 分钟不动（Round 11 已修边界 bug，之前因 active_window 等于 dead 阈值，dead 永远不触发） | 看下是不是 crash 了 |
+| dead | 已死亡 | 🔴 | 进程没了（快路径）/ transcript 静默超过 `dead_threshold_minutes`（默认 180min，R38 从 30 调大以容纳长任务）— 详见 `docs/configuration.md §5` | 看下是不是 crash 了 |
 
 **重点理解**：`idle`（回合结束）和 `waiting`（等输入）的区别——
 - **idle**：Claude 回完一句话，技术上没在等什么；你也许走开了，也许在思考下一句。
@@ -110,7 +110,7 @@ dashboard 每张卡片右上角都有一个状态标签。它告诉你：**这�
 
 ### 飞书 ↗ 链接的 tab 复用（L45 / R20+R22）
 
-飞书消息末尾 `↗ http://127.0.0.1:8787/#s=<sid>` 链接点击后，行为受 Settings → "飞书 ↗ 链接 tab 复用" 控制，两档可选：
+飞书消息末尾 `↗ {public_url}/o/{sid}` 链接点击后（R27 / L52 改成 backend 专用 endpoint `/o/{sid}`，由 osascript 切 Chrome dashboard tab + WS 广播 `open_intent`），行为受 Settings → "飞书 ↗ 链接 tab 复用" 控制，两档可选：
 
 **focus_old（默认 / 推荐）**：
 - 已有 dashboard tab → 旧 tab 自动切前台 + 跳到对应 session + 高亮卡片；新 tab 显示 2.5s 自动消失的提示后变白页（可手动 ⌘W 关）
@@ -350,8 +350,40 @@ Claude 会在某些场景**主动列菜单**等你做选择，例如：
 
 ---
 
+## 六·五、Claude Desktop 桥接（macOS，R29+）
+
+如果你也用 Claude Desktop（`/Applications/Claude.app`），claude-notify 可以同步监控桌面端的「生成中 / 等输入 / 等确认」状态，**与 CLI 共用同一个 dashboard、推送策略、静音、quiet hours**。原理是 macOS Accessibility API 轮询 Claude.app 侧栏 Recents 列表（R33 之后稳定方案）。
+
+### 启用三步（一次性）
+
+详见 [README.md §3c](../README.md#3c-可选启用-claude-desktop-桥接macos)：装 desktop 依赖 → 授辅助功能权限 → `data/config.json` 设 `desktop_bridge.enabled=true` → 重启 backend。
+
+可选附加：通过 MCP 让 Claude Desktop 主动汇报里程碑，见 [README.md §3d](../README.md#3d-可选让-claude-desktop-自报家门--mcp-辅助通道)。
+
+### dashboard 行为
+
+- 列表分三段（不混放）：**终端 (Claude Code CLI) / Claude Desktop · Code / Claude Desktop · Cowork**。Chat tab 完全不采集（用户私聊不污染面板）
+- Desktop 卡片右上加 🖥 蓝色徽章；同会话两个观测视角（AX + hook 嵌入式 CLI）自动合并为一张卡（R45 / R47）
+- 卡片右上多一个 `→ Desktop` 按钮，点击拉 Claude.app 前台并切到对应 session（R34）
+- "标记已结束"按钮（R38）/ "删除 session"按钮（R40）跨重启持久化
+
+### 诊断
+
+- `curl http://127.0.0.1:8787/api/desktop-bridge/status` — configured / running / ax_trusted / claude_pid / 当前追踪 sessions / 观察到的 raw 状态字
+- `python3 scripts/desktop_ax_dump.py | head -30` — 离线 dump Claude.app AX 树，用于 UI 改版后排查 label 漂移
+
+### 限制
+
+- Claude.app 升级到新 UI 可能导致 AX 启发式（按钮 label 关键字 `RUNNING_KEYWORDS` / `BLOCKED_KEYWORDS`）失效；需要更新 `backend/desktop_bridge.py` 的关键字常量
+- AX 桥接拿不到对话语义（只能感知 UI 状态）；语义摘要靠 MCP 辅助通道补足
+- 仅 macOS；Claude Desktop 没有 Linux/Windows 版
+
+---
+
 ## 七、还想了解什么
 
 - 安装 / 启动：见 [README.md](../README.md)
-- 设计教训和决策来源：见 [LESSONS.md](../LESSONS.md)
+- 用户视角的功能演进：见 [CHANGELOG.md](../CHANGELOG.md)（R0–R49）
+- 设计教训和决策来源：见 [LESSONS.md](../LESSONS.md)（L01–L53）
 - 模块结构：见 [docs/modules.md](modules.md)
+- Claude Desktop 桥接的最初设计：见 [docs/desktop-bridge/design.md](desktop-bridge/design.md)（R29 baseline，实现细节已演进，仅作背景）

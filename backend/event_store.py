@@ -644,7 +644,12 @@ def list_sessions(active_window_minutes: int = 30,
             s["_last_stop_unix"] = parse_iso(evt.get("ts", ""))
             s["_last_stop_ts"] = evt.get("ts") or ""
             s["_last_stop_event_type"] = "Stop"
-            s["menu_detected"] = False  # 回合结束 → 清菜单标记
+        # R51 / F8：菜单红徽清零的事件分支扩展 —— 单靠 Stop 不够，用户答完菜单（推 UserPromptSubmit）
+        # 到下一次 Stop 之间 🔥 会持续亮 →「已响应了还在催」。
+        # 清零信号 = 用户实际响应（UserPromptSubmit）或会话终结（SessionEnd / SessionDead，再亮无意义）。
+        # 不清零：PostToolUse（Claude 用工具 ≠ 用户响应）/ SubagentStop（子 agent 完成 ≠ 主流程响应）。
+        if evt.get("event") in ("Stop", "UserPromptSubmit", "SessionEnd", "SessionDead"):
+            s["menu_detected"] = False
         if evt.get("event") == "SubagentStop":
             # 子 agent 完成也算一次回合结束，可作为兜底来源（但只在没有 Stop 时填充）
             if evt.get("last_assistant_message") and not s.get("_last_stop_ts"):

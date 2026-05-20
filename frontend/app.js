@@ -152,6 +152,12 @@ function passesFilter(s) {
 }
 
 function renderSessions() {
+  // R52：把 merged_hook mutate 提到所有视图分发之前，保证 grouped 视图的 collectMergedSids
+  //   也能拿到 hook sid。原 R51 只在 list 视图 renderListWithSections 里跑 mergeDesktopViews，
+  //   grouped 视图（renderGroupedHTML）走另一条路径 → state.sessions[ax] 没有 merged_hook 字段
+  //   → drawer 删除/mark-dead 只镜像一面 → 下次 loadSessions 复活成幽灵卡。
+  //   这里在 renderSessions 单一入口顶部 mutate state.sessions，下面两条渲染路径都受益。
+  applyMergedHookToState(state.sessions || []);
   // 排序：一级 = STATUS_WEIGHT；二级 = 同 status 内按"等待时长"或"最近活动"
   // 二级语义随 status 切换：
   //   waiting / suspect / idle  → 按 last_event_ts 升序（等最久的往前，定位"等了 10 分钟没人理"）
@@ -186,7 +192,10 @@ function renderSessions() {
   }
   // L24：grouped 视图按 cwd_short 分桶；list 视图按 source/mode 分段（R37：终端 / Desktop·Code / Desktop·Cowork 不混放）
   if (state.viewMode === "grouped") {
-    $sessions.innerHTML = renderGroupedHTML(visible);
+    // R52：grouped 视图也要剔掉被合并 ax 吸收的 hook 卡（即"该卡 ax 还在 state.sessions 里"的 embedded UUID），
+    // 否则同一 chat 在 grouped 视图会显示成两张（一张 dsk-*、一张 uuid-*）。list 视图本来由
+    // mergeDesktopViews 返回 filtered 数组兜底，grouped 视图不走那条路径 → 手动按段过滤一次。
+    $sessions.innerHTML = renderGroupedHTML(filterGroupedVisible(visible));
     bindGroupHeaderEvents();
   } else {
     $sessions.innerHTML = renderListWithSections(visible);
@@ -305,26 +314,83 @@ function filterEmbeddedWhenAxPresent(items) {
 // 合并条件（保守）：当前 active 的 ax session 唯一 && 当前 active 的 hook session 唯一
 //   → 合并到 ax，hook 的 cwd/工具调用/transcript 等元数据塞进 merged_hook 副字段
 // 否则保留原样（多 session 时不合并避免错配）。
+// R51：直接 mutate state.sessions 里的 ax 对象（之前 spread 出 merged 副本只影响渲染层；
+//   drawer / alias / mute handler 通过 state.sessions.find() 拿到的还是没 merged_hook 的
+//   原对象，导致 F3/F4 镜像逻辑永远走 hook_sid !== sid 分支以外的早退）。
 function mergeDesktopViews(items) {
   if (!items || items.length < 2) return items || [];
   const isActiveAlive = s => s && !["dead", "ended"].includes(s.status);
   const activeAx = items.filter(s => s.source === "desktop_app" && isActiveAlive(s));
   const activeHook = items.filter(s => s.desktop_embedded && s.source !== "desktop_app" && isActiveAlive(s));
-  if (activeAx.length !== 1 || activeHook.length !== 1) return items;
+  if (activeAx.length !== 1 || activeHook.length !== 1) {
+    // R51：合并条件不满足时，清掉旧 merged_hook（防止上次合并的引用残留在 state.sessions[ax] 上 →
+    //   drawer 操作会镜像一个早就该忽略的 hook_sid）。
+    items.forEach(s => { if (s && s.merged_hook) delete s.merged_hook; });
+    return items;
+  }
   const ax = activeAx[0];
   const hook = activeHook[0];
-  const merged = { ...ax };
-  merged.merged_hook = hook;
+  // R51：直接写回 ax（state.sessions 里的同一对象引用）。
+  ax.merged_hook = hook;
   // hook 视角的有用字段补给 ax（ax 没有 transcript / tool 调用）
-  if (hook.last_assistant_message && !ax.last_assistant_message) merged.last_assistant_message = hook.last_assistant_message;
-  if (hook.turn_summary && !ax.turn_summary) merged.turn_summary = hook.turn_summary;
-  if (hook.last_milestone && !ax.last_milestone) merged.last_milestone = hook.last_milestone;
-  if (hook.first_user_prompt && !ax.first_user_prompt) merged.first_user_prompt = hook.first_user_prompt;
-  if (hook.cwd_short && !ax.cwd_short) merged.cwd_short = hook.cwd_short;
-  if (hook.cwd && !ax.cwd) merged.cwd = hook.cwd;
-  if (hook.tty && !ax.tty) merged.tty = hook.tty;
-  // 替换 items：去掉 hook 和原 ax，加 merged
-  return items.filter(s => s !== hook && s !== ax).concat([merged]);
+  if (hook.last_assistant_message && !ax.last_assistant_message) ax.last_assistant_message = hook.last_assistant_message;
+  if (hook.turn_summary && !ax.turn_summary) ax.turn_summary = hook.turn_summary;
+  if (hook.last_milestone && !ax.last_milestone) ax.last_milestone = hook.last_milestone;
+  if (hook.first_user_prompt && !ax.first_user_prompt) ax.first_user_prompt = hook.first_user_prompt;
+  if (hook.cwd_short && !ax.cwd_short) ax.cwd_short = hook.cwd_short;
+  if (hook.cwd && !ax.cwd) ax.cwd = hook.cwd;
+  if (hook.tty && !ax.tty) ax.tty = hook.tty;
+  // 渲染层：把 hook 从段里剔掉。ax 已经被 mutate 成"包含 merged_hook 的完整对象"，
+  // 渲染时直接用，不再单独构造 merged 副本。
+  return items.filter(s => s !== hook);
+}
+
+// R52：按 source/mode 分段后跑 mergeDesktopViews，让合并 mutate 副作用（写 ax.merged_hook +
+// 补 hook 的 cwd/tty/transcript 等字段到 ax 上）在 state.sessions 上落地。renderSessions 单一
+// 入口顶部调用，保证 list / grouped 两种视图渲染前 state 已经被 mutate。
+// mergeDesktopViews 是幂等的：第二次调用时 activeAx/activeHook 仍命中同对，ax.merged_hook 被重
+// 写为同一引用，补字段的 if (!ax.x) 已为 falsy 跳过。返回值在这里被丢弃，只用副作用。
+function applyMergedHookToState(sessions) {
+  if (!sessions || sessions.length === 0) return;
+  const buckets = { "desktop-code": [], "desktop-cowork": [] };
+  for (const s of sessions) {
+    const cat = categorizeSession(s);
+    if (cat === "desktop-code" || cat === "desktop-cowork") buckets[cat].push(s);
+  }
+  mergeDesktopViews(buckets["desktop-code"]);
+  mergeDesktopViews(buckets["desktop-cowork"]);
+}
+
+// R52：grouped 视图渲染前按 desktop 段做一次 hook 卡过滤（同 list 视图 R47 行为）。
+// 不直接 mutate state.sessions（保留 hook 卡对象本身，drawer 操作要用它的 last_event_ts 等），
+// 只在渲染层剔掉。
+function filterGroupedVisible(visible) {
+  if (!visible || visible.length === 0) return visible || [];
+  const buckets = { "terminal": [], "desktop-code": [], "desktop-cowork": [] };
+  for (const s of visible) {
+    const cat = categorizeSession(s);
+    if (!buckets[cat]) buckets[cat] = [];
+    buckets[cat].push(s);
+  }
+  buckets["desktop-code"] = filterEmbeddedWhenAxPresent(buckets["desktop-code"]);
+  buckets["desktop-cowork"] = filterEmbeddedWhenAxPresent(buckets["desktop-cowork"]);
+  // 顺序保留原 visible 中的相对顺序：用 Set 标记保留 sid，再过滤一次
+  const keep = new Set();
+  for (const arr of Object.values(buckets)) {
+    for (const s of arr) if (s && s.session_id) keep.add(s.session_id);
+  }
+  return visible.filter(s => keep.has(s.session_id));
+}
+
+// R51：合并卡的两个 sid（ax + merged_hook）— 凡是按 sid 持久化的操作（删除 / mark-dead /
+// alias / 静音 / 解除静音）都必须镜像到两个 sid，否则下次 loadSessions 一面会"复活成幽灵卡"。
+function collectMergedSids(sid) {
+  const s = (state.sessions || []).find(x => x.session_id === sid);
+  const sids = [sid];
+  if (s && s.merged_hook && s.merged_hook.session_id && s.merged_hook.session_id !== sid) {
+    sids.push(s.merged_hook.session_id);
+  }
+  return sids;
 }
 
 // ───────────── L24：按项目（cwd_short）分组视图 ─────────────
@@ -1114,8 +1180,12 @@ function openMuteMenu(sessionId, anchorEl) {
 }
 
 async function applyMute(sessionId, minutes, scope) {
+  // F7：合并视角卡的静音也要镜像到 hook_sid，否则 hook 那条记录仍会按规则发通知。
+  const sids = collectMergedSids(sessionId);
   try {
-    await api.muteSession(sessionId, { minutes, scope });
+    for (const s of sids) {
+      await api.muteSession(s, { minutes, scope });
+    }
     const text = (minutes == null)
       ? "已永久静音"
       : `已静音 ${minutes} 分钟${scope === "stop_only" ? "（仅 Stop）" : ""}`;
@@ -1127,8 +1197,12 @@ async function applyMute(sessionId, minutes, scope) {
 }
 
 async function applyUnmute(sessionId) {
+  // F7：与 applyMute 对称，两个 sid 都解除。
+  const sids = collectMergedSids(sessionId);
   try {
-    await api.unmuteSession(sessionId);
+    for (const s of sids) {
+      await api.unmuteSession(s);
+    }
     showToast("已解除静音", "ok");
     await loadSessions();
   } catch (e) {
@@ -1788,8 +1862,13 @@ $aliasForm.addEventListener("submit", async (e) => {
   const sid = aliasEditingSid;
   const alias = $aliasForm.elements["alias"].value;
   const note = $aliasForm.elements["note"].value;
+  // F7：合并视角卡的 alias 也要镜像到 hook_sid，否则 hook 那条记录别名为空，
+  // 下次合并条件失效时（hook 单独成卡）会看到一张没别名的"裸卡"。
+  const sids = collectMergedSids(sid);
   try {
-    await api.setAlias(sid, alias, note);
+    for (const s of sids) {
+      await api.setAlias(s, alias, note);
+    }
     closeAliasModal();
     await loadSessions();
     showToast("别名已保存", "ok");
@@ -1958,17 +2037,22 @@ if ($drawerDelete) {
     const sid = $drawerDelete.dataset.sid;
     if (!sid) return;
     if (!confirm("从 dashboard 彻底删除这个 session？\n(events.jsonl 仍保留事件历史；如需恢复可在『已删除』面板还原)")) return;
+    // F3：合并视角卡（R45）= AX sid + merged_hook.session_id 两个 sid。只删一个会让另一面下次 loadSessions 时复活成"幽灵卡"。镜像两次。
+    const sids = collectMergedSids(sid);
     try {
-      const r = await api.deleteSession(sid);
-      if (r && r.ok) {
-        showToast(`已删除：${r.name || sid.slice(0, 8)}`, "ok");
-        // 立即从前端 state 移除 + 关 drawer + 重渲染
-        state.sessions = (state.sessions || []).filter(s => s.session_id !== sid);
-        closeDrawer();
-        renderSessions();
-      } else {
-        showToast("删除失败：" + (r && (r.detail || r.reason) || "未知"), "err");
+      let primary = null;
+      for (const s of sids) {
+        const r = await api.deleteSession(s);
+        if (!primary) primary = r;
+        if (!(r && r.ok)) {
+          showToast("删除失败：" + (r && (r.detail || r.reason) || "未知"), "err");
+          return;
+        }
       }
+      showToast(`已删除：${(primary && primary.name) || sid.slice(0, 8)}`, "ok");
+      state.sessions = (state.sessions || []).filter(s => !sids.includes(s.session_id));
+      closeDrawer();
+      renderSessions();
     } catch (err) {
       showToast("删除失败：" + err.message, "err");
     }
@@ -1983,17 +2067,22 @@ if ($drawerMarkDead) {
     const sid = $drawerMarkDead.dataset.sid;
     if (!sid) return;
     if (!confirm("把这个 session 标记为已结束？\n(已结束后会从默认列表筛选掉，但仍可在事件流里看历史)")) return;
+    // F4：与 F3 对称。合并视角卡的两个 sid 都要 mark-dead，否则 hook 视角继续 running，dashboard 分裂成一张 dead + 一张活跃。
+    const sids = collectMergedSids(sid);
     try {
-      const r = await api.markDead(sid);
-      if (r && r.ok) {
-        showToast(r.already ? "已经是结束状态" : "已标记为已结束", "ok");
-        // 立即禁用按钮 + 刷新数据（WS 也会推一条 SessionDead 事件）
-        $drawerMarkDead.disabled = true;
-        $drawerMarkDead.textContent = "已结束";
-        loadSessions();
-      } else {
-        showToast("标记失败：" + (r && (r.detail || r.reason) || "未知"), "err");
+      let primary = null;
+      for (const s of sids) {
+        const r = await api.markDead(s);
+        if (!primary) primary = r;
+        if (!(r && r.ok)) {
+          showToast("标记失败：" + (r && (r.detail || r.reason) || "未知"), "err");
+          return;
+        }
       }
+      showToast(primary && primary.already ? "已经是结束状态" : "已标记为已结束", "ok");
+      $drawerMarkDead.disabled = true;
+      $drawerMarkDead.textContent = "已结束";
+      loadSessions();
     } catch (err) {
       showToast("标记失败：" + err.message, "err");
     }

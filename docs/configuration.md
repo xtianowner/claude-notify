@@ -145,7 +145,7 @@ idle reminder 是 §3 里 `notif_idle_reminder_minutes` 的行为，没有独立
 3. Stop 后 `notif_idle_reminder_minutes[1]` 分钟（默认 45）+ 又一次 idle prompt → 推第 3 次（reminder #2）
 4. 之后再来 idle prompt 也不推；直到下一次新 Stop push 来 → 计数重置 → 进入下一回合的 3 次循环
 
-计数器在 backend 进程内（`backend/idle_reminder.py` 的 `_counts`），**重启 backend 会清零**（用户预期 reminder 是临时状态，重启后从 0 开始可接受）。最多保留 1024 个 sid 的计数，LRU 淘汰。
+计数器持久化到 `data/idle_reminder.json`（R50 / F2，schema `{"<sid>": {"count": int, "last_at": iso8601}}`）。**重启 backend 时从盘恢复**，避免"重启后下条 filler 又被当 reminder #1 推一遍"。最多保留 512 个 sid 的计数（落盘场景下控文件体积），LRU 淘汰。
 
 ---
 
@@ -156,7 +156,7 @@ liveness watcher 每 `liveness_interval_seconds` 秒扫一次活跃 session，�
 | 字段 | 默认 | 取值/类型 | 含义 |
 |---|---|---|---|
 | `timeout_minutes` | `5` | int (分钟) | **legacy 单一阈值**。当 `liveness_per_state_timeout.enabled=false` 时一刀切用此值；启用 per-state 时仅作 fallback。 |
-| `dead_threshold_minutes` | `30` | int (分钟) | transcript 文件静默超此分钟 → 标 `SessionDead`。也是 PID 仍存在的"慢路径"死亡阈值。 |
+| `dead_threshold_minutes` | `180` | int (分钟) | transcript 文件静默超此分钟 → 标 `SessionDead`。也是 PID 仍存在的"慢路径"死亡阈值。**R38 从 30 → 180**：长任务（大 batch / build / 大 LLM 调用）不再被误标 dead。 |
 | `active_window_minutes` | `30` | int (分钟) | dashboard 与 list_sessions 的"近期活跃窗"长度。**未显式配置**时 watcher 会自动用 `max(60, dead_threshold_minutes * 2)` 保证 dead 判定窗口覆盖；显式配置 → 完全按用户值。 |
 | `liveness_interval_seconds` | `30` | int (秒) | liveness watcher 巡检周期。改完**需要重启 backend** 才生效（仅启动时读一次）。 |
 | `liveness_per_state_timeout.enabled` | `true` | bool | 是否按 last_event_kind 分状态用不同阈值。false → 退化到 `timeout_minutes` 一刀切。 |
@@ -172,7 +172,7 @@ liveness watcher 每 `liveness_interval_seconds` 秒扫一次活跃 session，�
 
 **状态机简述**：每个 session 在 watcher 视角下处于 `running` / `ended` / `dead` 之一。`ended`/`dead` 跳过判定；`running` 时按 last_event_kind 选阈值。死亡判定有快路径（PID gone + transcript ≥60s 静默 → 立即 dead）和慢路径（transcript ≥ `dead_threshold_minutes` 静默 → dead，无视 PID）。每个 session 在每个状态下只 push 一次。
 
-**何时改 `dead_threshold_minutes`**：如果长任务（大批量 LLM 调用、build 整个项目）经常被误标 dead，从默认 30 拉高到 60 甚至 120。
+**何时改 `dead_threshold_minutes`**：默认 180min（3 小时）已能覆盖绝大多数长任务。若仍误标 dead（如 6 小时 batch / 隔夜跑），调到 360 / 720。若你希望 hang 的 session 更早被标 dead 释放面板，调低到 60；不建议 < 30（与"短暂网络抖动 / Claude 长 tool"难区分）。
 
 **何时改 `PreToolUse_minutes`**：经常跑 30 分钟以上的单工具（如 `npm install` 大仓 / 大模型 batch 调用）→ 拉高到 30 或 60。
 
@@ -294,6 +294,18 @@ events.jsonl 长期 append 会无界增长。开启归档后，老事件会 gzip
 |---|---|---|---|
 | `muted` | `false` | bool | 全局静音开关。true → 所有飞书推送在最终发送前被 drop（dashboard 仍记录事件）。dashboard 顶部"全局静音"按钮维护。 |
 | `snooze_until` | `""` | string (ISO8601) | 临时贪睡截止时间。非空且未过期 → 推送被 drop。过期后字段值仍在但不再生效。dashboard "贪睡 N 分钟" 按钮维护。 |
+| `public_url` | `""` | string | 飞书 ↗ 链接 + osascript Chrome tab 匹配用的 dashboard 公共 URL。**空 = 自动**从 `main()` 实际监听的 `HOST:PORT` 推导（`HOST=0.0.0.0` 时浏览器侧退化为 `127.0.0.1`）。**填则覆盖**：当 backend 实际监听地址 ≠ 浏览器访问 URL 时显式配置（反向代理 / Tailscale 域名 / Cloudflare Tunnel 等）。例：`"https://notify.example.com"` 或 `"http://192.168.1.10:9000"`。trailing `/` 自动忽略。改完立即生效（feishu.send_event 每次重读 cfg）。 |
+
+### 11.1 `public_url` 何时该改（F6）
+
+只改 `PORT` / 在 LAN 用 `HOST=0.0.0.0` → **不用动**（backend 自动推导）。
+
+需要显式填的场景：
+- 套了反向代理：backend 监听 `127.0.0.1:8787`，对外暴露 `https://notify.example.com`
+- Tailscale / WireGuard 内网域名：浏览器走 `http://mac-tailnet:8787` 访问别的机器上的 backend
+- 多机器共用一个对外入口
+
+填了之后：飞书消息里的 ↗ 链接用 `public_url` 拼 `/o/<sid>`；osascript 匹配 Chrome dashboard tab 时也用它做 starts-with 前缀（注意：osascript 在 backend 本机跑，远端浏览器场景这个匹配自然会 NOT_FOUND，走 meta refresh fallback，符合预期）。
 
 ---
 

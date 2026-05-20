@@ -3,7 +3,10 @@
 # Claude Desktop Bridge 设计
 
 创建时间: 2026-05-17 18:30:00
-更新时间: 2026-05-17 18:30:00
+更新时间: 2026-05-17 18:30:00（R29 baseline，未跟随后续实现更新）
+
+> **⚠️ 时效声明**：本文档是 R29 立项时的**设计 baseline**。R30 之后实际实现已大幅演进（R33 "找窗口 Stop 按钮"被废弃 → 改读 sidebar Recents；R35-R38 增加 mode 板块识别；R40+ 增加 hidden_sessions / mark-dead 等）。
+> **代码事实**以 `backend/desktop_bridge.py` 为准；**模块清单**见 [docs/modules.md `backend.desktop_bridge` 段](../modules.md#backenddesktop_bridger30-新增macos-only)；**用户视角的演进过程**见 [CHANGELOG.md R29-R49](../../CHANGELOG.md)。本文件保留作为方案选型背景。
 
 ## 1. 目标
 

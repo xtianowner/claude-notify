@@ -266,7 +266,10 @@ def _format_text(evt: dict[str, Any], summary: dict[str, Any] | None, cfg: dict[
         # - R26 / L51：改成 query URL `/?s={sid}` 解决了 `#` 问题，但 Chrome 仍按
         #   "最右匹配"开/复用 tab，前面位置的 dashboard tab 拿不到焦点。
         # - R27 / L52：彻底改走 backend endpoint，osascript 接管 tab 切换。
-        tail_bits.append(f"↗ http://127.0.0.1:8787/o/{sid}")
+        # F6：URL host:port 跟随 cfg.public_url（用户显式）或 HOST/PORT env 推导，
+        # 不再硬编码 127.0.0.1:8787，否则改端口后 ↗ 链接点出来 404。
+        base = cfg_mod.get_public_url(cfg)
+        tail_bits.append(f"↗ {base}/o/{sid}")
     if tail_bits:
         lines.append(" · ".join(tail_bits))
 

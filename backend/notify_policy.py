@@ -83,20 +83,26 @@ class NotifyDispatcher:
                 return False
         return False
 
-    async def _emit_browser_push(self, evt: dict[str, Any], reason: str) -> None:
+    async def _emit_browser_push(self, evt: dict[str, Any], reason: str) -> bool:
         """通过 listener 广播一份 push_event 给 dashboard WS。
-        前端根据 push_channels.browser + Notification permission 决定是否弹 toast。"""
+        前端根据 push_channels.browser + Notification permission 决定是否弹 toast。
+
+        返回值（R50/F1）：True=实际把 push 派给 listener；False=listener 未注入或被全局静音。
+        调用方据此判断 browser 渠道是否成功 emit，用于 _record_stop_push 的 dedupe ts 决策。
+        """
         listener = self._push_listener
         if listener is None:
-            return
+            return False
         cfg = cfg_mod.load()
         if self._globally_silenced(cfg):
-            return
+            return False
         try:
             await listener(evt, reason)
+            return True
         except Exception:
             log.exception("push listener failed sid=%s",
                           evt.get("session_id"))
+            return False
 
     async def submit(self, evt: dict[str, Any]) -> dict[str, Any]:
         ev_type = evt.get("event") or ""
@@ -139,9 +145,13 @@ class NotifyDispatcher:
             ok, reason = notify_filter.should_notify(evt, summary, cfg)
             if not ok:
                 return {"ok": False, "reason": f"filtered:{reason}"}
-            await self._emit_browser_push(evt, reason or "immediate")
+            browser_emitted = await self._emit_browser_push(evt, reason or "immediate")
             result = await feishu.send_event(evt)
-            self._record_stop_push(ev_type, sid, result)
+            self._record_stop_push(
+                ev_type, sid,
+                feishu_ok=bool(result and result.get("ok")),
+                browser_emitted=browser_emitted,
+            )
             return result
 
         if policy.startswith("silence:"):
@@ -197,9 +207,14 @@ class NotifyDispatcher:
                     if not ok:
                         log.info("silence-then filtered sid=%s reason=%s", sid, reason)
                         return
-                    await self._emit_browser_push(events[0], reason or "silence_fire")
+                    browser_emitted = await self._emit_browser_push(
+                        events[0], reason or "silence_fire")
                     result = await feishu.send_event(events[0])
-                    self._record_stop_push(events[0].get("event") or "", sid, result)
+                    self._record_stop_push(
+                        events[0].get("event") or "", sid,
+                        feishu_ok=bool(result and result.get("ok")),
+                        browser_emitted=browser_emitted,
+                    )
                 else:
                     # 多事件合并：只要有一条通过过滤就推（合并卡片）
                     passed = [e for e in events
@@ -209,12 +224,16 @@ class NotifyDispatcher:
                         self._trace(sid, "Stop", "drop",
                                     f"merged_all_filtered(n={len(events)})", "silence")
                         return
-                    await self._emit_browser_push(
+                    browser_emitted = await self._emit_browser_push(
                         passed[-1], f"silence_combined_{len(passed)}")
                     result = await feishu.send_events_combined(passed)
                     # 合并卡片若包含 Stop，也算 Stop 已推过
                     if any((e.get("event") or "") == "Stop" for e in passed):
-                        self._record_stop_push("Stop", sid, result)
+                        self._record_stop_push(
+                            "Stop", sid,
+                            feishu_ok=bool(result and result.get("ok")),
+                            browser_emitted=browser_emitted,
+                        )
             except Exception:
                 log.exception("delayed send failed sid=%s n=%d", sid, len(events))
         except asyncio.CancelledError:
@@ -267,12 +286,27 @@ class NotifyDispatcher:
         except Exception:
             pass
 
-    def _record_stop_push(self, ev_type: str, sid: str, result: dict[str, Any] | None) -> None:
-        """Stop 推送成功后写 ts，供 Notification dedupe 用。
-        L22：同时重置该 sid 的 idle reminder 计数 —— 新一回合开始，3 次配额刷新。"""
+    def _record_stop_push(
+        self,
+        ev_type: str,
+        sid: str,
+        *,
+        feishu_ok: bool,
+        browser_emitted: bool,
+    ) -> None:
+        """Stop 推送被分发出去后写 ts，供 Notification dedupe 用。
+        L22：同时重置该 sid 的 idle reminder 计数 —— 新一回合开始，3 次配额刷新。
+
+        R50/F1：判定从「feishu 成功」改为「任一渠道实际 emit」。browser-only 用户
+        （未配 feishu_webhook，纯走浏览器通知）也能正确记 ts、刷 reminder 配额，
+        否则浏览器会被反复弹同一句 filler。
+
+        注意：policy_off / quiet_hours_drop / session_muted_drop 路径在调到这里之前
+        就已经被 should_notify 拦截（feishu_ok=False && browser_emitted=False），
+        因此本函数不会被它们触发。"""
         if ev_type != "Stop" or not sid:
             return
-        if not (result and result.get("ok")):
+        if not (feishu_ok or browser_emitted):
             return
         self._last_stop_pushed_at[sid] = time.time()
         # L22：新 Stop push 来 → 重置 idle reminder 计数（下一回合重新走 3 次循环）

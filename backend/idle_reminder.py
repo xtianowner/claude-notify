@@ -16,27 +16,114 @@
 - mark_sent(sid) → reminder 计数 +1
 - reset(sid) → 计数清零（在 Stop push 成功时调用）
 
-状态持久化策略：
-- in-memory dict + lock；重启 backend 全部重置（用户预期 reminder 是临时状态，重启后从 0 开始可接受）
-- 不写文件（避免 IO；与 decision_log 不同，decision_log 有用户回看价值）
+状态持久化策略（R50/F2）：
+- 落盘 data/idle_reminder.json，schema: {"<sid>": {"count": int, "last_at": iso8601}}
+- mark_sent / reset 后同步落盘（tmp + os.replace 原子写）
+- 模块首次访问时 lazy load（与 hidden_sessions.py 模式一致）
+- 重启 backend 时计数从盘恢复 —— 防止"重启后用户被当作新一回合再推 reminder #1"
 
-容量保护：单实例最多保留 1024 个 sid 的计数（LRU 淘汰），防内存泄漏。
+并发：threading.RLock；与 dispatcher（async）跨线程安全（mark_sent/reset 可能从
+任意 event loop 线程调用，且 hidden_sessions 也是同模式）。
+
+容量保护：单实例最多保留 _MAX_ENTRIES（512）个 sid 的计数（LRU 淘汰），防内存/磁盘爆炸。
 """
 from __future__ import annotations
+import json
+import os
 from collections import OrderedDict
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from threading import RLock
 
-_MAX_ENTRIES = 1024
+from .config import DATA_DIR
+
+_MAX_ENTRIES = 512  # R50/F2：从 1024 降到 512，落盘场景下控制文件体积
+_REMINDER_PATH: Path = DATA_DIR / "idle_reminder.json"
+_SHANGHAI_TZ = timezone(timedelta(hours=8))
 
 _lock = RLock()
-_counts: "OrderedDict[str, int]" = OrderedDict()
+# entry: {"count": int, "last_at": iso8601}
+_counts: "OrderedDict[str, dict] | None" = None  # None = 尚未 lazy load
+
+
+def _now_iso() -> str:
+    return datetime.now(_SHANGHAI_TZ).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+
+
+def _load_unlocked() -> "OrderedDict[str, dict]":
+    """从盘加载到 _counts。损坏 / 不存在 → 空 OrderedDict。"""
+    if not _REMINDER_PATH.exists():
+        return OrderedDict()
+    try:
+        raw = json.loads(_REMINDER_PATH.read_text("utf-8"))
+    except Exception:
+        return OrderedDict()
+    if not isinstance(raw, dict):
+        return OrderedDict()
+    out: "OrderedDict[str, dict]" = OrderedDict()
+    for sid, entry in raw.items():
+        if not isinstance(sid, str) or not sid:
+            continue
+        # 容错：旧格式 {sid: int} 也接住
+        if isinstance(entry, int):
+            out[sid] = {"count": entry, "last_at": ""}
+            continue
+        if not isinstance(entry, dict):
+            continue
+        try:
+            cnt = int(entry.get("count") or 0)
+        except Exception:
+            cnt = 0
+        if cnt <= 0:
+            continue
+        out[sid] = {
+            "count": cnt,
+            "last_at": str(entry.get("last_at") or ""),
+        }
+    return out
+
+
+def _ensure_loaded_unlocked() -> "OrderedDict[str, dict]":
+    global _counts
+    if _counts is None:
+        _counts = _load_unlocked()
+    return _counts
+
+
+def _persist_unlocked() -> None:
+    """tmp + os.replace 原子写。调用方必须已持 _lock。"""
+    global _counts
+    if _counts is None:
+        return
+    data = {sid: dict(entry) for sid, entry in _counts.items()}
+    try:
+        _REMINDER_PATH.parent.mkdir(exist_ok=True)
+        tmp = _REMINDER_PATH.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, _REMINDER_PATH)
+    except Exception:
+        # 落盘失败不抛 —— 内存计数仍然有效，下一次 mark_sent/reset 会重试
+        pass
 
 
 def get_count(sid: str) -> int:
     if not sid:
         return 0
     with _lock:
-        return _counts.get(sid, 0)
+        c = _ensure_loaded_unlocked()
+        entry = c.get(sid)
+        if not entry:
+            return 0
+        try:
+            return int(entry.get("count") or 0)
+        except Exception:
+            return 0
 
 
 def mark_sent(sid: str) -> int:
@@ -44,12 +131,19 @@ def mark_sent(sid: str) -> int:
     if not sid:
         return 0
     with _lock:
-        cur = _counts.get(sid, 0) + 1
-        _counts[sid] = cur
-        _counts.move_to_end(sid)
-        # 容量保护
-        while len(_counts) > _MAX_ENTRIES:
-            _counts.popitem(last=False)
+        c = _ensure_loaded_unlocked()
+        entry = c.get(sid) or {"count": 0, "last_at": ""}
+        try:
+            cur = int(entry.get("count") or 0) + 1
+        except Exception:
+            cur = 1
+        entry = {"count": cur, "last_at": _now_iso()}
+        c[sid] = entry
+        c.move_to_end(sid)
+        # 容量保护（LRU 淘汰最老）
+        while len(c) > _MAX_ENTRIES:
+            c.popitem(last=False)
+        _persist_unlocked()
         return cur
 
 
@@ -58,10 +152,28 @@ def reset(sid: str) -> None:
     if not sid:
         return
     with _lock:
-        _counts.pop(sid, None)
+        c = _ensure_loaded_unlocked()
+        if sid not in c:
+            return
+        c.pop(sid, None)
+        _persist_unlocked()
 
 
 def snapshot() -> dict[str, int]:
-    """诊断用：返回当前内存里所有 sid 的 reminder 计数副本。"""
+    """诊断用：返回当前所有 sid 的 reminder 计数副本（仅 count，向后兼容）。"""
     with _lock:
-        return dict(_counts)
+        c = _ensure_loaded_unlocked()
+        out: dict[str, int] = {}
+        for sid, entry in c.items():
+            try:
+                out[sid] = int(entry.get("count") or 0)
+            except Exception:
+                out[sid] = 0
+        return out
+
+
+def _reload_for_tests() -> None:
+    """测试钩子：强制下一次访问 lazy load 重新读盘。"""
+    global _counts
+    with _lock:
+        _counts = None

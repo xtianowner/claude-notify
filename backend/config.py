@@ -153,11 +153,17 @@ DEFAULTS: dict[str, Any] = {
     "push_channels": DEFAULT_PUSH_CHANNELS,
     "tab_reuse_mode": DEFAULT_TAB_REUSE_MODE,
     "desktop_bridge": DEFAULT_DESKTOP_BRIDGE,
+    # F6：飞书 ↗ 链接 + osascript Chrome tab 匹配跟随的 dashboard 公共 URL。
+    # 空 → 自动从 main() 实际监听的 HOST:PORT 推导（HOST=0.0.0.0 时退化为 127.0.0.1）。
+    # 显式填 → 用户自定义（LAN 场景 / 反向代理 / Tailscale 内网域名等）。
+    # 接受 trailing slash，会在 get_public_url() 内 rstrip。
+    "public_url": "",
     "feishu_webhook": "",
     "feishu_secret": "",
     "timeout_minutes": 5,
     "dead_threshold_minutes": 180,   # R38：3 小时；之前 30min 对长任务过激（误标 dead）
     "active_window_minutes": 30,
+    "liveness_interval_seconds": 30,   # R52：watcher 巡检周期；docs/configuration.md §5 提到过但 DEFAULTS 漏，R52 补
     "liveness_per_state_timeout": DEFAULT_LIVENESS_PER_STATE_TIMEOUT,
     "archival": DEFAULT_ARCHIVAL,
     "notify_policy": DEFAULT_NOTIFY_POLICY,
@@ -378,6 +384,42 @@ def prune_expired_session_mutes() -> int:
             sm.pop(sid, None)
         _write_session_mutes(sm)
     return len(expired)
+
+
+# R51 / F6 补齐：feishu.py 这类 plain 模块拿不到 app.state，需要 module-level runtime default。
+# app.py main() 算出真实 HOST:PORT 后调 set_runtime_default_public_url() 注入。
+# 初始值兜底 127.0.0.1:8787（lifespan startup 之前误调也不崩）。
+_RUNTIME_DEFAULT_PUBLIC_URL = "http://127.0.0.1:8787"
+
+
+def set_runtime_default_public_url(url: str) -> None:
+    """app.py main() 启动后注入，让 get_public_url 在 cfg/caller 都没值时用真实 HOST:PORT。
+
+    PORT=9000 启动后，feishu.send_event 调 get_public_url(cfg) 不传 default 也能拿到 :9000。
+    """
+    global _RUNTIME_DEFAULT_PUBLIC_URL
+    if url and isinstance(url, str):
+        _RUNTIME_DEFAULT_PUBLIC_URL = url.rstrip("/")
+
+
+def get_public_url(cfg: dict[str, Any], default: str | None = None) -> str:
+    """F6：返回 dashboard 公共可访问 URL（无 trailing slash）。
+
+    优先级：
+      1. cfg.public_url 非空 → 用它（用户显式自定义，覆盖一切）
+      2. default → 调用方显式传入（app.py 拼 base_url 时传 app.state.default_public_url）
+      3. _RUNTIME_DEFAULT_PUBLIC_URL → main() 注入的真实 HOST:PORT（feishu.py 走这条）
+      4. 兜底 "http://127.0.0.1:8787"（仅 startup 之前的极端情况）
+    末尾 `/` 一律 strip，方便调用方自由拼 `/o/{sid}` / `/?s=...`。
+    """
+    explicit = (cfg.get("public_url") or "").strip() if isinstance(cfg, dict) else ""
+    if explicit:
+        return explicit.rstrip("/")
+    if default:
+        base = default.strip()
+        if base:
+            return base.rstrip("/")
+    return _RUNTIME_DEFAULT_PUBLIC_URL or "http://127.0.0.1:8787"
 
 
 def public_view(cfg: dict[str, Any]) -> dict[str, Any]:

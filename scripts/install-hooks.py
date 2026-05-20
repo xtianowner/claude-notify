@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""把 claude-notify 的 4 条 hook 写入 ~/.claude/settings.json。
+"""把 claude-notify 的 7 条 hook 写入 ~/.claude/settings.json。
+
+构成：
+  事件型 6 条：Notification / Stop / SubagentStop / SessionStart / SessionEnd / UserPromptSubmit
+  心跳型 1 条：PreToolUse（带 --heartbeat，不推送，只刷新 last_activity）
 
 用法：
   python scripts/install-hooks.py            # 安装
