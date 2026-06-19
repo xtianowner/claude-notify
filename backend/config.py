@@ -22,6 +22,7 @@ DEFAULT_NOTIFY_POLICY = {
     "Notification":  "immediate",   # 等输入 / 等授权 → 必推
     "TimeoutSuspect": "immediate",  # 疑挂 → 必推
     "Stop":          "silence:12",  # 主 agent 完成 = 等下一步 → 推（12s 静默）
+    "StopFailure":   "immediate",   # R54：回合因 API 错误结束（无 Stop）→ 立即推，否则静默到 liveness 超时
     "SubagentStop":  "off",         # 子 agent 完成 ≠ 主流程结束，主 agent 还在跑，不打扰
     "SessionStart":  "off",         # 开会话本身不要求用户动作
     "SessionEnd":    "off",
@@ -90,6 +91,9 @@ DEFAULT_ARCHIVAL = {
     "max_hot_size_mb": 50,       # hot 文件 >= 此大小触发归档检查
     "rotation_grace_days": 1,    # 只归档 ts 早于 N 天前的事件，保留近期热事件
     "archive_dir": "data/archive",
+    # R54：周期归档检查间隔。此前归档只在 backend 启动时跑一次，长驻不重启的 backend
+    # events.jsonl 会无界增长（实测涨到 185MB）→ list_sessions 每次全量读 hot 文件变慢。
+    "check_interval_seconds": 600,
 }
 
 DEFAULT_QUIET_HOURS = {
@@ -113,6 +117,7 @@ DEFAULT_LIVENESS_PER_STATE_TIMEOUT = {
     "enabled": True,
     "Notification_minutes": 5,         # 等用户输入：与原 timeout 一致
     "Stop_minutes": 5,                 # 主回合结束等下一步
+    "StopFailure_minutes": 5,          # R54：失败结束同 Stop，回合已终结等用户处理
     "SubagentStop_minutes": 5,
     "PreToolUse_minutes": 15,          # 长 tool 执行（curl 大文件 / build / LLM 慢响应）容忍 15 分钟
     "PostToolUse_minutes": 10,         # 思考下一步

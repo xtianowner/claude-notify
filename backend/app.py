@@ -192,6 +192,28 @@ def _inject_runtime_public_url(source: str) -> str:
     return default_url
 
 
+async def _archive_loop(interval_seconds: int):
+    """R54：周期触发滚动归档。此前归档只在 lifespan 启动跑一次，长驻不重启的 backend
+    events.jsonl 无界增长（实测 185MB）→ list_sessions 全量读 hot 文件变慢。
+    archive_if_needed() 内部按 max_hot_size_mb 判阈值，未超时只是一次 stat，开销极小；
+    超阈值时持 LOCK_EX 安全重写（与 append_event 并发不冲突）。"""
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            # to_thread：archive_if_needed 对最大 ~185MB 的 hot 文件做阻塞 readlines + 重写 + fsync，
+            # 直接在 event loop 跑会卡住 WS / HTTP / dispatch（每 interval 一次）→ 丢线程池。
+            stats = await asyncio.to_thread(event_store.archive_if_needed)
+            if stats.get("triggered") and stats.get("reason") == "ok":
+                log.info("periodic archive: %d events archived, %d kept hot",
+                         stats.get("archived_count", 0), stats.get("kept_count", 0))
+        except asyncio.CancelledError:
+            # 与 liveness watch_loop 一致：cancel 时正常 return，让 lifespan 的 `except Exception`
+            # 等待块拿到结果；若 re-raise，CancelledError(BaseException) 会击穿该块、跳过后续 desktop 清理。
+            return
+        except Exception:
+            log.exception("periodic archive failed (non-fatal)")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # F6 / R52：lifespan 在两种启动姿势下都会跑（main() / uvicorn 直起）。
@@ -218,6 +240,13 @@ async def lifespan(app: FastAPI):
     except Exception:
         log.exception("startup prune session_mutes failed")
     task = asyncio.create_task(liveness_watcher.watch_loop(_on_watcher_event, interval_seconds=interval))
+    # R54：周期归档（events.jsonl 控大小）。enabled=False 时不起任务。
+    archival_cfg = cfg.get("archival") or {}
+    archive_task: asyncio.Task | None = None
+    if archival_cfg.get("enabled"):
+        archive_task = asyncio.create_task(
+            _archive_loop(int(archival_cfg.get("check_interval_seconds") or 600))
+        )
     # R30：Claude Desktop AX 桥接（macOS only；默认 off，dashboard 开启）。
     # 桥接 emit 的事件通过 _on_desktop_event 走与 hook POST 同样的归一化 + 派发链路。
     dsk_cfg = cfg.get("desktop_bridge") or {}
@@ -277,6 +306,12 @@ async def lifespan(app: FastAPI):
             await task
         except Exception:
             pass
+        if archive_task is not None:
+            archive_task.cancel()
+            try:
+                await archive_task
+            except Exception:
+                pass
         if desktop_task is not None:
             try:
                 app.state.desktop_bridge.stop()
@@ -1048,8 +1083,8 @@ def health_setup():
     cfg = cfg_mod.load()
     settings_path = Path.home() / ".claude" / "settings.json"
     # R24 / B3：与 scripts/install-hooks.py 的 EVENTS_NORMAL + PreToolUse 心跳保持一致
-    expected = ["Notification", "Stop", "SubagentStop", "SessionStart", "SessionEnd",
-                "UserPromptSubmit", "PreToolUse"]
+    expected = ["Notification", "Stop", "StopFailure", "SubagentStop", "SessionStart",
+                "SessionEnd", "UserPromptSubmit", "PreToolUse"]
     detected: list[str] = []
     settings_exists = settings_path.exists()
     if settings_exists:

@@ -93,6 +93,7 @@ export function eventBadgeClass(ev) {
   switch (ev) {
     case "Notification":    return "status-badge status-waiting";
     case "Stop":            return "status-badge status-ok";
+    case "StopFailure":     return "status-badge status-dead";
     case "SubagentStop":    return "status-badge status-ok";
     case "TimeoutSuspect":  return "status-badge status-suspect";
     case "SessionDead":     return "status-badge status-dead";

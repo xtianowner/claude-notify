@@ -180,7 +180,7 @@ python3 scripts/install-hooks.py --uninstall  # 卸载
 
 **关于已有 hook 的冲突**：脚本只识别**自家** hook（按命令含 `hook-notify.py` 关键字判定）。你已有的其它 hook **会原样保留**，不会被删/改。每次写入前自动备份 `~/.claude/settings.json` 到 `~/.claude/settings.json.bak-<YYYYMMDD-HHMMSS>`。
 
-注册的 hook 共 7 条：`Notification` / `Stop` / `SubagentStop` / `SessionStart` / `SessionEnd` / `UserPromptSubmit`（事件型）+ `PreToolUse`（心跳型，加 `--heartbeat` 不推送）。其中 `UserPromptSubmit` 是 dashboard 状态从"等输入"翻回"工作中"的唯一信号源 —— 缺它会导致回话后 dashboard 状态不更新（L43）。
+注册的 hook 共 8 条：`Notification` / `Stop` / `StopFailure` / `SubagentStop` / `SessionStart` / `SessionEnd` / `UserPromptSubmit`（事件型）+ `PreToolUse`（心跳型，加 `--heartbeat` 不推送）。其中 `UserPromptSubmit` 是 dashboard 状态从"等输入"翻回"工作中"的唯一信号源 —— 缺它会导致回话后 dashboard 状态不更新（L43）；`StopFailure`（R54）让"回合因 API 错误结束"也能即时推送，否则会静默到 liveness 超时才标 dead。
 
 装完后任意 Claude Code 终端发一句话，dashboard 即应出现该 session 卡片。
 
@@ -271,10 +271,11 @@ git reset --hard pre-desktop-bridge-R29
 | `Notification` | immediate | 等输入 / 等授权 → 必推 |
 | `TimeoutSuspect` | immediate | 长任务疑似 hang → 必推 |
 | `Stop` | silence:12 | 主 agent 完成一回合（= 等下一步） → 12s 静默后推 |
+| `StopFailure` | immediate | 回合因 API 错误结束（无 Stop） → 立即推（R54；尊重静音/免打扰，不进穿透白名单） |
 | `SubagentStop` | off | 子 agent 完成 ≠ 主流程结束，不打扰 |
 | `SessionDead/End/Heartbeat` | off | 不推 |
 
-dashboard ⚙ → 配置可手动调整。除上述 5 个事件开关外，还有 30+ 字段（精细过滤 / liveness 阈值 / idle reminder / quiet hours / 归档 / LLM…） → [docs/configuration.md](docs/configuration.md)
+dashboard ⚙ → 配置可手动调整。除上述事件开关外，还有 30+ 字段（精细过滤 / liveness 阈值 / idle reminder / quiet hours / 归档周期 / LLM…） → [docs/configuration.md](docs/configuration.md)
 
 ## 故障排查
 

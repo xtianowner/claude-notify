@@ -116,9 +116,22 @@ def main() -> int:
     # 若是 → 标 desktop_embedded=True，dashboard 将把它归到 Desktop·Code 段而非终端段。
     desktop_embedded = _is_claude_desktop_embedded(claude_pid)
 
+    # CC 的 SessionStart 负载带顶层 source ∈ {startup,resume,clear,compact}（= 会话启动原因），
+    # 不是 claude-notify 的传输渠道（claude_code / desktop_app）。绝不能让它覆盖渠道 source：
+    # 否则后端 sources.normalize 按 source 路由会把这些 session 误判成非 claude_code，
+    # 前端"终端 / Desktop"分段错乱、desktop_embedded 兜底被跳过。详见 LESSONS.md L54。
+    # 本 hook 仅由 Claude Code CLI 触发，渠道恒为 claude_code；启动原因单独存 session_start_source。
+    raw_source = payload.get("source")
+    if event_name == "SessionStart":
+        channel = "claude_code"
+        session_start_source = raw_source  # startup/resume/clear/compact，供后端区分 resume/compact
+    else:
+        channel = raw_source or "claude_code"
+        session_start_source = None
+
     evt = {
         "ts": now_iso(),
-        "source": payload.get("source") or "claude_code",
+        "source": channel,
         "session_id": payload.get("session_id") or "unknown",
         "event": event_name,
         "cwd": cwd,
@@ -133,7 +146,10 @@ def main() -> int:
         "effort_level": effort_level,
         "last_assistant_message": payload.get("last_assistant_message"),
         "reason": payload.get("reason"),
+        "error": payload.get("error"),  # R54：StopFailure 必带，回合失败的错误
+        "error_details": payload.get("error_details"),  # R54：StopFailure 可选
         "desktop_embedded": desktop_embedded,  # R43：Claude Desktop Code mode 嵌入的 CLI
+        "session_start_source": session_start_source,  # R53：CC SessionStart 启动原因 startup/resume/clear/compact
         "raw": payload,
     }
 
@@ -198,6 +214,8 @@ def _summarize(payload: dict, is_heartbeat: bool) -> str:
         return payload.get("message") or "需要确认"
     if ev == "Stop":
         return "任务一回合结束"
+    if ev == "StopFailure":
+        return f"任务失败：{payload.get('error') or payload.get('error_details') or 'API 错误'}"
     if ev == "SubagentStop":
         return "子 agent 完成"
     if ev == "SessionStart":
