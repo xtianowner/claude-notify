@@ -2,6 +2,12 @@
 
 > 用户视角的功能演进。每个 round 对应一个 git commit，可在 `git log` 找到完整 diff。
 
+## R55 · 修「→ 终端」跨 Space 激活跳错（误切到顶层别的 app） (2026-06-20)
+
+`→ 终端` focus：当多个终端窗口分布在不同 macOS Space（桌面）时，旧逻辑 `set frontmost of w to true` → `activate` 只把"当前 Space 已有的那个终端窗口"拉前，**不切到目标窗口所在 Space** → 用户停在当前桌面、看到的是该桌面顶层的别的 app（如 Telegram），误以为"跳转跳错了"。
+**修法**（`backend/app.py` `_build_focus_script`）：先把目标窗口提到该 app 窗口栈最前（Terminal `set index of w to 1`；iTerm2 补 `select theWindow`）→ 再 `activate`（触发跨 Space 切到目标窗口所在桌面）→ activate 后再 re-assert 一次目标窗口在最前（防落到当前 Space 的另一个终端窗口）。
+**诊断**：iTerm2 未装（该分支 `-1728` 被 `try` 吃掉）、tty 唯一命中、前端无乱跳 fallback —— 三者均排除后定位到激活逻辑。用户实测确认修复。
+
 ## R54 · 采纳 StopFailure 推送 + events.jsonl 周期归档 (2026-06-20)
 
 接 R53 适配排查的两个 follow-up：采纳 R53 deferred 的一个 opportunity + 修一个归档 gap。

@@ -575,6 +575,12 @@ def _build_focus_script(tty: str) -> str:
     改成对各终端 app 直接 `try ... end try`，应用没装时 try 吃掉错误，继续下一个。
     """
     safe_tty = tty.replace("\\", "\\\\").replace('"', '\\"')
+    # R55：跨 Space / 多窗口下的稳健激活。
+    # 旧版 `set frontmost of w to true` 后 `activate`：当用户有多个终端窗口分布在不同
+    # macOS Space（桌面）时，`activate` 只把"当前 Space 已有的那个终端窗口"拉前，而不是
+    # 切到目标窗口所在 Space → 用户停在当前 Space、看到的是该 Space 顶层的别的 app（如 TG），
+    # 误以为"跳转跳错了"。修法：先把目标窗口提到该 app 窗口栈最前（select / set index 1），
+    # 再 `activate`（触发跨 Space 切换到目标窗口），activate 后再 re-assert 一次目标窗口在最前。
     return (
         f'set targetTty to "{safe_tty}"\n'
         'try\n'
@@ -583,9 +589,11 @@ def _build_focus_script(tty: str) -> str:
         '      repeat with theTab in tabs of theWindow\n'
         '        repeat with theSession in sessions of theTab\n'
         '          if tty of theSession is targetTty then\n'
+        '            select theWindow\n'
         '            select theTab\n'
         '            select theSession\n'
         '            activate\n'
+        '            select theWindow\n'
         '            return "iterm2:ok"\n'
         '          end if\n'
         '        end repeat\n'
@@ -599,8 +607,10 @@ def _build_focus_script(tty: str) -> str:
         '      repeat with t in tabs of w\n'
         '        if tty of t is targetTty then\n'
         '          set selected of t to true\n'
-        '          set frontmost of w to true\n'
+        '          set index of w to 1\n'
         '          activate\n'
+        '          set frontmost of w to true\n'
+        '          set index of w to 1\n'
         '          return "terminal:ok"\n'
         '        end if\n'
         '      end repeat\n'
