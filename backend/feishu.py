@@ -18,6 +18,7 @@ log = logging.getLogger("claude-notify.feishu")
 EVENT_META = {
     "Notification":   ("🔔", "等你确认"),
     "Stop":           ("✅", "任务完成"),
+    "StopFailure":    ("🔴", "任务失败"),   # R54：回合因 API 错误结束
     "SubagentStop":   ("🤝", "子 agent 完成"),
     "TimeoutSuspect": ("⚠️", "疑似 hang"),
     "SessionDead":    ("🪦", "会话已结束"),

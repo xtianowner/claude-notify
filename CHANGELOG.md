@@ -2,6 +2,47 @@
 
 > 用户视角的功能演进。每个 round 对应一个 git commit，可在 `git log` 找到完整 diff。
 
+## R55 · 修「→ 终端」跨 Space 激活跳错（误切到顶层别的 app） (2026-06-20)
+
+`→ 终端` focus：当多个终端窗口分布在不同 macOS Space（桌面）时，旧逻辑 `set frontmost of w to true` → `activate` 只把"当前 Space 已有的那个终端窗口"拉前，**不切到目标窗口所在 Space** → 用户停在当前桌面、看到的是该桌面顶层的别的 app（如 Telegram），误以为"跳转跳错了"。
+**修法**（`backend/app.py` `_build_focus_script`）：先把目标窗口提到该 app 窗口栈最前（Terminal `set index of w to 1`；iTerm2 补 `select theWindow`）→ 再 `activate`（触发跨 Space 切到目标窗口所在桌面）→ activate 后再 re-assert 一次目标窗口在最前（防落到当前 Space 的另一个终端窗口）。
+**诊断**：iTerm2 未装（该分支 `-1728` 被 `try` 吃掉）、tty 唯一命中、前端无乱跳 fallback —— 三者均排除后定位到激活逻辑。用户实测确认修复。
+
+## R54 · 采纳 StopFailure 推送 + events.jsonl 周期归档 (2026-06-20)
+
+接 R53 适配排查的两个 follow-up：采纳 R53 deferred 的一个 opportunity + 修一个归档 gap。
+
+### StopFailure：失败回合也即时推送（多文件全链路）
+
+CC 2.1.x 的 `StopFailure`（回合因 API 错误结束）**不触发 `Stop`**，dashboard 会静默卡在"运行中"直到 liveness 超时才标 dead。本轮全链路接入：
+- `install-hooks.py` 注册第 8 条 hook `StopFailure`（**需重跑 `install-hooks.py` 生效**）；
+- `hook-notify.py` / `sources.py` 摘要成「任务失败：<error>」，透传 `error`/`error_details`；
+- `event_store.derive_status` → `idle`（回合终结，不再卡 running）+ 按 Stop 清菜单红徽；
+- `config.notify_policy` 默认 `immediate`；`notify_filter._ALWAYS_TRUE` 收录（否则落 `unknown_event` 被吞）—— 仍尊重 session 静音 / quiet hours，不进穿透白名单；
+- `feishu` 渲染 `🔴 任务失败`。
+全链路 offline 验证通过（normalize→status→policy→filter→feishu）。不想要可在配置面板把 `StopFailure` 调 `off`。
+
+### events.jsonl 周期归档 — `backend/app.py` / `backend/config.py`
+
+此前归档只在 backend 启动时跑一次（`lifespan`），长驻不重启的 backend events.jsonl 会无界增长（实测涨到 185MB）→ `list_sessions` 每次全量读 hot 文件变慢。新增 `_archive_loop` 周期任务（`archival.check_interval_seconds`，默认 600s），到点调同一个 `archive_if_needed()`（持 LOCK_EX 安全重写，未超阈值只是一次 stat）。`enabled=False` 不起任务；lifespan 退出时 cancel。验证：0.05s 间隔 spy 测试确认按时 tick + cancel 干净。
+
+## R53 · 适配 Claude Code 2.1.183：修 `source` 字段语义冲突 + hook 实机漂移 (2026-06-20)
+
+随本机 Claude Code 升到 **2.1.183** 做的一轮适配排查（对二进制 Zod schema 取证 + 多 agent 对抗式验证）。**结论：无 BREAKING** —— 项目 hook 的全部事件在 2.1.183 仍存在，settings.json 三级格式、`effort{level}`、`last_assistant_message`、`notification_type==permission_prompt` 全部仍匹配当前 schema。本轮修掉 1 个真 bug + 1 个配置漂移。
+
+### `source` 字段语义冲突（真 bug）— `scripts/hook-notify.py` / `backend/sources.py` / `backend/event_store.py`
+
+CC 的 `SessionStart` 负载带顶层 `source` ∈ `{startup,resume,clear,compact}`（= 会话**启动原因**），`hook-notify.py` 之前 `payload.get("source") or "claude_code"` 把它当成 claude-notify 自己的**渠道** `source`，污染了 session 的渠道归属 → 前端「终端 / Desktop」分段错乱、`desktop_embedded` 兜底被跳过（实测 2.1.183 下 **10/14** session 中招）。
+**修法**：① 渠道按事件名硬钉 `claude_code`，启动原因另存 `session_start_source`（按事件名 gate，未来枚举扩张也不漏）；② 新增单一真相函数 `sources.coerce_channel_source()`，在入口 `normalize`（新事件）+ `list_sessions` 建卡（旧事件 replay）两处把被污染的历史 `source` 纠回 `claude_code`。详见 [LESSONS.md L54](LESSONS.md)。
+**验证**：实机重启 replay 后 15/15 session 全归 `claude_code`，污染清零；合成 `source=compact` 事件归段正确。
+
+### hook 实机漂移 — `~/.claude/settings.json`（重跑 install-hooks 收敛，代码无改）
+
+- 实机 settings.json 缺 `UserPromptSubmit`（install-hooks.py 早已注册但实机漂移；缺它会导致回话后 dashboard 状态翻不回、🔥 红徽不清，见 L43）→ 重跑 `python3 scripts/install-hooks.py` 补回（幂等 + 自动备份）。
+- settings.json 与 settings.local.json **双份注册**同 6 条 hook → 每个事件 POST 双触发。去重 settings.local.json（仅删自家 hook，保留 `permissions`），统一由 settings.json 单一持有 7 条。
+
+> 后续 opportunity（CC 2.1.x 二进制确认存在）：`StopFailure`（API 错误结束的回合也推送）**已于 R54 采纳**；仍未采纳：`PreCompact`+`PostCompact`（压缩态显示 + `compact_summary` 上下文）/ `Notification.notification_type=idle_prompt`（结构化等输入，替代脆弱的 transcript 正则）/ `SubagentStart`+`agent_id`/`background_tasks[]`（细粒度子 agent 追踪）。
+
 ## R52 · 修 R51 残余的"启动姿势依赖"与"视图依赖"半失效 (2026-05-20)
 
 R51 落地后第三轮独立 audit 发现两个新隐蔽 bug：F6 在 `uvicorn backend.app:app` 启动姿势下失效（README/update.py 推荐的就是这条路径，绕过 `main()`）；F3/F4/F7 在「按项目」分组视图下退化（合并卡 mutate 只在 list 视图入口跑）。本轮全部修透 + 配套清理 3 处文档错信息。所有修复主 agent 独立端到端验证（2+7 case 全过，不复用 subagent 留下的脚本）。

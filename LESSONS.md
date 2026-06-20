@@ -1,10 +1,10 @@
 <!-- purpose: 设计教训记录 — 删除/否定一个设计前先写一段简要总结，避免后续重复犯错 -->
 
 创建时间: 2026-05-09 16:25:00
-更新时间: 2026-05-14 08:35:00
+更新时间: 2026-06-20 01:10:00
 
-> 最后录入 **L53**（R28，2026-05-14）。R29+（Claude Desktop 桥接）的功能/修复要点全部进 [`CHANGELOG.md`](CHANGELOG.md)；
-> 当出现"尝试了 X / 为什么不行 / 替代方案 Y"的设计教训（CLAUDE.md §2 规则）时再回此文件追加 L54+，避免和 CHANGELOG 重复。
+> 最后录入 **L54**（R53，2026-06-20）。R29+（Claude Desktop 桥接）的功能/修复要点全部进 [`CHANGELOG.md`](CHANGELOG.md)；
+> 当出现"尝试了 X / 为什么不行 / 替代方案 Y"的设计教训（CLAUDE.md §2 规则）时再回此文件追加 L55+，避免和 CHANGELOG 重复。
 
 # 设计教训
 
@@ -1847,3 +1847,24 @@ if (theURL starts with "http://127.0.0.1:8787/") and (not (theURL starts with "h
 **教训**：
 1. **"匹配自己的请求 tab" 是 endpoint-controlled-from-script 类设计的通病**。任何"backend 通过 OS API 扫前端 tab 决定行为"的脚本都要明确排除"发起本次请求的那个 tab 自身"，否则会形成自指环路。这跟 webhook 死循环、shell glob `rm` 包含自己一样，是同源结构 bug。
 2. **fallback 路径要在每次设计时实地走一遍**，不能只测 happy path。R27 当时验证 `activated=True reason=OK` 就以为没问题，但那是"已有 dashboard tab"前提下的 happy path；空状态走不了 fallback 这个隐 bug 一直没暴露，直到用户实测"完全没启动 dashboard 时点链接"才发现。设计 fallback 时要主动构造"primary path 失败"的场景做 dry-run。
+
+## L54 — hook `source` 字段语义冲突：CC `SessionStart.source`(启动原因) 覆盖了 claude-notify 的渠道 `source`（已修，R53）
+
+**修改时间**：2026-06-20
+
+**背景**：claude-notify 用 `source` 表示「事件来自哪个观测渠道」（`claude_code` / `desktop_app` / `codex`）；后端 `sources.normalize` 按它路由规范化函数，前端按它分「终端 / Desktop」段。
+
+**原设计（错）**：`scripts/hook-notify.py` 直接 `"source": payload.get("source") or "claude_code"` —— 假设 hook payload 里的 `source` 就是渠道。
+
+**为什么不行**：CC 的 hook schema 里 `source` 是 **SessionStart 专属字段**，枚举 `startup/resume/clear/compact`，含义是「会话启动原因」，跟「渠道」是两个概念。于是每条 SessionStart 把渠道 `source` 污染成 `startup`/`compact`/`resume`：
+- `sources.normalize` 里 `src not in _REGISTRY` → 落 `_normalize_generic`，该事件被当成非 claude_code 渠道；
+- `event_store.list_sessions` 建卡时 `source` 取**首事件 sticky**（line 523），SessionStart 通常是首事件 → 整张卡永久锁成非 claude_code → 前端分段错乱、`_backfill_desktop_embedded`（line 783 `!= "claude_code"`）被跳过；
+- 实测 CC 2.1.183 下 14 个 session 有 10 个中招。
+这是「随 Claude 升级，hook schema 字段语义与工具自有字段撞名」的典型 drift —— CC 2.1.x 的 SessionStart 还同时新增了 `model` 字段，佐证 schema 在持续扩张。
+
+**替代方案（已落地，R53）**：
+1. 渠道与启动原因彻底分离：`hook-notify.py` 对 `event_name == "SessionStart"` 把渠道 `source` 硬钉 `claude_code`，CC 的启动原因另存 `session_start_source`（**按事件名 gate，未来 CC 新增枚举值也不会再漏**，比按值白名单更稳）。
+2. 历史数据兜底：新增单一真相函数 `sources.coerce_channel_source()`，在 `normalize`（新事件入口）+ `list_sessions` 建卡（旧事件 replay；events.jsonl 不可变，不回写）两处把 `startup/resume/clear/compact` 纠回 `claude_code`。
+3. 通用教训：**为外部系统做外挂时，凡是 `payload.get(X)` 直接透传外部字段当自有语义用，先确认两边 X 不是撞名**；尤其 hook/webhook 这类「对方 schema 会随版本扩张」的接口，撞名是迟早的。和 L02（自家 LLM 子进程触发自家 hook 致死循环）同源：都是「没把自己和外部的命名空间隔离开」。
+
+**关联**：CC 2.1.183 适配同轮还修了 ① 实机 settings.json 缺 `UserPromptSubmit`（install-hooks 已注册但漂移，见 [L43](#l43)）② settings.json + settings.local.json 双份注册致事件双触发 —— 两者靠重跑 `install-hooks.py` + 去重 settings.local 收敛。详见 [CHANGELOG.md](CHANGELOG.md) R53。

@@ -196,8 +196,8 @@ def derive_status(arg: Any) -> str:
         return "ended"
     if last_event == "SessionDead":
         return "dead"
-    if last_event == "Stop":
-        return "idle"
+    if last_event in {"Stop", "StopFailure"}:
+        return "idle"  # R54：失败结束也是回合终结（等用户处理），不该卡在 running
     if last_event in {"Notification", "TimeoutSuspect"}:
         if s is not None:
             last_status_ts = s.get("_last_status_event_unix") or 0.0
@@ -520,7 +520,9 @@ def list_sessions(active_window_minutes: int = 30,
         if s is None:
             s = {
                 "session_id": sid,
-                "source": evt.get("source") or "claude_code",
+                # R53：旧 events.jsonl 里 SessionStart 的 source 曾被误写成启动原因
+                # (startup/resume/clear/compact)；replay 时纠回 claude_code，避免历史 session 永久错段。
+                "source": sources.coerce_channel_source(evt.get("source")),
                 "project": evt.get("project") or "",
                 "cwd": evt.get("cwd") or "",
                 "cwd_short": evt.get("cwd_short") or "",
@@ -603,7 +605,9 @@ def list_sessions(active_window_minutes: int = 30,
         if not s.get("cwd_short") and evt.get("cwd_short"):
             s["cwd_short"] = evt.get("cwd_short")
         if not s.get("source") and evt.get("source"):
-            s["source"] = evt.get("source")
+            # R53：旧 events.jsonl 里 SessionStart 的 source 曾被误写成启动原因，
+            # replay 聚合时纠回 claude_code，避免历史 session 永久错段。
+            s["source"] = sources.coerce_channel_source(evt.get("source"))
         if evt.get("mode") and not s.get("mode"):
             s["mode"] = evt.get("mode")
         # R48：desktop_embedded 改 latest-wins（覆盖 R43 的 sticky True 规则）。
@@ -639,16 +643,16 @@ def list_sessions(active_window_minutes: int = 30,
                 or _raw.get("notification_type") == "permission_prompt"
             )
             s["menu_detected"] = bool(_is_menu_or_perm)
-        if evt.get("event") == "Stop":
+        if evt.get("event") in ("Stop", "StopFailure"):  # R54：失败结束按回合终结处理
             s["_last_stop_assistant"] = evt.get("last_assistant_message") or ""
             s["_last_stop_unix"] = parse_iso(evt.get("ts", ""))
             s["_last_stop_ts"] = evt.get("ts") or ""
-            s["_last_stop_event_type"] = "Stop"
+            s["_last_stop_event_type"] = evt.get("event")
         # R51 / F8：菜单红徽清零的事件分支扩展 —— 单靠 Stop 不够，用户答完菜单（推 UserPromptSubmit）
         # 到下一次 Stop 之间 🔥 会持续亮 →「已响应了还在催」。
         # 清零信号 = 用户实际响应（UserPromptSubmit）或会话终结（SessionEnd / SessionDead，再亮无意义）。
         # 不清零：PostToolUse（Claude 用工具 ≠ 用户响应）/ SubagentStop（子 agent 完成 ≠ 主流程响应）。
-        if evt.get("event") in ("Stop", "UserPromptSubmit", "SessionEnd", "SessionDead"):
+        if evt.get("event") in ("Stop", "StopFailure", "UserPromptSubmit", "SessionEnd", "SessionDead"):
             s["menu_detected"] = False
         if evt.get("event") == "SubagentStop":
             # 子 agent 完成也算一次回合结束，可作为兜底来源（但只在没有 Stop 时填充）

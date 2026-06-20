@@ -396,8 +396,13 @@ def _normalize_claude_code(raw: dict[str, Any]) -> dict[str, Any]:
         "last_assistant_message": (raw.get("raw") or {}).get("last_assistant_message")
             or raw.get("last_assistant_message"),
         "reason": (raw.get("raw") or {}).get("reason") or raw.get("reason"),
+        "error": raw.get("error") or (raw.get("raw") or {}).get("error"),  # R54：StopFailure 错误
+        "error_details": raw.get("error_details") or (raw.get("raw") or {}).get("error_details"),
         "is_sidechain": is_sidechain,
         "desktop_embedded": bool(raw.get("desktop_embedded")),  # R43：CLI 跑在 Claude Desktop Code mode 内
+        # R53：CC SessionStart 启动原因。新事件直接带；旧事件从被污染的 source 里回收。
+        "session_start_source": raw.get("session_start_source")
+            or (raw.get("source") if (raw.get("source") or "").lower() in _SESSION_START_REASONS else None),
         "raw": raw.get("raw") if isinstance(raw.get("raw"), dict) else raw,
     }
 
@@ -487,8 +492,25 @@ _REGISTRY: dict[str, Callable[[dict], dict]] = {
 }
 
 
+# CC 的 SessionStart 负载里 source ∈ 这些值（= 会话启动原因），不是传输渠道。
+# R53 之前的 hook-notify 误把它写进渠道 source 字段；旧事件 replay 时纠回 claude_code，
+# 否则会路由到 _normalize_generic 被错误归段（前端"终端 / Desktop"分段错乱）。
+# 新事件已由 hook-notify 在源头钉死 claude_code，这里是历史数据的兜底。
+_SESSION_START_REASONS = {"startup", "resume", "clear", "compact"}
+
+
+def coerce_channel_source(src: Any) -> str:
+    """把被误写成 SessionStart 启动原因(startup/resume/clear/compact)的 source 纠回 claude_code。
+    R53 之前 hook-notify 把 CC 的 SessionStart.source 当渠道写入，污染了 events.jsonl；
+    本函数在两处兜底：normalize（新事件入口）+ 会话聚合（旧事件 replay，见 event_store）。"""
+    s = (src or "").lower()
+    if s in _SESSION_START_REASONS:
+        return CLAUDE_CODE
+    return src or CLAUDE_CODE
+
+
 def normalize(raw: dict[str, Any]) -> dict[str, Any]:
-    src = (raw.get("source") or CLAUDE_CODE).lower()
+    src = coerce_channel_source(raw.get("source")).lower()
     fn = _REGISTRY.get(src) or _normalize_generic
     return fn(raw)
 
@@ -506,6 +528,9 @@ def _summarize_claude(raw: dict[str, Any]) -> str:
         return raw.get("message") or "需要确认"
     if ev == "Stop":
         return "任务一回合结束"
+    if ev == "StopFailure":
+        err = raw.get("error") or raw.get("error_details") or (raw.get("raw") or {}).get("error") or "API 错误"
+        return f"任务失败：{err}"
     if ev == "SubagentStop":
         return "子 agent 完成"
     if ev == "SessionStart":

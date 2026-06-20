@@ -85,12 +85,13 @@ function statusWeight(s) {
 const SILENCE_DEFAULTS = {
   Notification: 5,
   Stop: 12,
+  StopFailure: 5,
   SubagentStop: 6,
   TimeoutSuspect: 5,
   SessionDead: 5,
   SessionEnd: 5,
 };
-const NP_KEYS = ["Notification","Stop","SubagentStop","TimeoutSuspect","SessionDead","SessionEnd"];
+const NP_KEYS = ["Notification","Stop","StopFailure","SubagentStop","TimeoutSuspect","SessionDead","SessionEnd"];
 
 // ───────────── DOM ─────────────
 const $ = (id) => document.getElementById(id);

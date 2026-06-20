@@ -114,6 +114,7 @@ export function bindPermBar(cfg) {
 const EVENT_LABEL = {
   Notification: "等待你的输入",
   Stop: "Claude 回合结束",
+  StopFailure: "任务失败",
   SubagentStop: "子任务结束",
   TimeoutSuspect: "疑似 hang",
   SessionDead: "会话死亡",

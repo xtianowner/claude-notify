@@ -66,7 +66,9 @@ DEFAULT_FILTER_CFG = {
 }
 
 
-_ALWAYS_TRUE = {"TimeoutSuspect", "TestNotify"}
+# R54：StopFailure（回合因 API 错误结束）= 高信号低频，永远推（否则会落到 else 的
+# unknown_event 被吞）。不进 passthrough_events → 仍尊重 session_mute / quiet_hours。
+_ALWAYS_TRUE = {"TimeoutSuspect", "TestNotify", "StopFailure"}
 _ALWAYS_FALSE = {
     "SubagentStop", "SessionStart", "SessionEnd", "SessionDead",
     "Heartbeat", "PreToolUse", "PostToolUse",

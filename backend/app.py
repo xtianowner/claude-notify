@@ -192,6 +192,28 @@ def _inject_runtime_public_url(source: str) -> str:
     return default_url
 
 
+async def _archive_loop(interval_seconds: int):
+    """R54：周期触发滚动归档。此前归档只在 lifespan 启动跑一次，长驻不重启的 backend
+    events.jsonl 无界增长（实测 185MB）→ list_sessions 全量读 hot 文件变慢。
+    archive_if_needed() 内部按 max_hot_size_mb 判阈值，未超时只是一次 stat，开销极小；
+    超阈值时持 LOCK_EX 安全重写（与 append_event 并发不冲突）。"""
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            # to_thread：archive_if_needed 对最大 ~185MB 的 hot 文件做阻塞 readlines + 重写 + fsync，
+            # 直接在 event loop 跑会卡住 WS / HTTP / dispatch（每 interval 一次）→ 丢线程池。
+            stats = await asyncio.to_thread(event_store.archive_if_needed)
+            if stats.get("triggered") and stats.get("reason") == "ok":
+                log.info("periodic archive: %d events archived, %d kept hot",
+                         stats.get("archived_count", 0), stats.get("kept_count", 0))
+        except asyncio.CancelledError:
+            # 与 liveness watch_loop 一致：cancel 时正常 return，让 lifespan 的 `except Exception`
+            # 等待块拿到结果；若 re-raise，CancelledError(BaseException) 会击穿该块、跳过后续 desktop 清理。
+            return
+        except Exception:
+            log.exception("periodic archive failed (non-fatal)")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # F6 / R52：lifespan 在两种启动姿势下都会跑（main() / uvicorn 直起）。
@@ -218,6 +240,13 @@ async def lifespan(app: FastAPI):
     except Exception:
         log.exception("startup prune session_mutes failed")
     task = asyncio.create_task(liveness_watcher.watch_loop(_on_watcher_event, interval_seconds=interval))
+    # R54：周期归档（events.jsonl 控大小）。enabled=False 时不起任务。
+    archival_cfg = cfg.get("archival") or {}
+    archive_task: asyncio.Task | None = None
+    if archival_cfg.get("enabled"):
+        archive_task = asyncio.create_task(
+            _archive_loop(int(archival_cfg.get("check_interval_seconds") or 600))
+        )
     # R30：Claude Desktop AX 桥接（macOS only；默认 off，dashboard 开启）。
     # 桥接 emit 的事件通过 _on_desktop_event 走与 hook POST 同样的归一化 + 派发链路。
     dsk_cfg = cfg.get("desktop_bridge") or {}
@@ -277,6 +306,12 @@ async def lifespan(app: FastAPI):
             await task
         except Exception:
             pass
+        if archive_task is not None:
+            archive_task.cancel()
+            try:
+                await archive_task
+            except Exception:
+                pass
         if desktop_task is not None:
             try:
                 app.state.desktop_bridge.stop()
@@ -540,6 +575,12 @@ def _build_focus_script(tty: str) -> str:
     改成对各终端 app 直接 `try ... end try`，应用没装时 try 吃掉错误，继续下一个。
     """
     safe_tty = tty.replace("\\", "\\\\").replace('"', '\\"')
+    # R55：跨 Space / 多窗口下的稳健激活。
+    # 旧版 `set frontmost of w to true` 后 `activate`：当用户有多个终端窗口分布在不同
+    # macOS Space（桌面）时，`activate` 只把"当前 Space 已有的那个终端窗口"拉前，而不是
+    # 切到目标窗口所在 Space → 用户停在当前 Space、看到的是该 Space 顶层的别的 app（如 TG），
+    # 误以为"跳转跳错了"。修法：先把目标窗口提到该 app 窗口栈最前（select / set index 1），
+    # 再 `activate`（触发跨 Space 切换到目标窗口），activate 后再 re-assert 一次目标窗口在最前。
     return (
         f'set targetTty to "{safe_tty}"\n'
         'try\n'
@@ -548,9 +589,11 @@ def _build_focus_script(tty: str) -> str:
         '      repeat with theTab in tabs of theWindow\n'
         '        repeat with theSession in sessions of theTab\n'
         '          if tty of theSession is targetTty then\n'
+        '            select theWindow\n'
         '            select theTab\n'
         '            select theSession\n'
         '            activate\n'
+        '            select theWindow\n'
         '            return "iterm2:ok"\n'
         '          end if\n'
         '        end repeat\n'
@@ -564,8 +607,10 @@ def _build_focus_script(tty: str) -> str:
         '      repeat with t in tabs of w\n'
         '        if tty of t is targetTty then\n'
         '          set selected of t to true\n'
-        '          set frontmost of w to true\n'
+        '          set index of w to 1\n'
         '          activate\n'
+        '          set frontmost of w to true\n'
+        '          set index of w to 1\n'
         '          return "terminal:ok"\n'
         '        end if\n'
         '      end repeat\n'
@@ -1048,8 +1093,8 @@ def health_setup():
     cfg = cfg_mod.load()
     settings_path = Path.home() / ".claude" / "settings.json"
     # R24 / B3：与 scripts/install-hooks.py 的 EVENTS_NORMAL + PreToolUse 心跳保持一致
-    expected = ["Notification", "Stop", "SubagentStop", "SessionStart", "SessionEnd",
-                "UserPromptSubmit", "PreToolUse"]
+    expected = ["Notification", "Stop", "StopFailure", "SubagentStop", "SessionStart",
+                "SessionEnd", "UserPromptSubmit", "PreToolUse"]
     detected: list[str] = []
     settings_exists = settings_path.exists()
     if settings_exists:
